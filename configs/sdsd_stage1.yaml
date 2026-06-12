@@ -1,0 +1,33 @@
+seed: 42
+output_dir: outputs/sdsd_stage1
+dataset:
+  train_input_root: F:/DatasetDL/SDSD/indoor/input
+  train_target_root: F:/DatasetDL/SDSD/indoor/GT
+  val_input_root: F:/DatasetDL/SDSD/test/low-light
+  val_target_root: F:/DatasetDL/SDSD/test/GT
+  window_size: 5
+  crop_size: 256
+  num_workers: 4
+model:
+  in_channels: 3
+  level_channels: [32, 64, 96]
+  fused_channels: 48
+  mins_window_size: 8
+train:
+  batch_size: 2
+  epochs: 200
+  lr: 0.0002
+  weight_decay: 0.0001
+  amp: false
+  log_interval: 20
+  val_interval: 1
+eval:
+  tile_size: 256
+  tile_overlap: 32
+  amp: false
+loss:
+  lambda_pix: 1.0
+  lambda_ssim: 0.2
+  lambda_perc: 0.05
+  lambda_tv: 0.01
+  perceptual_pretrained: false

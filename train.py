@@ -1,0 +1,263 @@
+import argparse
+import os
+
+import torch
+import yaml
+from torch.cuda.amp import GradScaler, autocast
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import DataLoader, Subset
+
+try:
+    from tqdm import tqdm
+except Exception:
+    class _TqdmFallback(object):
+        def __init__(self, iterable=None, *args, **kwargs):
+            self.iterable = iterable
+
+        def __iter__(self):
+            return iter(self.iterable)
+
+        def set_postfix(self, **kwargs):
+            return None
+
+    def tqdm(iterable=None, *args, **kwargs):
+        return _TqdmFallback(iterable, *args, **kwargs)
+
+from datasets import SDSDDataset
+from losses import MINSLoss
+from models import MINSNet
+from utils.io import save_checkpoint
+from utils.inference import tiled_forward
+from utils.metrics import tensor_psnr, tensor_ssim
+from utils.misc import AverageMeter, create_logger, seed_everything
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--smoke", action="store_true")
+    return parser.parse_args()
+
+
+def load_config(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def build_dataloaders(cfg, smoke=False):
+    train_set = SDSDDataset(
+        input_root=cfg["dataset"]["train_input_root"],
+        target_root=cfg["dataset"]["train_target_root"],
+        window_size=cfg["dataset"]["window_size"],
+        mode="train",
+        crop_size=cfg["dataset"]["crop_size"],
+    )
+    val_set = SDSDDataset(
+        input_root=cfg["dataset"]["val_input_root"],
+        target_root=cfg["dataset"]["val_target_root"],
+        window_size=cfg["dataset"]["window_size"],
+        mode="val",
+        crop_size=cfg["dataset"]["crop_size"],
+    )
+
+    if smoke:
+        train_set = Subset(train_set, list(range(min(8, len(train_set)))))
+        val_set = Subset(val_set, list(range(min(4, len(val_set)))))
+
+    train_loader = DataLoader(
+        train_set,
+        batch_size=cfg["train"]["batch_size"],
+        shuffle=True,
+        num_workers=cfg["dataset"]["num_workers"],
+        pin_memory=True,
+        drop_last=False,
+    )
+    val_loader = DataLoader(
+        val_set,
+        batch_size=1,
+        shuffle=False,
+        num_workers=cfg["dataset"]["num_workers"],
+        pin_memory=True,
+        drop_last=False,
+    )
+    return train_loader, val_loader
+
+
+def build_model(cfg, device):
+    model = MINSNet(
+        in_channels=cfg["model"]["in_channels"],
+        level_channels=tuple(cfg["model"]["level_channels"]),
+        fused_channels=cfg["model"]["fused_channels"],
+        window_size=cfg["model"]["mins_window_size"],
+    )
+    return model.to(device)
+
+
+def build_loss(cfg, device):
+    criterion = MINSLoss(
+        lambda_pix=cfg["loss"]["lambda_pix"],
+        lambda_ssim=cfg["loss"]["lambda_ssim"],
+        lambda_perc=cfg["loss"]["lambda_perc"],
+        lambda_tv=cfg["loss"]["lambda_tv"],
+        perceptual_pretrained=cfg["loss"]["perceptual_pretrained"],
+    )
+    return criterion.to(device)
+
+
+def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp, logger, log_interval):
+    model.train()
+    meter_total = AverageMeter()
+    meter_pix = AverageMeter()
+    meter_ssim = AverageMeter()
+    meter_perc = AverageMeter()
+    meter_prior = AverageMeter()
+
+    progress = tqdm(enumerate(loader), total=len(loader), desc="train", leave=False)
+    for step, (clip, target, _) in progress:
+        clip = clip.to(device, non_blocking=True)
+        target = target.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+        with autocast(enabled=use_amp):
+            outputs = model(clip)
+            loss, loss_dict = criterion(outputs, target)
+
+        if not torch.isfinite(loss):
+            logger.warning("Skipping non-finite loss at step %d", step + 1)
+            optimizer.zero_grad(set_to_none=True)
+            continue
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        meter_total.update(loss_dict["loss_total"].item(), clip.size(0))
+        meter_pix.update(loss_dict["loss_pix"].item(), clip.size(0))
+        meter_ssim.update(loss_dict["loss_ssim"].item(), clip.size(0))
+        meter_perc.update(loss_dict["loss_perc"].item(), clip.size(0))
+        meter_prior.update(loss_dict["loss_prior"].item(), clip.size(0))
+
+        progress.set_postfix(loss=meter_total.avg, l1=meter_pix.avg, ssim=meter_ssim.avg)
+        if (step + 1) % log_interval == 0:
+            logger.info(
+                "step %d/%d loss=%.4f l1=%.4f ssim=%.4f perc=%.4f prior=%.4f",
+                step + 1,
+                len(loader),
+                meter_total.avg,
+                meter_pix.avg,
+                meter_ssim.avg,
+                meter_perc.avg,
+                meter_prior.avg,
+            )
+
+    return {
+        "loss_total": meter_total.avg,
+        "loss_pix": meter_pix.avg,
+        "loss_ssim": meter_ssim.avg,
+        "loss_perc": meter_perc.avg,
+        "loss_prior": meter_prior.avg,
+    }
+
+
+@torch.no_grad()
+def validate(model, loader, device, tile_size, tile_overlap, use_amp):
+    model.eval()
+    psnr_meter = AverageMeter()
+    ssim_meter = AverageMeter()
+    loss_meter = AverageMeter()
+    for clip, target, _ in tqdm(loader, total=len(loader), desc="val", leave=False):
+        clip = clip.to(device, non_blocking=True)
+        target = target.to(device, non_blocking=True)
+        pred = tiled_forward(
+            model=model,
+            clip=clip,
+            tile_size=tile_size,
+            tile_overlap=tile_overlap,
+            use_amp=use_amp,
+        )
+        loss = torch.mean(torch.abs(pred - target))
+        psnr_meter.update(tensor_psnr(pred, target), clip.size(0))
+        ssim_meter.update(tensor_ssim(pred, target), clip.size(0))
+        loss_meter.update(loss.item(), clip.size(0))
+        del clip, target, pred, loss
+    return {"val_l1": loss_meter.avg, "psnr": psnr_meter.avg, "ssim": ssim_meter.avg}
+
+
+def main():
+    args = parse_args()
+    cfg = load_config(args.config)
+    seed_everything(cfg["seed"])
+
+    output_dir = cfg["output_dir"]
+    os.makedirs(output_dir, exist_ok=True)
+    logger = create_logger(output_dir)
+    logger.info("Loading config from %s", args.config)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info("Using device: %s", device)
+
+    train_loader, val_loader = build_dataloaders(cfg, smoke=args.smoke)
+    model = build_model(cfg, device)
+    criterion = build_loss(cfg, device)
+    optimizer = AdamW(model.parameters(), lr=cfg["train"]["lr"], weight_decay=cfg["train"]["weight_decay"])
+    scheduler = CosineAnnealingLR(optimizer, T_max=cfg["train"]["epochs"])
+    scaler = GradScaler(enabled=cfg["train"]["amp"] and device.type == "cuda")
+
+    total_epochs = cfg["train"]["epochs"] if not args.smoke else 1
+    best_psnr = -1.0
+    for epoch in range(total_epochs):
+        logger.info("Epoch %d / %d", epoch + 1, total_epochs)
+        train_stats = train_one_epoch(
+            model=model,
+            criterion=criterion,
+            optimizer=optimizer,
+            scaler=scaler,
+            loader=train_loader,
+            device=device,
+            use_amp=cfg["train"]["amp"] and device.type == "cuda",
+            logger=logger,
+            log_interval=cfg["train"]["log_interval"],
+        )
+        scheduler.step()
+        logger.info("Train stats: %s", train_stats)
+
+        if (epoch + 1) % cfg["train"]["val_interval"] == 0:
+            val_stats = validate(
+                model,
+                val_loader,
+                device,
+                tile_size=cfg["eval"]["tile_size"],
+                tile_overlap=cfg["eval"]["tile_overlap"],
+                use_amp=cfg["eval"]["amp"] and device.type == "cuda",
+            )
+            logger.info("Val stats: %s", val_stats)
+            save_checkpoint(
+                {
+                    "epoch": epoch + 1,
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "config": cfg,
+                },
+                os.path.join(output_dir, "latest.pth"),
+            )
+            if val_stats["psnr"] > best_psnr:
+                best_psnr = val_stats["psnr"]
+                save_checkpoint(
+                    {
+                        "epoch": epoch + 1,
+                        "model": model.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "scheduler": scheduler.state_dict(),
+                        "config": cfg,
+                        "best_psnr": best_psnr,
+                    },
+                    os.path.join(output_dir, "best.pth"),
+                )
+        if args.smoke:
+            break
+
+
+if __name__ == "__main__":
+    main()

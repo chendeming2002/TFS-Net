@@ -1,0 +1,11 @@
+2026-05-29 12:13:25,645 - INFO - Loading config from configs/sdsd_stage1.yaml
+2026-05-29 12:13:25,645 - INFO - Using device: cuda
+2026-05-29 12:13:27,338 - INFO - Epoch 1 / 1
+2026-05-29 12:13:59,126 - INFO - Loading config from configs/sdsd_stage1.yaml
+2026-05-29 12:13:59,126 - INFO - Using device: cuda
+2026-05-29 12:14:00,635 - INFO - Epoch 1 / 1
+2026-05-29 12:14:11,033 - INFO - Train stats: {'loss_total': nan, 'loss_pix': nan, 'loss_ssim': nan, 'loss_perc': nan, 'loss_prior': 0.0010099411010742188}
+2026-05-29 12:16:50,003 - INFO - Loading config from configs/sdsd_stage1.yaml
+2026-05-29 12:16:50,003 - INFO - Using device: cuda
+2026-05-29 12:16:51,519 - INFO - Epoch 1 / 1
+2026-05-29 12:17:02,209 - INFO - Train stats: {'loss_total': 0.48071423918008804, 'loss_pix': 0.3436240255832672, 'loss_ssim': 0.6719697266817093, 'loss_perc': 0.05372659582644701, 'loss_prior': 0.0009947959188139066}
