@@ -111,3 +111,99 @@ class MINSLoss(nn.Module):
             "loss_prior": loss_prior.detach(),
         }
 
+
+# =================================================================
+#  TFSNetLoss — TFS-Net v3 损失函数
+# =================================================================
+
+class TFSNetLoss(nn.Module):
+    """
+    TFS-Net v3 损失函数（首版 use_temporal=False）
+
+    L_total = L_recon + λ_perc * L_perc + λ_illum * L_illum
+        L_recon = L_pix + λ_freq * L_freq
+        L_pix   = L1(pred, target)
+        L_freq  = L1(|FFT(pred)|, |FFT(target)|)
+        L_perc  = PerceptualLoss(pred, target)
+        L_illum = edge-aware smoothness on s_illum
+    """
+
+    def __init__(
+        self,
+        use_temporal: bool = False,
+        use_freq_loss: bool = True,
+        perceptual_pretrained: bool = False,
+        lambda_perc: float = 0.1,
+        lambda_freq: float = 0.1,
+        lambda_illum: float = 0.01,
+    ):
+        super().__init__()
+        self.use_temporal = use_temporal
+        self.use_freq_loss = use_freq_loss
+        self.lambda_perc = lambda_perc
+        self.lambda_freq = lambda_freq
+        self.lambda_illum = lambda_illum
+
+        self.perceptual = PerceptualLoss(pretrained=perceptual_pretrained)
+
+    @staticmethod
+    def _edge_aware_smooth(s: torch.Tensor, ref_img: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            s       : (B, 1, H, W) 单通道强度图
+            ref_img : (B, 3, H, W) RGB 参考图
+        Returns:
+            scalar loss
+        """
+        grad_s_x = (s[:, :, :, 1:] - s[:, :, :, :-1]).abs()
+        grad_s_y = (s[:, :, 1:, :] - s[:, :, :-1, :]).abs()
+
+        grad_i_x = (ref_img[:, :, :, 1:] - ref_img[:, :, :, :-1]).abs().mean(dim=1, keepdim=True)
+        grad_i_y = (ref_img[:, :, 1:, :] - ref_img[:, :, :-1, :]).abs().mean(dim=1, keepdim=True)
+
+        loss = (grad_s_x * torch.exp(-grad_i_x)).mean() + \
+               (grad_s_y * torch.exp(-grad_i_y)).mean()
+        return loss
+
+    def forward(self, outputs: dict, target: torch.Tensor):
+        """
+        Args:
+            outputs : dict from TFSNet.forward()
+            target  : (B, 3, H, W) GT
+        Returns:
+            (loss_total, loss_dict)
+        """
+        pred = outputs["res_t"]
+        s_illum = outputs["s_illum"]
+
+        # (1) 空间像素重建
+        L_pix = F.l1_loss(pred, target)
+
+        # (2) 频域重建
+        if self.use_freq_loss:
+            fft_pred = torch.fft.rfft2(pred, norm='ortho')
+            fft_gt = torch.fft.rfft2(target, norm='ortho')
+            L_freq = F.l1_loss(fft_pred.abs(), fft_gt.abs())
+        else:
+            L_freq = pred.new_tensor(0.0)
+
+        L_recon = L_pix + self.lambda_freq * L_freq
+
+        # (3) 感知损失
+        L_perc = self.perceptual(pred, target)
+
+        # (4) 光照场边缘感知平滑
+        L_illum = self._edge_aware_smooth(s_illum, target)
+
+        # 总损失
+        L_total = L_recon + self.lambda_perc * L_perc + self.lambda_illum * L_illum
+
+        loss_dict = {
+            "loss_total": L_total.detach(),
+            "loss_pix":   L_pix.detach(),
+            "loss_freq":  L_freq.detach(),
+            "loss_perc":  L_perc.detach(),
+            "loss_illum": L_illum.detach(),
+        }
+        return L_total, loss_dict
+

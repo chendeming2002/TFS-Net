@@ -25,8 +25,8 @@ except Exception:
         return _TqdmFallback(iterable, *args, **kwargs)
 
 from datasets import SDSDDataset
-from losses import MINSLoss
-from models import MINSNet
+from losses.losses import TFSNetLoss
+from models import TFSNet
 from utils.io import save_checkpoint
 from utils.inference import tiled_forward
 from utils.metrics import tensor_psnr, tensor_ssim
@@ -85,22 +85,22 @@ def build_dataloaders(cfg, smoke=False):
 
 
 def build_model(cfg, device):
-    model = MINSNet(
+    model = TFSNet(
         in_channels=cfg["model"]["in_channels"],
         level_channels=tuple(cfg["model"]["level_channels"]),
         fused_channels=cfg["model"]["fused_channels"],
-        window_size=cfg["model"]["mins_window_size"],
     )
     return model.to(device)
 
 
 def build_loss(cfg, device):
-    criterion = MINSLoss(
-        lambda_pix=cfg["loss"]["lambda_pix"],
-        lambda_ssim=cfg["loss"]["lambda_ssim"],
-        lambda_perc=cfg["loss"]["lambda_perc"],
-        lambda_tv=cfg["loss"]["lambda_tv"],
-        perceptual_pretrained=cfg["loss"]["perceptual_pretrained"],
+    loss_cfg = cfg["loss"]
+    criterion = TFSNetLoss(
+        use_freq_loss=loss_cfg.get("use_freq_loss", True),
+        perceptual_pretrained=loss_cfg.get("perceptual_pretrained", False),
+        lambda_perc=loss_cfg.get("lambda_perc", 0.1),
+        lambda_freq=loss_cfg.get("lambda_freq", 0.1),
+        lambda_illum=loss_cfg.get("lambda_illum", 0.01),
     )
     return criterion.to(device)
 
@@ -109,9 +109,9 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
     model.train()
     meter_total = AverageMeter()
     meter_pix = AverageMeter()
-    meter_ssim = AverageMeter()
+    meter_freq = AverageMeter()
     meter_perc = AverageMeter()
-    meter_prior = AverageMeter()
+    meter_illum = AverageMeter()
 
     progress = tqdm(enumerate(loader), total=len(loader), desc="train", leave=False)
     for step, (clip, target, _) in progress:
@@ -134,29 +134,29 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
 
         meter_total.update(loss_dict["loss_total"].item(), clip.size(0))
         meter_pix.update(loss_dict["loss_pix"].item(), clip.size(0))
-        meter_ssim.update(loss_dict["loss_ssim"].item(), clip.size(0))
+        meter_freq.update(loss_dict["loss_freq"].item(), clip.size(0))
         meter_perc.update(loss_dict["loss_perc"].item(), clip.size(0))
-        meter_prior.update(loss_dict["loss_prior"].item(), clip.size(0))
+        meter_illum.update(loss_dict["loss_illum"].item(), clip.size(0))
 
-        progress.set_postfix(loss=meter_total.avg, l1=meter_pix.avg, ssim=meter_ssim.avg)
+        progress.set_postfix(loss=meter_total.avg, l1=meter_pix.avg, freq=meter_freq.avg)
         if (step + 1) % log_interval == 0:
             logger.info(
-                "step %d/%d loss=%.4f l1=%.4f ssim=%.4f perc=%.4f prior=%.4f",
+                "step %d/%d loss=%.4f l1=%.4f freq=%.4f perc=%.4f illum=%.4f",
                 step + 1,
                 len(loader),
                 meter_total.avg,
                 meter_pix.avg,
-                meter_ssim.avg,
+                meter_freq.avg,
                 meter_perc.avg,
-                meter_prior.avg,
+                meter_illum.avg,
             )
 
     return {
         "loss_total": meter_total.avg,
         "loss_pix": meter_pix.avg,
-        "loss_ssim": meter_ssim.avg,
+        "loss_freq": meter_freq.avg,
         "loss_perc": meter_perc.avg,
-        "loss_prior": meter_prior.avg,
+        "loss_illum": meter_illum.avg,
     }
 
 

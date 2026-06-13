@@ -23,7 +23,7 @@ except Exception:
     def tqdm(iterable=None, *args, **kwargs):
         return _TqdmFallback(iterable, *args, **kwargs)
 
-from models import MINSNet
+from models import TFSNet
 from utils.inference import tiled_forward
 from utils.io import ensure_dir, load_checkpoint, save_image_tensor
 
@@ -70,11 +70,10 @@ def main():
     cfg = load_config(args.config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = MINSNet(
+    model = TFSNet(
         in_channels=cfg["model"]["in_channels"],
         level_channels=tuple(cfg["model"]["level_channels"]),
         fused_channels=cfg["model"]["fused_channels"],
-        window_size=cfg["model"]["mins_window_size"],
     ).to(device)
     checkpoint = load_checkpoint(args.checkpoint, map_location=device)
     model.load_state_dict(checkpoint["model"], strict=True)
