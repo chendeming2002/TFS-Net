@@ -240,6 +240,18 @@ class SACE(nn.Module):
         self.norm_q = LayerNorm2d(channels)
         self.norm_kv = LayerNorm2d(channels)
 
+    @staticmethod
+    def _soft_median(x: torch.Tensor, dim: int = 1, tau: float = 0.1) -> torch.Tensor:
+        """
+        梯度友好的软中位值近似。
+        所有帧都获得梯度回传，距中位值近的帧权重更大。
+        """
+        with torch.no_grad():
+            med = x.median(dim=dim).values.unsqueeze(dim)
+        dist = (x - med).abs()
+        weights = F.softmax(-dist / tau, dim=dim)
+        return (weights * x).sum(dim=dim)
+
     def forward(
         self,
         feats: torch.Tensor,
@@ -256,8 +268,8 @@ class SACE(nn.Module):
             lff_feats.append(f_t_lff)
         lff_stack = torch.stack(lff_feats, dim=1)
 
-        # Step 2: 时域中位值 → 参考帧
-        mu_t_clean = lff_stack.median(dim=1).values
+        # Step 2: 时域 soft-median → 参考帧 (梯度友好)
+        mu_t_clean = self._soft_median(lff_stack, dim=1)
 
         # Step 3: 逐帧可变形对齐
         attn_maps: List[Tuple[torch.Tensor, torch.Tensor]] = []

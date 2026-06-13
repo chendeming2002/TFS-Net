@@ -21,6 +21,8 @@ train:
   amp: true
   log_interval: 50
   val_interval: 5
+  warmup_epochs: 5
+  grad_clip: 1.0
 loss:
   type: TFSNetLoss
   use_freq_loss: true
@@ -28,6 +30,9 @@ loss:
   lambda_perc: 0.1
   lambda_freq: 0.1
   lambda_illum: 0.05
+  lambda_ssim: 0.2
+  lambda_aux: 0.2
+  fused_channels: 64
 eval:
   tile_size: 256
   tile_overlap: 32

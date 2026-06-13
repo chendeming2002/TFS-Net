@@ -151,7 +151,7 @@ class IFPN(nn.Module):
 
         # Step 5: 强度调制
         eps = 1e-3
-        L_ratio_lr = L_ref / (L_t.abs() + eps)
+        L_ratio_lr = (L_ref / (L_t.abs() + eps)).clamp(-4.0, 4.0)
         L_ratio = F.interpolate(L_ratio_lr, size=(H, W), mode='bilinear', align_corners=False)
         ratio_feat = self.ratio_proj(L_ratio)
 

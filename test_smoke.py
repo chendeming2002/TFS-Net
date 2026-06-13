@@ -50,16 +50,26 @@ def test_loss():
         use_freq_loss=True,
         lambda_perc=0.1,
         lambda_freq=0.1,
-        lambda_illum=0.01
+        lambda_illum=0.05,
+        lambda_ssim=0.2,
+        lambda_aux=0.2,
+        fused_channels=64,
+        perceptual_pretrained=False,
     )
     # Simulate model output
     pred = torch.randn(1, 3, 64, 64, requires_grad=True)
     target = torch.randn(1, 3, 64, 64)
     s_illum = torch.sigmoid(torch.randn(1, 1, 64, 64))
+    f_illum_out = torch.randn(1, 64, 64, 64)
+    f_noise_out = torch.randn(1, 64, 64, 64)
+    f_motion_out = torch.randn(1, 64, 64, 64)
     
     model_output = {
         'res_t': pred,
-        's_illum': s_illum
+        's_illum': s_illum,
+        'f_illum_out': f_illum_out,
+        'f_noise_out': f_noise_out,
+        'f_motion_out': f_motion_out,
     }
     
     result = criterion(model_output, target)
@@ -68,6 +78,8 @@ def test_loss():
     total_loss, loss_dict = result
     assert isinstance(loss_dict, dict), f"Expected dict, got {type(loss_dict)}"
     print(f"  Loss keys: {list(loss_dict.keys())}")
+    assert 'loss_ssim' in loss_dict, "Missing loss_ssim"
+    assert 'loss_aux' in loss_dict, "Missing loss_aux"
     
     total_loss.backward()
     print(f"  OK - Loss value: {total_loss.item():.4f}")

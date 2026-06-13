@@ -113,19 +113,29 @@ class MINSLoss(nn.Module):
 
 
 # =================================================================
-#  TFSNetLoss — TFS-Net v3 损失函数
+#  TFSNetLoss — TFS-Net v3.2 损失函数
 # =================================================================
+
+
+def charbonnier_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Charbonnier loss (smooth L1 alternative, standard in image restoration)."""
+    return torch.mean(torch.sqrt((pred - target) ** 2 + eps))
+
 
 class TFSNetLoss(nn.Module):
     """
-    TFS-Net v3 损失函数（首版 use_temporal=False）
+    TFS-Net v3.2 损失函数
 
-    L_total = L_recon + λ_perc * L_perc + λ_illum * L_illum
-        L_recon = L_pix + λ_freq * L_freq
-        L_pix   = L1(pred, target)
-        L_freq  = L1(|FFT(pred)|, |FFT(target)|)
-        L_perc  = PerceptualLoss(pred, target)
-        L_illum = edge-aware smoothness on s_illum
+    L_total = L_recon + λ_ssim * L_ssim + λ_perc * L_perc
+              + λ_illum * L_illum + λ_aux * L_aux
+
+        L_recon  = L_pix + λ_freq * L_freq
+        L_pix    = Charbonnier(pred, target)
+        L_freq   = L1(|FFT(pred)|, |FFT(target)|)
+        L_ssim   = 1 - SSIM(pred, target)
+        L_perc   = PerceptualLoss(pred, target)
+        L_illum  = edge-aware smoothness on s_illum
+        L_aux    = mean(Charbonnier(proj(f_branch_i), target)) for i in {illum, noise, motion}
     """
 
     def __init__(
@@ -136,6 +146,9 @@ class TFSNetLoss(nn.Module):
         lambda_perc: float = 0.1,
         lambda_freq: float = 0.1,
         lambda_illum: float = 0.01,
+        lambda_ssim: float = 0.2,
+        lambda_aux: float = 0.2,
+        fused_channels: int = 64,
     ):
         super().__init__()
         self.use_temporal = use_temporal
@@ -143,8 +156,13 @@ class TFSNetLoss(nn.Module):
         self.lambda_perc = lambda_perc
         self.lambda_freq = lambda_freq
         self.lambda_illum = lambda_illum
+        self.lambda_ssim = lambda_ssim
+        self.lambda_aux = lambda_aux
 
         self.perceptual = PerceptualLoss(pretrained=perceptual_pretrained)
+
+        # 辅助分支投影头：将分支特征投影到 RGB (共享权重)
+        self.aux_proj = nn.Conv2d(fused_channels, 3, kernel_size=1, bias=True)
 
     @staticmethod
     def _edge_aware_smooth(s: torch.Tensor, ref_img: torch.Tensor) -> torch.Tensor:
@@ -176,8 +194,8 @@ class TFSNetLoss(nn.Module):
         pred = outputs["res_t"]
         s_illum = outputs["s_illum"]
 
-        # (1) 空间像素重建
-        L_pix = F.l1_loss(pred, target)
+        # (1) 空间像素重建 (Charbonnier)
+        L_pix = charbonnier_loss(pred, target)
 
         # (2) 频域重建
         if self.use_freq_loss:
@@ -189,21 +207,44 @@ class TFSNetLoss(nn.Module):
 
         L_recon = L_pix + self.lambda_freq * L_freq
 
-        # (3) 感知损失
+        # (3) SSIM 损失
+        L_ssim = 1.0 - ssim_map(pred, target).mean()
+
+        # (4) 感知损失
         L_perc = self.perceptual(pred, target)
 
-        # (4) 光照场边缘感知平滑
+        # (5) 光照场边缘感知平滑
         L_illum = self._edge_aware_smooth(s_illum, target)
 
+        # (6) 辅助分支重建损失
+        L_aux = pred.new_tensor(0.0)
+        if self.lambda_aux > 0 and "f_illum_out" in outputs:
+            f_illum = outputs["f_illum_out"]
+            f_noise = outputs["f_noise_out"]
+            f_motion = outputs["f_motion_out"]
+            L_aux = (
+                charbonnier_loss(self.aux_proj(f_illum), target) +
+                charbonnier_loss(self.aux_proj(f_noise), target) +
+                charbonnier_loss(self.aux_proj(f_motion), target)
+            ) / 3.0
+
         # 总损失
-        L_total = L_recon + self.lambda_perc * L_perc + self.lambda_illum * L_illum
+        L_total = (
+            L_recon
+            + self.lambda_ssim * L_ssim
+            + self.lambda_perc * L_perc
+            + self.lambda_illum * L_illum
+            + self.lambda_aux * L_aux
+        )
 
         loss_dict = {
             "loss_total": L_total.detach(),
             "loss_pix":   L_pix.detach(),
             "loss_freq":  L_freq.detach(),
+            "loss_ssim":  L_ssim.detach(),
             "loss_perc":  L_perc.detach(),
             "loss_illum": L_illum.detach(),
+            "loss_aux":   L_aux.detach(),
         }
         return L_total, loss_dict
 

@@ -5,7 +5,7 @@ import torch
 import yaml
 from torch.cuda.amp import GradScaler, autocast
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, Subset
 
 try:
@@ -101,17 +101,22 @@ def build_loss(cfg, device):
         lambda_perc=loss_cfg.get("lambda_perc", 0.1),
         lambda_freq=loss_cfg.get("lambda_freq", 0.1),
         lambda_illum=loss_cfg.get("lambda_illum", 0.01),
+        lambda_ssim=loss_cfg.get("lambda_ssim", 0.2),
+        lambda_aux=loss_cfg.get("lambda_aux", 0.2),
+        fused_channels=loss_cfg.get("fused_channels", 64),
     )
     return criterion.to(device)
 
 
-def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp, logger, log_interval):
+def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp, logger, log_interval, grad_clip=1.0):
     model.train()
     meter_total = AverageMeter()
     meter_pix = AverageMeter()
     meter_freq = AverageMeter()
+    meter_ssim = AverageMeter()
     meter_perc = AverageMeter()
     meter_illum = AverageMeter()
+    meter_aux = AverageMeter()
 
     progress = tqdm(enumerate(loader), total=len(loader), desc="train", leave=False)
     for step, (clip, target, _) in progress:
@@ -129,34 +134,42 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
             continue
 
         scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
         scaler.step(optimizer)
         scaler.update()
 
         meter_total.update(loss_dict["loss_total"].item(), clip.size(0))
         meter_pix.update(loss_dict["loss_pix"].item(), clip.size(0))
         meter_freq.update(loss_dict["loss_freq"].item(), clip.size(0))
+        meter_ssim.update(loss_dict["loss_ssim"].item(), clip.size(0))
         meter_perc.update(loss_dict["loss_perc"].item(), clip.size(0))
         meter_illum.update(loss_dict["loss_illum"].item(), clip.size(0))
+        meter_aux.update(loss_dict["loss_aux"].item(), clip.size(0))
 
-        progress.set_postfix(loss=meter_total.avg, l1=meter_pix.avg, freq=meter_freq.avg)
+        progress.set_postfix(loss=meter_total.avg, pix=meter_pix.avg, ssim=meter_ssim.avg)
         if (step + 1) % log_interval == 0:
             logger.info(
-                "step %d/%d loss=%.4f l1=%.4f freq=%.4f perc=%.4f illum=%.4f",
+                "step %d/%d loss=%.4f pix=%.4f freq=%.4f ssim=%.4f perc=%.4f illum=%.4f aux=%.4f",
                 step + 1,
                 len(loader),
                 meter_total.avg,
                 meter_pix.avg,
                 meter_freq.avg,
+                meter_ssim.avg,
                 meter_perc.avg,
                 meter_illum.avg,
+                meter_aux.avg,
             )
 
     return {
         "loss_total": meter_total.avg,
         "loss_pix": meter_pix.avg,
         "loss_freq": meter_freq.avg,
+        "loss_ssim": meter_ssim.avg,
         "loss_perc": meter_perc.avg,
         "loss_illum": meter_illum.avg,
+        "loss_aux": meter_aux.avg,
     }
 
 
@@ -201,10 +214,17 @@ def main():
     model = build_model(cfg, device)
     criterion = build_loss(cfg, device)
     optimizer = AdamW(model.parameters(), lr=cfg["train"]["lr"], weight_decay=cfg["train"]["weight_decay"])
-    scheduler = CosineAnnealingLR(optimizer, T_max=cfg["train"]["epochs"])
-    scaler = GradScaler(enabled=cfg["train"]["amp"] and device.type == "cuda")
-
+    warmup_epochs = cfg["train"].get("warmup_epochs", 5)
     total_epochs = cfg["train"]["epochs"] if not args.smoke else 1
+    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=max(total_epochs - warmup_epochs, 1))
+    if warmup_epochs > 0 and total_epochs > warmup_epochs:
+        warmup_scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_epochs)
+        scheduler = SequentialLR(optimizer, [warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs])
+    else:
+        scheduler = cosine_scheduler
+    scaler = GradScaler(enabled=cfg["train"]["amp"] and device.type == "cuda")
+    grad_clip = cfg["train"].get("grad_clip", 1.0)
+
     best_psnr = -1.0
     for epoch in range(total_epochs):
         logger.info("Epoch %d / %d", epoch + 1, total_epochs)
@@ -218,6 +238,7 @@ def main():
             use_amp=cfg["train"]["amp"] and device.type == "cuda",
             logger=logger,
             log_interval=cfg["train"]["log_interval"],
+            grad_clip=grad_clip,
         )
         scheduler.step()
         logger.info("Train stats: %s", train_stats)
