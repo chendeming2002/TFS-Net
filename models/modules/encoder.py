@@ -33,12 +33,21 @@ class EncoderStage(nn.Module):
 
 
 class PyramidEncoder(nn.Module):
-    def __init__(self, in_channels=3, level_channels=(32, 64, 96), fused_channels=48):
+    def __init__(self, in_channels=3, level_channels=(32, 64, 96, 128), fused_channels=64):
         super().__init__()
-        c1, c2, c3 = level_channels
+        if len(level_channels) == 4:
+            c1, c2, c3, c4 = level_channels
+        else:
+            c1, c2, c3 = level_channels
+            c4 = None
+
         self.stage1 = EncoderStage(in_channels, c1, stride=1)
         self.stage2 = EncoderStage(c1, c2, stride=2)
         self.stage3 = EncoderStage(c2, c3, stride=2)
+        self.has_stage4 = c4 is not None
+        if self.has_stage4:
+            self.stage4 = EncoderStage(c3, c4, stride=2)
+            self.lateral4 = nn.Conv2d(c4, fused_channels, 1, 1, 0)
 
         self.lateral3 = nn.Conv2d(c3, fused_channels, 1, 1, 0)
         self.lateral2 = nn.Conv2d(c2, fused_channels, 1, 1, 0)
@@ -52,25 +61,33 @@ class PyramidEncoder(nn.Module):
         """
         Args:
             x             : (B, C, H, W) 单帧图像
-            return_coarse : 是否同时返回最粗尺度特征 l3
+            return_coarse : 是否同时返回最粗尺度特征
 
         Returns:
             return_coarse=False: fused_feat (B, C_f, H, W)
-            return_coarse=True : (fused_feat, coarse_feat) 其中 coarse_feat = l3 (B, c3, H/8, W/8)
+            return_coarse=True : (fused_feat, coarse_feat)
+                                 4-stage: coarse = l4 (B, c4, H/8, W/8)
+                                 3-stage: coarse = l3 (B, c3, H/4, W/4)
         """
         l1 = self.stage1(x)       # (B, c1, H, W)
         l2 = self.stage2(l1)      # (B, c2, H/2, W/2)
-        l3 = self.stage3(l2)      # (B, c3, H/4, W/4)  ← 注：两次 stride=2 → H/4
+        l3 = self.stage3(l2)      # (B, c3, H/4, W/4)
 
-        p3 = self.lateral3(l3)
+        if self.has_stage4:
+            l4 = self.stage4(l3)  # (B, c4, H/8, W/8)
+            p4 = self.lateral4(l4)
+            p3 = self.lateral3(l3) + F.interpolate(p4, size=l3.shape[-2:], mode="bilinear", align_corners=False)
+        else:
+            l4 = None
+            p3 = self.lateral3(l3)
+
         p2 = self.lateral2(l2) + F.interpolate(p3, size=l2.shape[-2:], mode="bilinear", align_corners=False)
         p1 = self.lateral1(l1) + F.interpolate(p2, size=l1.shape[-2:], mode="bilinear", align_corners=False)
         fused = self.fuse(p1)     # (B, C_f, H, W)
 
         if return_coarse:
-            # 当前假设：coarse_feat = l3（最粗尺度，未经 lateral 投影）
-            # 待 IFPN 设计澄清后可能改为 p3 或其他尺度
-            return fused, l3
+            coarse = l4 if self.has_stage4 else l3
+            return fused, coarse
         return fused
 
     def forward(self, x, return_coarse=False):

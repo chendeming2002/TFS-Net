@@ -75,8 +75,8 @@ class IFPN(nn.Module):
 
     def __init__(
         self,
-        fused_channels: int = 48,
-        coarse_channels: int = 96,
+        fused_channels: int = 64,
+        coarse_channels: int = 128,
         img_channels: int = 3,
         feat_proj_channels: int = 16,
         n_fea_middle: int = 32,
@@ -159,7 +159,8 @@ class IFPN(nn.Module):
         F_t_illum = F_t * (1.0 + ratio_feat)
         F_t_illum = self.refine(F_t_illum)
 
-        f_illum_out = s_illum * F_t_illum + (1.0 - s_illum) * F_t
+        # 移除双重门控：直接输出光照校正特征（由 IGRF 统一做强度加权）
+        f_illum_out = F_t_illum
 
         return {
             "f_illum_out": f_illum_out,

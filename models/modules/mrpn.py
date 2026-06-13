@@ -27,10 +27,10 @@ from models.modules.blocks import ConvBlock
 class MRPN(nn.Module):
     """
     Args:
-        channels: 特征通道数 (默认 48)
+        channels: 特征通道数 (默认 64)
     """
 
-    def __init__(self, channels: int = 48):
+    def __init__(self, channels: int = 64):
         super().__init__()
         self.channels = channels
 
@@ -83,9 +83,9 @@ class MRPN(nn.Module):
             weights_norm.append(w_i_norm)
             F_motion_agg = F_motion_agg + w_i_norm * F_aligned_list[i]
 
-        # Step 4: refine + 强度门控
+        # Step 4: refine + 直接输出（移除双重门控，由 IGRF 统一做强度加权）
         F_motion_refined = self.refine(F_motion_agg)
-        f_motion_out = s_motion * F_motion_refined + (1.0 - s_motion) * F_t
+        f_motion_out = F_motion_refined
 
         motion_weights = torch.cat(
             [weights_norm[i] for i in range(T) if i != center_idx], dim=1

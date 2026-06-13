@@ -1,34 +1,34 @@
 seed: 42
 output_dir: outputs/sdsd_stage1
 dataset:
-  train_input_root: F:/DatasetDL/SDSD/indoor/input
-  train_target_root: F:/DatasetDL/SDSD/indoor/GT
-  val_input_root: F:/DatasetDL/SDSD/test/low-light
-  val_target_root: F:/DatasetDL/SDSD/test/GT
+  train_input_root: /home/a1005/yzy/dataset/SDSD/indoor/input
+  train_target_root: /home/a1005/yzy/dataset/SDSD/indoor/GT
+  val_input_root: /home/a1005/yzy/dataset/SDSD/test/low-light
+  val_target_root: /home/a1005/yzy/dataset/SDSD/test/GT
   window_size: 5
   crop_size: 256
   num_workers: 4
 model:
   type: TFSNet
   in_channels: 3
-  level_channels: [32, 64, 96]
-  fused_channels: 48
+  level_channels: [32, 64, 96, 128]
+  fused_channels: 64
 train:
-  batch_size: 2
-  epochs: 200
-  lr: 0.0002
+  batch_size: 4
+  epochs: 100
+  lr: 0.0005
   weight_decay: 0.0001
-  amp: false
+  amp: true
   log_interval: 50
   val_interval: 5
 loss:
   type: TFSNetLoss
   use_freq_loss: true
-  perceptual_pretrained: false
+  perceptual_pretrained: true
   lambda_perc: 0.1
   lambda_freq: 0.1
-  lambda_illum: 0.01
+  lambda_illum: 0.05
 eval:
   tile_size: 256
   tile_overlap: 32
-  amp: false
+  amp: true

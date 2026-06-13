@@ -223,7 +223,7 @@ class TFSI(nn.Module):
     供后续 SACE 共享 LFF 时扩展。
     """
 
-    def __init__(self, channels: int = 48, fused_channels: int = 48, eps: float = 1e-6):
+    def __init__(self, channels: int = 64, fused_channels: int = 64, eps: float = 1e-6):
         super().__init__()
         self.channels = channels
         self.fused_channels = fused_channels

@@ -43,8 +43,8 @@ class TFSNet(nn.Module):
     def __init__(
         self,
         in_channels: int = 3,
-        level_channels: Tuple[int, int, int] = (32, 64, 96),
-        fused_channels: int = 48,
+        level_channels: Tuple[int, ...] = (32, 64, 96, 128),
+        fused_channels: int = 64,
         eps: float = 1e-6,
         n_groups: int = 4,
         kernel_size: int = 3,
@@ -54,7 +54,8 @@ class TFSNet(nn.Module):
         self.in_channels = in_channels
         self.fused_channels = fused_channels
         self.share_lff = share_lff
-        c1, c2, c3 = level_channels
+        # 支持 3 或 4 级编码器
+        coarse_channels = level_channels[-1]  # 最粗层通道数
 
         # Stage 0: PyramidEncoder
         self.encoder = PyramidEncoder(
@@ -83,7 +84,7 @@ class TFSNet(nn.Module):
         # Stage 3: 三源恢复分支
         self.ifpn = IFPN(
             fused_channels=fused_channels,
-            coarse_channels=c3,
+            coarse_channels=coarse_channels,
             img_channels=in_channels,
         )
         self.ndpn = NDPN(channels=fused_channels)

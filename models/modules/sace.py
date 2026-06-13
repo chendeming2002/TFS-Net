@@ -205,7 +205,7 @@ class SACE(nn.Module):
 
     def __init__(
         self,
-        channels: int = 48,
+        channels: int = 64,
         n_groups: int = 4,
         kernel_size: int = 3,
         use_optimized: bool = True,

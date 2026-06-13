@@ -26,14 +26,14 @@ from models.modules.blocks import ConvBlock
 class NDPN(nn.Module):
     """
     Args:
-        channels       : 特征通道数 (默认 48)
+        channels       : 特征通道数 (默认 64)
         tau_mid_init   : SNR 归一化中心初始值
         tau_scale_init : SNR 归一化尺度初始值
     """
 
     def __init__(
         self,
-        channels: int = 48,
+        channels: int = 64,
         tau_mid_init: float = 1.0,
         tau_scale_init: float = 1.0,
     ):
@@ -102,8 +102,8 @@ class NDPN(nn.Module):
 
         F_denoised = self.refine(F_denoised)
 
-        # Step 4: 强度门控
-        f_noise_out = s_noise * F_denoised + (1.0 - s_noise) * F_t
+        # 移除双重门控：直接输出去噪特征（由 IGRF 统一做强度加权）
+        f_noise_out = F_denoised
 
         return {
             "f_noise_out": f_noise_out,
