@@ -156,11 +156,10 @@ class IFPN(nn.Module):
         ratio_feat = self.ratio_proj(L_ratio)
 
         F_t = feats[:, center_idx]
-        F_t_illum = F_t * (1.0 + ratio_feat)
-        F_t_illum = self.refine(F_t_illum)
 
-        # 移除双重门控：直接输出光照校正特征（由 IGRF 统一做强度加权）
-        f_illum_out = F_t_illum
+        # v4.1: 加法残差 + skip connection（替代 v4 的乘法调制）
+        # 即使 ratio_feat=0 时，梯度仍通过 skip (F_t) 直通回传
+        f_illum_out = F_t + self.refine(F_t + ratio_feat)
 
         return {
             "f_illum_out": f_illum_out,

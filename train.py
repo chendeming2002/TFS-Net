@@ -102,7 +102,7 @@ def build_loss(cfg, device):
         lambda_freq=loss_cfg.get("lambda_freq", 0.1),
         lambda_illum=loss_cfg.get("lambda_illum", 0.01),
         lambda_ssim=loss_cfg.get("lambda_ssim", 0.2),
-        lambda_aux=loss_cfg.get("lambda_aux", 0.2),
+        lambda_inter=loss_cfg.get("lambda_inter", 0.3),
         fused_channels=loss_cfg.get("fused_channels", 64),
     )
     return criterion.to(device)
@@ -116,7 +116,7 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
     meter_ssim = AverageMeter()
     meter_perc = AverageMeter()
     meter_illum = AverageMeter()
-    meter_aux = AverageMeter()
+    meter_inter = AverageMeter()
 
     progress = tqdm(enumerate(loader), total=len(loader), desc="train", leave=False)
     for step, (clip, target, _) in progress:
@@ -145,12 +145,12 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
         meter_ssim.update(loss_dict["loss_ssim"].item(), clip.size(0))
         meter_perc.update(loss_dict["loss_perc"].item(), clip.size(0))
         meter_illum.update(loss_dict["loss_illum"].item(), clip.size(0))
-        meter_aux.update(loss_dict["loss_aux"].item(), clip.size(0))
+        meter_inter.update(loss_dict["loss_inter"].item(), clip.size(0))
 
         progress.set_postfix(loss=meter_total.avg, pix=meter_pix.avg, ssim=meter_ssim.avg)
         if (step + 1) % log_interval == 0:
             logger.info(
-                "step %d/%d loss=%.4f pix=%.4f freq=%.4f ssim=%.4f perc=%.4f illum=%.4f aux=%.4f",
+                "step %d/%d loss=%.4f pix=%.4f freq=%.4f ssim=%.4f perc=%.4f illum=%.4f inter=%.4f",
                 step + 1,
                 len(loader),
                 meter_total.avg,
@@ -159,7 +159,7 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
                 meter_ssim.avg,
                 meter_perc.avg,
                 meter_illum.avg,
-                meter_aux.avg,
+                meter_inter.avg,
             )
 
     return {
@@ -169,7 +169,7 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
         "loss_ssim": meter_ssim.avg,
         "loss_perc": meter_perc.avg,
         "loss_illum": meter_illum.avg,
-        "loss_aux": meter_aux.avg,
+        "loss_inter": meter_inter.avg,
     }
 
 

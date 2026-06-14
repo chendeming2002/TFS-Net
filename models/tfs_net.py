@@ -163,22 +163,19 @@ class TFSNet(nn.Module):
             center_idx=center_idx,
         )
 
-        # Stage 4: IGRF
+        # Stage 4: IGRF v4.1 — 顺序级联融合（光照→去噪→运动）
         igrf_out = self.igrf(
-            f_t_base=F_fused,
             f_illum_out=ifpn_out["f_illum_out"],
             f_noise_out=ndpn_out["f_noise_out"],
             f_motion_out=mrpn_out["f_motion_out"],
-            s_illum=s_illum,
-            s_noise=s_noise,
-            s_motion=s_motion,
             image_center=image_center,
         )
 
         return {
             "res_t":          igrf_out["res_t"],
-            "delta":          igrf_out["delta"],
-            "f_fused_igrf":   igrf_out["f_fused"],
+            "img_s1":         igrf_out["img_s1"],
+            "img_s2":         igrf_out["img_s2"],
+            "image_center":   image_center,
             "s_illum":        s_illum,
             "s_noise":        s_noise,
             "s_motion":       s_motion,

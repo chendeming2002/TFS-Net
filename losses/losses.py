@@ -142,10 +142,10 @@ class BranchReconHead(nn.Module):
 
 class TFSNetLoss(nn.Module):
     """
-    TFS-Net v4 损失函数
+    TFS-Net v4.1 损失函数
 
     L_total = L_recon + λ_ssim * L_ssim + λ_perc * L_perc
-              + λ_illum * L_illum + λ_aux * L_aux
+              + λ_illum * L_illum + λ_inter * L_inter
 
         L_recon  = L_pix + λ_freq * L_freq
         L_pix    = Charbonnier(pred, target)
@@ -153,8 +153,8 @@ class TFSNetLoss(nn.Module):
         L_ssim   = 1 - SSIM(pred, target)
         L_perc   = PerceptualLoss(pred, target)
         L_illum  = edge-aware smoothness on s_illum
-        L_aux    = mean(Charbonnier(head_i(f_branch_i), target)) for i in {illum, noise, motion}
-                   # 每个分支有独立重建头，提供强监督信号
+        L_inter  = (Charbonnier(img_s1, target) + Charbonnier(img_s2, target)) / 2
+                   # IGRF 中间阶段图像直接监督，无需额外 head
     """
 
     def __init__(
@@ -166,7 +166,9 @@ class TFSNetLoss(nn.Module):
         lambda_freq: float = 0.1,
         lambda_illum: float = 0.01,
         lambda_ssim: float = 0.2,
-        lambda_aux: float = 0.5,
+        lambda_inter: float = 0.3,
+        # 保留旧参数兼容性
+        lambda_aux: float = 0.0,
         fused_channels: int = 64,
     ):
         super().__init__()
@@ -176,14 +178,9 @@ class TFSNetLoss(nn.Module):
         self.lambda_freq = lambda_freq
         self.lambda_illum = lambda_illum
         self.lambda_ssim = lambda_ssim
-        self.lambda_aux = lambda_aux
+        self.lambda_inter = lambda_inter
 
         self.perceptual = PerceptualLoss(pretrained=perceptual_pretrained)
-
-        # 独立分支重建头：每个分支有专属的 3 层重建网络
-        self.aux_head_illum = BranchReconHead(fused_channels, 3)
-        self.aux_head_noise = BranchReconHead(fused_channels, 3)
-        self.aux_head_motion = BranchReconHead(fused_channels, 3)
 
     @staticmethod
     def _edge_aware_smooth(s: torch.Tensor, ref_img: torch.Tensor) -> torch.Tensor:
@@ -237,17 +234,12 @@ class TFSNetLoss(nn.Module):
         # (5) 光照场边缘感知平滑
         L_illum = self._edge_aware_smooth(s_illum, target)
 
-        # (6) 独立分支重建损失（每个分支有专属重建头）
-        L_aux = pred.new_tensor(0.0)
-        if self.lambda_aux > 0 and "f_illum_out" in outputs:
-            f_illum = outputs["f_illum_out"]
-            f_noise = outputs["f_noise_out"]
-            f_motion = outputs["f_motion_out"]
-            L_aux = (
-                charbonnier_loss(self.aux_head_illum(f_illum), target) +
-                charbonnier_loss(self.aux_head_noise(f_noise), target) +
-                charbonnier_loss(self.aux_head_motion(f_motion), target)
-            ) / 3.0
+        # (6) IGRF 中间阶段监督（img_s1, img_s2 已是图像空间，直接对 GT 监督）
+        L_inter = pred.new_tensor(0.0)
+        if self.lambda_inter > 0 and "img_s1" in outputs:
+            L_s1 = charbonnier_loss(outputs["img_s1"], target)
+            L_s2 = charbonnier_loss(outputs["img_s2"], target)
+            L_inter = (L_s1 + L_s2) / 2.0
 
         # 总损失
         L_total = (
@@ -255,7 +247,7 @@ class TFSNetLoss(nn.Module):
             + self.lambda_ssim * L_ssim
             + self.lambda_perc * L_perc
             + self.lambda_illum * L_illum
-            + self.lambda_aux * L_aux
+            + self.lambda_inter * L_inter
         )
 
         loss_dict = {
@@ -265,7 +257,7 @@ class TFSNetLoss(nn.Module):
             "loss_ssim":  L_ssim.detach(),
             "loss_perc":  L_perc.detach(),
             "loss_illum": L_illum.detach(),
-            "loss_aux":   L_aux.detach(),
+            "loss_inter": L_inter.detach(),
         }
         return L_total, loss_dict
 
