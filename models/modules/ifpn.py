@@ -1,11 +1,8 @@
 """
-IFPN (Illumination-Filtering Pyramid Network) — TFS-Net v3
+IFPN (Illumination-Filtering Pyramid Network) - TFS-Net v4.2
 ============================================================
-基于 Retinexformer IllumExtract 的多帧光照参考估计与光照恢复。
-
-实现状态:
-    ✅ IllumExtract: groups=4 分组卷积
-    ✅ IFPN 主类: 多帧光照参考加权 + 强度调制
+Retinexformer IllumExtract multi-frame illumination reference estimation.
+v4.2: outputs lit_up_map + f_illum_feat for multiplicative brightening.
 """
 
 from __future__ import annotations
@@ -105,9 +102,16 @@ class IFPN(nn.Module):
 
         self.ratio_proj = nn.Conv2d(img_channels, fused_channels, kernel_size=1, bias=True)
 
-        self.refine = nn.Sequential(
+        self.feat_refine = nn.Sequential(
             ConvBlock(fused_channels, fused_channels, kernel_size=3, stride=1, padding=1, act=True),
             ConvBlock(fused_channels, fused_channels, kernel_size=1, stride=1, padding=0, act=False),
+        )
+
+        # v4.2: 提亮图精化网络（图像空间，残差修正 L_ratio）
+        self.lit_up_refine = nn.Sequential(
+            nn.Conv2d(img_channels, 16, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.GELU(),
+            nn.Conv2d(16, img_channels, kernel_size=1, stride=1, padding=0, bias=True),
         )
 
     def forward(
@@ -149,21 +153,23 @@ class IFPN(nn.Module):
         L_neighbors = torch.stack([L_list[i] for i in neighbor_indices], dim=1)
         L_ref = (weights * L_neighbors).sum(dim=1)
 
-        # Step 5: 强度调制
+        # Step 5: 光照比率估计（Retinexformer 风格）
         eps = 1e-3
-        L_ratio_lr = (L_ref / (L_t.abs() + eps)).clamp(-4.0, 4.0)
+        L_ratio_lr = (L_ref / (L_t.abs() + eps)).clamp(0.5, 8.0)  # v4.2: 确保 > 0.5（提亮倍率）
         L_ratio = F.interpolate(L_ratio_lr, size=(H, W), mode='bilinear', align_corners=False)
         ratio_feat = self.ratio_proj(L_ratio)
 
-        F_t = feats[:, center_idx]
+        # v4.2: 提亮图（图像空间，>= 1，物理意义：每个像素提亮多少倍）
+        lit_up_map_raw = L_ratio + self.lit_up_refine(L_ratio)  # 残差精化
+        lit_up_map_raw = lit_up_map_raw.clamp(min=0.5)         # 确保提亮倍率 >= 0.5
 
-        # v4.1: 加法残差 + skip connection（替代 v4 的乘法调制）
-        # 即使 ratio_feat=0 时，梯度仍通过 skip (F_t) 直通回传
-        f_illum_out = F_t + self.refine(F_t + ratio_feat)
+        # v4.2: 光照条件特征（特征空间，供 BrightenStage 条件编码）
+        f_illum_feat = self.feat_refine(ratio_feat)
 
         return {
-            "f_illum_out": f_illum_out,
-            "L_t":         L_t,
-            "L_ref":       L_ref,
-            "L_ratio":     L_ratio,
+            "lit_up_map_raw": lit_up_map_raw,
+            "f_illum_feat":  f_illum_feat,
+            "L_t":           L_t,
+            "L_ref":         L_ref,
+            "L_ratio":       L_ratio,
         }

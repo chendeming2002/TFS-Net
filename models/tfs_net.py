@@ -163,11 +163,12 @@ class TFSNet(nn.Module):
             center_idx=center_idx,
         )
 
-        # Stage 4: IGRF v4.1 — 顺序级联融合（光照→去噪→运动）
+        # Stage 4: IGRF v4.2 - Denoise -> Motion -> Brighten
         igrf_out = self.igrf(
-            f_illum_out=ifpn_out["f_illum_out"],
+            f_illum_feat=ifpn_out["f_illum_feat"],
             f_noise_out=ndpn_out["f_noise_out"],
             f_motion_out=mrpn_out["f_motion_out"],
+            lit_up_map_raw=ifpn_out["lit_up_map_raw"],
             image_center=image_center,
         )
 
@@ -175,11 +176,12 @@ class TFSNet(nn.Module):
             "res_t":          igrf_out["res_t"],
             "img_s1":         igrf_out["img_s1"],
             "img_s2":         igrf_out["img_s2"],
+            "lit_up_map":     igrf_out["lit_up_map"],
             "image_center":   image_center,
             "s_illum":        s_illum,
             "s_noise":        s_noise,
             "s_motion":       s_motion,
-            "f_illum_out":    ifpn_out["f_illum_out"],
+            "f_illum_feat":   ifpn_out["f_illum_feat"],
             "f_noise_out":    ndpn_out["f_noise_out"],
             "f_motion_out":   mrpn_out["f_motion_out"],
             "L_t":            ifpn_out["L_t"],

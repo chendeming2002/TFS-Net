@@ -234,11 +234,16 @@ class TFSNetLoss(nn.Module):
         # (5) 光照场边缘感知平滑
         L_illum = self._edge_aware_smooth(s_illum, target)
 
-        # (6) IGRF 中间阶段监督（img_s1, img_s2 已是图像空间，直接对 GT 监督）
+        # (6) v4.2: intermediate supervision - brightened intermediate images vs GT
+        # img_s1/img_s2 are dark (denoised/deblurred but not brightened)
+        # lit_up_map brightens them: img_s1 * lit_up_map should approximate GT
         L_inter = pred.new_tensor(0.0)
-        if self.lambda_inter > 0 and "img_s1" in outputs:
-            L_s1 = charbonnier_loss(outputs["img_s1"], target)
-            L_s2 = charbonnier_loss(outputs["img_s2"], target)
+        if self.lambda_inter > 0 and "img_s1" in outputs and "lit_up_map" in outputs:
+            lit_up_map = outputs["lit_up_map"]
+            res_s1 = torch.clamp(outputs["img_s1"] * lit_up_map, 0.0, 1.0)
+            res_s2 = torch.clamp(outputs["img_s2"] * lit_up_map, 0.0, 1.0)
+            L_s1 = charbonnier_loss(res_s1, target)
+            L_s2 = charbonnier_loss(res_s2, target)
             L_inter = (L_s1 + L_s2) / 2.0
 
         # 总损失
