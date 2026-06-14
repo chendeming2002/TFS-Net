@@ -122,9 +122,27 @@ def charbonnier_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6
     return torch.mean(torch.sqrt((pred - target) ** 2 + eps))
 
 
+class BranchReconHead(nn.Module):
+    """分支独立重建头：将分支特征投影到图像空间进行辅助监督。"""
+
+    def __init__(self, channels: int, out_channels: int = 3):
+        super().__init__()
+        mid = max(channels // 2, 16)
+        self.head = nn.Sequential(
+            nn.Conv2d(channels, mid, 3, 1, 1),
+            nn.GELU(),
+            nn.Conv2d(mid, mid, 3, 1, 1),
+            nn.GELU(),
+            nn.Conv2d(mid, out_channels, 1, 1, 0),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(x)
+
+
 class TFSNetLoss(nn.Module):
     """
-    TFS-Net v3.2 损失函数
+    TFS-Net v4 损失函数
 
     L_total = L_recon + λ_ssim * L_ssim + λ_perc * L_perc
               + λ_illum * L_illum + λ_aux * L_aux
@@ -135,7 +153,8 @@ class TFSNetLoss(nn.Module):
         L_ssim   = 1 - SSIM(pred, target)
         L_perc   = PerceptualLoss(pred, target)
         L_illum  = edge-aware smoothness on s_illum
-        L_aux    = mean(Charbonnier(proj(f_branch_i), target)) for i in {illum, noise, motion}
+        L_aux    = mean(Charbonnier(head_i(f_branch_i), target)) for i in {illum, noise, motion}
+                   # 每个分支有独立重建头，提供强监督信号
     """
 
     def __init__(
@@ -147,7 +166,7 @@ class TFSNetLoss(nn.Module):
         lambda_freq: float = 0.1,
         lambda_illum: float = 0.01,
         lambda_ssim: float = 0.2,
-        lambda_aux: float = 0.2,
+        lambda_aux: float = 0.5,
         fused_channels: int = 64,
     ):
         super().__init__()
@@ -161,8 +180,10 @@ class TFSNetLoss(nn.Module):
 
         self.perceptual = PerceptualLoss(pretrained=perceptual_pretrained)
 
-        # 辅助分支投影头：将分支特征投影到 RGB (共享权重)
-        self.aux_proj = nn.Conv2d(fused_channels, 3, kernel_size=1, bias=True)
+        # 独立分支重建头：每个分支有专属的 3 层重建网络
+        self.aux_head_illum = BranchReconHead(fused_channels, 3)
+        self.aux_head_noise = BranchReconHead(fused_channels, 3)
+        self.aux_head_motion = BranchReconHead(fused_channels, 3)
 
     @staticmethod
     def _edge_aware_smooth(s: torch.Tensor, ref_img: torch.Tensor) -> torch.Tensor:
@@ -216,16 +237,16 @@ class TFSNetLoss(nn.Module):
         # (5) 光照场边缘感知平滑
         L_illum = self._edge_aware_smooth(s_illum, target)
 
-        # (6) 辅助分支重建损失
+        # (6) 独立分支重建损失（每个分支有专属重建头）
         L_aux = pred.new_tensor(0.0)
         if self.lambda_aux > 0 and "f_illum_out" in outputs:
             f_illum = outputs["f_illum_out"]
             f_noise = outputs["f_noise_out"]
             f_motion = outputs["f_motion_out"]
             L_aux = (
-                charbonnier_loss(self.aux_proj(f_illum), target) +
-                charbonnier_loss(self.aux_proj(f_noise), target) +
-                charbonnier_loss(self.aux_proj(f_motion), target)
+                charbonnier_loss(self.aux_head_illum(f_illum), target) +
+                charbonnier_loss(self.aux_head_noise(f_noise), target) +
+                charbonnier_loss(self.aux_head_motion(f_motion), target)
             ) / 3.0
 
         # 总损失
