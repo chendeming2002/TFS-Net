@@ -142,19 +142,20 @@ class BranchReconHead(nn.Module):
 
 class TFSNetLoss(nn.Module):
     """
-    TFS-Net v4.1 损失函数
+    TFS-Net v4.3 loss function
 
-    L_total = L_recon + λ_ssim * L_ssim + λ_perc * L_perc
-              + λ_illum * L_illum + λ_inter * L_inter
+    L_total = L_recon + lambda_ssim * L_ssim + lambda_perc * L_perc
+              + lambda_illum * L_illum + lambda_inter * L_inter
 
-        L_recon  = L_pix + λ_freq * L_freq
+        L_recon  = L_pix + lambda_freq * L_freq
         L_pix    = Charbonnier(pred, target)
         L_freq   = L1(|FFT(pred)|, |FFT(target)|)
         L_ssim   = 1 - SSIM(pred, target)
         L_perc   = PerceptualLoss(pred, target)
         L_illum  = edge-aware smoothness on s_illum
-        L_inter  = (Charbonnier(img_s1, target) + Charbonnier(img_s2, target)) / 2
-                   # IGRF 中间阶段图像直接监督，无需额外 head
+        L_inter  = Charbonnier(clamp(img_s2 * lit_up_map, 0, 1), target)
+                   # v4.3: only img_s2 supervision (theoretically well-posed:
+                   # img_s2 is denoised + deblurred, so brightened version ~= GT)
     """
 
     def __init__(
@@ -234,17 +235,12 @@ class TFSNetLoss(nn.Module):
         # (5) 光照场边缘感知平滑
         L_illum = self._edge_aware_smooth(s_illum, target)
 
-        # (6) v4.2: intermediate supervision - brightened intermediate images vs GT
-        # img_s1/img_s2 are dark (denoised/deblurred but not brightened)
-        # lit_up_map brightens them: img_s1 * lit_up_map should approximate GT
+        # (6) v4.3: intermediate supervision on img_s2
+        # Charb(clamp(img_s2 * lit_up_map, 0, 1), target)
         L_inter = pred.new_tensor(0.0)
-        if self.lambda_inter > 0 and "img_s1" in outputs and "lit_up_map" in outputs:
-            lit_up_map = outputs["lit_up_map"]
-            res_s1 = torch.clamp(outputs["img_s1"] * lit_up_map, 0.0, 1.0)
-            res_s2 = torch.clamp(outputs["img_s2"] * lit_up_map, 0.0, 1.0)
-            L_s1 = charbonnier_loss(res_s1, target)
-            L_s2 = charbonnier_loss(res_s2, target)
-            L_inter = (L_s1 + L_s2) / 2.0
+        if self.lambda_inter > 0 and "img_s2" in outputs and "lit_up_map" in outputs:
+            img_s2_lit = torch.clamp(outputs["img_s2"] * outputs["lit_up_map"], 0.0, 1.0)
+            L_inter = charbonnier_loss(img_s2_lit, target)
 
         # 总损失
         L_total = (
