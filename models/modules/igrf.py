@@ -1,12 +1,11 @@
 """
-IGRF v4.2 - Sequential Cascade Fusion with Multiplicative Brightening
-=====================================================================
+IGRF v4.3 - Sequential Cascade Fusion with Bounded Multiplicative Brightening
+===============================================================================
 
-v4.2 key changes vs v4.1:
-  1. Stage order: noise -> motion -> brighten (denoise first, brighten last)
-  2. BrightenStage uses Retinexformer-style img * exp(lit_up_feat) multiplication
-  3. .detach() between stages to prevent gradient interference
-  4. Gradient stability: d(res_t)/d(lit_up_feat) = res_t (proportional to output)
+v4.3 key changes vs v4.2:
+  1. BrightenStage uses bounded delta: lit_up_map = raw * (1 + tanh(delta) * max_delta)
+  2. Eliminates clamp gradient dead zone from v4.2's exp(log(x) + delta)
+  3. L_inter only supervises img_s2 (theoretically well-posed, img_s1 still has blur)
 
 References:
   - Cai et al., Retinexformer (ICCV 2023): lit_up_map multiplicative brightening
@@ -44,17 +43,18 @@ class StageBlock(nn.Module):
 
 class BrightenStage(nn.Module):
     """
-    Retinexformer-style multiplicative brightening stage.
+    Bounded multiplicative brightening stage (v4.3).
 
-    Converts lit_up_map_raw to log space, adds a delta correction (conditioned
-    on illumination features and current image), then exponentiates.
+    lit_up_map = lit_up_map_raw * (1 + tanh(delta) * max_delta)
+    res_t = clamp(img_dark * lit_up_map, 0, 1)
 
-    res_t = img_dark * exp(log(lit_up_map_raw) + delta)
-    Gradient: d(res_t)/d(delta) = res_t (proportional to output, not dark input)
+    Bounded delta prevents the exp gradient dead zone from v4.2.
+    tanh limits adjustment range to +/- max_delta (default 50%).
     """
 
-    def __init__(self, channels: int, img_channels: int = 3):
+    def __init__(self, channels: int, img_channels: int = 3, max_delta: float = 0.5):
         super().__init__()
+        self.max_delta = max_delta
         self.feat_proj = nn.Conv2d(channels, img_channels, 3, 1, 1)
         self.img_proj = nn.Conv2d(img_channels, img_channels, 3, 1, 1)
         self.delta_refine = nn.Sequential(
@@ -69,19 +69,23 @@ class BrightenStage(nn.Module):
         feat_cond = self.feat_proj(f_illum_feat)
         img_cond = self.img_proj(img_dark)
         delta = self.delta_refine(torch.cat([feat_cond, img_cond], dim=1))
-        lit_up_log = torch.log(lit_up_map_raw.clamp(min=1e-6))
-        lit_up_map = torch.exp(lit_up_log + delta)
+
+        # Bounded delta: adjustment limited to +/- max_delta (default +/-50%)
+        lit_up_map = lit_up_map_raw * (1.0 + torch.tanh(delta) * self.max_delta)
+        lit_up_map = lit_up_map.clamp(min=0.5)
+
         res_t = torch.clamp(img_dark * lit_up_map, 0.0, 1.0)
         return res_t, lit_up_map
 
 
 class IGRF(nn.Module):
     """
-    IGRF v4.2 - Denoise -> Motion -> Brighten (sequential cascade with .detach())
+    IGRF v4.3 - Denoise -> Motion -> Brighten (sequential cascade)
 
-    Stage 1 (denoise):     img_s1 = image_center + delta_noise
-    Stage 2 (motion):      img_s2 = img_s1.detach() + delta_motion
-    Stage 3 (brighten):    res_t  = img_s2.detach() * exp(log(lit_up_map_raw) + delta)
+    Stage 1 (denoise):   img_s1 = image_center + delta_noise
+    Stage 2 (motion):    img_s2 = img_s1 + delta_motion
+    Stage 3 (brighten):  res_t  = img_s2 * bounded_lit_up_map
+                          (NO .detach(): L_recon gradient flows through to NDPN/MRPN)
     """
 
     def __init__(self, channels: int = 64, out_channels: int = 3):
@@ -104,13 +108,12 @@ class IGRF(nn.Module):
         # Stage 1: denoise (in dark domain, noise amplitude is small)
         img_s1, delta_s1 = self.stage_noise(f_noise_out, image_center)
 
-        # Stage 2: motion deblur (.detach() prevents gradient interference)
-        img_s2, delta_s2 = self.stage_motion(f_motion_out, img_s1.detach())
+        # Stage 2: motion deblur
+        img_s2, delta_s2 = self.stage_motion(f_motion_out, img_s1)
 
-        # Stage 3: Retinexformer-style multiplicative brightening (.detach())
-        res_t, lit_up_map = self.brighten(
-            lit_up_map_raw, f_illum_feat, img_s2.detach()
-        )
+        # Stage 3: bounded multiplicative brightening
+        # NO .detach() on img_s2: allow L_recon gradient to flow through to NDPN/MRPN
+        res_t, lit_up_map = self.brighten(lit_up_map_raw, f_illum_feat, img_s2)
 
         return {
             "res_t":       res_t,

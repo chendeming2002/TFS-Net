@@ -14,26 +14,26 @@ model:
   level_channels: [32, 64, 96, 128]
   fused_channels: 64
 train:
-  batch_size: 4
-  epochs: 50
+  batch_size: 2
+  epochs: 100
   lr: 0.001
   weight_decay: 0.0001
-  amp: true
+  amp: false
   log_interval: 50
   val_interval: 5
-  warmup_epochs: 3
-  grad_clip: 1.0
+  warmup_epochs: 5
+  grad_clip: 0.5
 loss:
   type: TFSNetLoss
   use_freq_loss: true
   perceptual_pretrained: true
-  lambda_perc: 0.2
+  lambda_perc: 0.1
   lambda_freq: 0.1
   lambda_illum: 0.01
-  lambda_ssim: 0.2
+  lambda_ssim: 0.1
   lambda_inter: 0.3
   fused_channels: 64
 eval:
   tile_size: 256
   tile_overlap: 32
-  amp: true
+  amp: false

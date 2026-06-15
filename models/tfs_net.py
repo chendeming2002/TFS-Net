@@ -163,7 +163,7 @@ class TFSNet(nn.Module):
             center_idx=center_idx,
         )
 
-        # Stage 4: IGRF v4.2 - Denoise -> Motion -> Brighten
+        # Stage 4: IGRF v4.3 - Denoise -> Motion -> Bounded Brighten
         igrf_out = self.igrf(
             f_illum_feat=ifpn_out["f_illum_feat"],
             f_noise_out=ndpn_out["f_noise_out"],

@@ -1,8 +1,8 @@
 """
-IFPN (Illumination-Filtering Pyramid Network) - TFS-Net v4.2
+IFPN (Illumination-Filtering Pyramid Network) - TFS-Net v4.3
 ============================================================
-Retinexformer IllumExtract multi-frame illumination reference estimation.
-v4.2: outputs lit_up_map + f_illum_feat for multiplicative brightening.
+v4.3: Hybrid lit_up_map (L_ratio anchor + feat_proj delta), sigmoid-bounded,
+      s_illum conditioning for illumination prior integration.
 """
 
 from __future__ import annotations
@@ -79,12 +79,14 @@ class IFPN(nn.Module):
         n_fea_middle: int = 32,
         n_fea_in: int = 4,
         sim_temperature: float = 1.0,
+        max_bright: float = 4.0,
     ):
         super().__init__()
         self.fused_channels = fused_channels
         self.coarse_channels = coarse_channels
         self.img_channels = img_channels
         self.sim_temperature = sim_temperature
+        self.max_bright = max_bright
 
         self.illum_extract = IllumExtract(
             img_channels=img_channels,
@@ -102,17 +104,16 @@ class IFPN(nn.Module):
 
         self.ratio_proj = nn.Conv2d(img_channels, fused_channels, kernel_size=1, bias=True)
 
+        # v4.3: s_illum (1ch) is expanded and concatenated with ratio_feat
+        self.illum_cond_proj = nn.Conv2d(fused_channels + 1, fused_channels, kernel_size=1, bias=True)
+
         self.feat_refine = nn.Sequential(
             ConvBlock(fused_channels, fused_channels, kernel_size=3, stride=1, padding=1, act=True),
             ConvBlock(fused_channels, fused_channels, kernel_size=1, stride=1, padding=0, act=False),
         )
 
-        # v4.2: 提亮图精化网络（图像空间，残差修正 L_ratio）
-        self.lit_up_refine = nn.Sequential(
-            nn.Conv2d(img_channels, 16, kernel_size=3, stride=1, padding=1, bias=True),
-            nn.GELU(),
-            nn.Conv2d(16, img_channels, kernel_size=1, stride=1, padding=0, bias=True),
-        )
+        # v4.3: hybrid estimation - feature space delta projected to image space
+        self.lit_up_proj = nn.Conv2d(fused_channels, img_channels, kernel_size=1, bias=True)
 
     def forward(
         self,
@@ -153,18 +154,24 @@ class IFPN(nn.Module):
         L_neighbors = torch.stack([L_list[i] for i in neighbor_indices], dim=1)
         L_ref = (weights * L_neighbors).sum(dim=1)
 
-        # Step 5: 光照比率估计（Retinexformer 风格）
+        # Step 5: Illumination ratio estimation
         eps = 1e-3
-        L_ratio_lr = (L_ref / (L_t.abs() + eps)).clamp(0.5, 8.0)  # v4.2: 确保 > 0.5（提亮倍率）
+        L_ratio_lr = (L_ref / (L_t.abs() + eps)).clamp(0.5, 8.0)
         L_ratio = F.interpolate(L_ratio_lr, size=(H, W), mode='bilinear', align_corners=False)
         ratio_feat = self.ratio_proj(L_ratio)
 
-        # v4.2: 提亮图（图像空间，>= 1，物理意义：每个像素提亮多少倍）
-        lit_up_map_raw = L_ratio + self.lit_up_refine(L_ratio)  # 残差精化
-        lit_up_map_raw = lit_up_map_raw.clamp(min=0.5)         # 确保提亮倍率 >= 0.5
+        # v4.3: integrate s_illum prior into illumination features
+        if s_illum is not None:
+            s_illum_up = F.interpolate(s_illum, size=(H, W), mode='bilinear', align_corners=False)
+            illum_cond = torch.cat([ratio_feat, s_illum_up], dim=1)  # (B, C+1, H, W)
+            ratio_feat = self.illum_cond_proj(illum_cond)              # (B, C, H, W)
 
-        # v4.2: 光照条件特征（特征空间，供 BrightenStage 条件编码）
         f_illum_feat = self.feat_refine(ratio_feat)
+
+        # v4.3: hybrid estimation - L_ratio anchor + feature-space delta
+        lit_up_delta = self.lit_up_proj(f_illum_feat)              # 64ch -> 3ch
+        lit_up_feat = L_ratio + lit_up_delta                        # physical anchor + feature correction
+        lit_up_map_raw = 1.0 + self.max_bright * torch.sigmoid(lit_up_feat)  # bounded [1, 1+max_bright]
 
         return {
             "lit_up_map_raw": lit_up_map_raw,
