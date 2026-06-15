@@ -5,6 +5,7 @@
     <mapping directory="$PROJECT_DIR$/reference_repos/BasicSR" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/reference_repos/DAT" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/reference_repos/FRBNet" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/reference_repos/MINS-Net" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/reference_repos/NAFNet" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/reference_repos/Retinexformer" vcs="Git" />
   </component>
