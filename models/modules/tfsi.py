@@ -6,8 +6,8 @@ v5 设计：输出双源独立强度图 [s_illum, s_noise]，s_motion 已废弃�
 
 实现状态：
   - 空间分支（时域统计量 → Conv）：✅ 已实现
-  - 门控融合：✅ 已实现
-  - 强度输出头（3 路 Sigmoid）：✅ 已实现
+  - 拼接融合：✅ 已实现（v5.2 从 sigmoid 门控改为 concat + Conv）
+  - 强度输出头（2 路 Sigmoid）：✅ 已实现
   - 频域分支（LFF 可学习频率滤波）：✅ 已实现 (B.2)
 
 设计参考：TFSv3-result.md § 4.1
@@ -136,21 +136,24 @@ class FrequencyBranch(nn.Module):
         return f_f
 
 
-class GatedFusion(nn.Module):
+class ConcatFusion(nn.Module):
     """
-    TFSI 门控融合（替代 v2 的跨域注意力）
+    TFSI 拼接融合（v5.2: 替代 sigmoid 门控）
 
     公式：
-        g = σ(Conv1x1(Concat[F_s, F_f]))
-        F_fused = g ⊙ F_s + (1-g) ⊙ F_f
+        F_fused = Conv3x3(GELU(Conv3x3(Concat[F_s, F_f])))
 
-    参考：Restormer (CVPR 2022)、NAFNet (ECCV 2022) 的标准门控融合设计。
+    两分支拼接后经两层 3×3 Conv 学习跨通道交互，
+    比 sigmoid 门控（g + (1-g) = 1 互补约束）表达更灵活。
     """
 
     def __init__(self, fused_channels: int):
         super().__init__()
         # 输入：Concat[F_s, F_f]，共 2*C_f 通道
-        self.gate_conv = nn.Conv2d(fused_channels * 2, fused_channels, 1, 1, 0)
+        self.fuse = nn.Sequential(
+            ConvBlock(fused_channels * 2, fused_channels, kernel_size=3, stride=1, padding=1, act=True),
+            ConvBlock(fused_channels, fused_channels, kernel_size=3, stride=1, padding=1, act=True),
+        )
 
     def forward(self, f_s: torch.Tensor, f_f: torch.Tensor) -> torch.Tensor:
         """
@@ -159,12 +162,9 @@ class GatedFusion(nn.Module):
             f_f: (B, C_f, H, W) 频域分支特征
 
         Returns:
-            F_fused: (B, C_f, H, W) 门控融合特征
+            F_fused: (B, C_f, H, W) 融合特征
         """
-        concat = torch.cat([f_s, f_f], dim=1)   # (B, 2*C_f, H, W)
-        g = torch.sigmoid(self.gate_conv(concat))  # (B, C_f, H, W)
-        f_fused = g * f_s + (1.0 - g) * f_f    # (B, C_f, H, W)
-        return f_fused
+        return self.fuse(torch.cat([f_s, f_f], dim=1))
 
 
 class IntensityHead(nn.Module):
@@ -184,7 +184,7 @@ class IntensityHead(nn.Module):
     def forward(self, f_fused: torch.Tensor) -> dict:
         """
         Args:
-            f_fused: (B, C_f, H, W) 门控融合特征
+            f_fused: (B, C_f, H, W) 融合特征
 
         Returns:
             dict:
@@ -203,14 +203,14 @@ class IntensityHead(nn.Module):
 
 class TFSI(nn.Module):
     """
-    TFSI 时频源指示器：整合空间分支、频域分支（占位）、门控融合、强度输出
+    TFSI 时频源指示器：整合空间分支、频域分支、拼接融合、强度输出
 
     数据流：
         feats (B,T,C,H,W)
             ├── SpatialBranch  → F_s (B,C_f,H,W), μ_t, σ_t, snr
-            └── FrequencyBranch → F_f (B,C_f,H,W)  [当前为零张量]
+            └── FrequencyBranch → F_f (B,C_f,H,W)
                     ↓
-              GatedFusion(F_s, F_f) → F_fused (B,C_f,H,W)
+              ConcatFusion(F_s, F_f) → F_fused (B,C_f,H,W)
                     ↓
               IntensityHead(F_fused) → s_illum, s_noise (B,1,H,W)
 
@@ -234,7 +234,7 @@ class TFSI(nn.Module):
             n_ang_freq=1,
             per_channel_rbf=False,
         )
-        self.gated_fusion = GatedFusion(fused_channels)
+        self.concat_fusion = ConcatFusion(fused_channels)
         self.intensity_head = IntensityHead(fused_channels)
 
     def forward(self, feats: torch.Tensor) -> dict:
@@ -244,7 +244,7 @@ class TFSI(nn.Module):
 
         Returns:
             dict:
-                F_fused   : (B, C_f, H, W) 门控融合特征
+                F_fused   : (B, C_f, H, W) 融合特征
                 F_s       : (B, C_f, H, W) 空间分支特征（供调试/可视化）
                 F_f       : (B, C_f, H, W) 频域分支特征（供调试/可视化）
                 mu_t      : (B, C, H, W) 时域中位值
@@ -267,8 +267,8 @@ class TFSI(nn.Module):
         # 频域分支（当前为零张量占位）
         f_f = self.freq_branch(feats_norm, center_idx)
 
-        # 门控融合
-        f_fused = self.gated_fusion(f_s, f_f)
+        # 拼接融合
+        f_fused = self.concat_fusion(f_s, f_f)
 
         # 强度输出
         intensities = self.intensity_head(f_fused)

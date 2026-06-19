@@ -126,7 +126,7 @@ $$\mathcal{F}\{y_t\}(u,v) = A(u,v) \cdot \exp(j \cdot \phi(u,v))$$
 | $I_t$ | 中心帧原始图像 | `image_center = x[:, T//2]` |
 | $I_t^{GT}$ | 中心帧 ground truth | `target` |
 | $F_i$ | 第 $i$ 帧编码器特征 | `feats[:, i]` |
-| $F_i^{(L)}$ | 第 $i$ 帧最粗尺度特征 | `coarse_feats[:, i]` |
+| $F_i^{(L)}$ | 第 $i$ 帧粗尺度特征 | v5.3: 由 `coarse_adapter`$(F_i^{aligned})$ 生成（原为 `coarse_feats[:, i]`） |
 | $s_{illum}, s_{noise}$ | 双源退化强度图 | TFSI 输出，$\in [0,1]^{1 \times H \times W}$（v5: s_motion 已废弃） |
 
 ### 1.4 五阶段管线公式
@@ -190,11 +190,11 @@ $$F_f = W_{post} \cdot \text{IFFT2}(A' \cdot e^{j\phi'}) \in \mathbb{R}^{C \time
 
 其中 $g_k = \text{sigmoid}(\text{raw\_gate}_k)$，$c_k$ 为可学习系数，$W_{post}$ 为 1×1 卷积（初始化为恒等映射）。
 
-**门控融合**：
+**拼接融合**（v5.2: 替代 sigmoid 门控）：
 
-$$g = \sigma(\text{Conv}_{1\times1}([F_s \| F_f]))$$
+$$F_{fused} = \text{Conv}_{3\times3}(\text{GELU}(\text{Conv}_{3\times3}([F_s \| F_f]))) \in \mathbb{R}^{C \times H \times W}$$
 
-$$F_{fused} = g \odot F_s + (1 - g) \odot F_f \in \mathbb{R}^{C \times H \times W}$$
+两分支拼接后经两层 3×3 Conv 学习跨通道交互，比 sigmoid 门控（$g + (1-g) = 1$ 互补约束）表达更灵活。
 
 **双源强度输出**（v5: 移除 s_motion，独立 Sigmoid，允许多源叠加）：
 
@@ -232,9 +232,15 @@ $$F_i^{aligned} = \text{DeformAttn}(\mu_t^{clean}, \tilde{F}_i, \Delta p_i, m_i)
 
 #### Stage 3：三源恢复分支（并行）
 
-**IFPN（光照恢复）**：
+**IFPN（光照恢复）** v5.3: 使用 SACE 对齐特征替代 Encoder 粗特征：
 
-光照图提取（双流输入：低分辨率原图 + 最粗尺度特征）：
+粗特征适配器（通道投影 + 空间下采样）：
+
+$$F_i^{(L)} = \text{AvgPool}(\text{GELU}(W_{adapt} \cdot F_i^{aligned})) \in \mathbb{R}^{C_L \times H/4 \times W/4}$$
+
+其中 $W_{adapt}: C_f \to C_L$，$C_L=128$。
+
+光照图提取（双流输入：低分辨率原图 + 适配后的粗特征）：
 
 $$L_t = \text{IllumExtract}([I_t^{down} \| \text{mean}(I_t^{down}) \| W_{fp} F_t^{(L)}])$$
 
@@ -428,7 +434,7 @@ v4.3 级联顺序：Denoise → Motion → Brighten
 当前 IFPN/NDPN/MRPN 完全独立运行：
 
 ```
-IFPN: feats, coarse_feats, s_illum → f_illum_feat, lit_up_map_raw
+IFPN: feats, aligned_feats (SACE), s_illum → f_illum_feat, lit_up_map_raw
 NDPN: feats, F_aligned_list, μ_t_clean, σ_t, s_noise → f_noise_out
 MRPN: feats, F_aligned_list, s_motion → f_motion_out
 ```
@@ -773,7 +779,7 @@ mrpn_out = self.mrpn(F_aligned_list=F_aligned_list,
 | v4.1 | 顺序级联（光照→噪声→运动）+ 中间监督 | IFPN 梯度改善 3x |
 | v4.2 | 去噪→运动→提亮 + 乘法提亮 | **训练失败**（loss 不下降） |
 | v4.3 | 有界乘法提亮 + hybrid lit_up_map + 移除 .detach() | **PSNR=19.9 dB, SSIM=0.765** |
-| **v5** | **MRPN 窗口相关+门控融合+残差精炼 / TFSI 移除 s_motion / v5.1 同域设计** | — |
+| **v5** | **MRPN 窗口相关+门控融合+残差精炼 / TFSI 移除 s_motion / v5.1 MRPN同域设计 / v5.2 TFSI concat融合 / v5.3 IFPN同域设计** | — |
 
 ---
 
@@ -783,7 +789,7 @@ mrpn_out = self.mrpn(F_aligned_list=F_aligned_list,
 |------|------|
 | `models/tfs_net.py` | 主网络（5 stage pipeline） |
 | `models/modules/igrf.py` | IGRF v4.3（StageBlock + BrightenStage） |
-| `models/modules/ifpn.py` | IFPN v4.3（hybrid lit_up_map） |
+| `models/modules/ifpn.py` | IFPN v5.3（hybrid lit_up_map + coarse_adapter） |
 | `models/modules/ndpn.py` | NDPN 去噪分支 |
 | `models/modules/mrpn.py` | MRPN 运动补偿分支 |
 | `models/modules/tfsi.py` | TFSI 时频源指示器 |

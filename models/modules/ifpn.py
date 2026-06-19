@@ -64,15 +64,19 @@ class IFPN(nn.Module):
     """
     Illumination-Filtering Pyramid Network.
 
+    v5.3: 用 SACE 对齐特征替代 Encoder 粗特征，通过 coarse_adapter 适配维度。
+
     Args:
-        fused_channels   : 中心帧特征通道数 (默认 48)
-        coarse_channels  : 粗尺度特征通道 (默认 96)
+        fused_channels   : 中心帧特征通道数 (默认 64)
+        aligned_channels : SACE 对齐特征通道数 (默认 = fused_channels)
+        coarse_channels  : 内部粗特征通道 (默认 128, IllumExtract 输入)
         img_channels     : 图像通道 (默认 3)
     """
 
     def __init__(
         self,
         fused_channels: int = 64,
+        aligned_channels: int = None,
         coarse_channels: int = 128,
         img_channels: int = 3,
         feat_proj_channels: int = 16,
@@ -83,10 +87,17 @@ class IFPN(nn.Module):
     ):
         super().__init__()
         self.fused_channels = fused_channels
+        self.aligned_channels = aligned_channels or fused_channels
         self.coarse_channels = coarse_channels
         self.img_channels = img_channels
         self.sim_temperature = sim_temperature
         self.max_bright = max_bright
+
+        # v5.3: SACE 对齐特征 → 粗特征适配器 (1×1 Conv + 空间下采样)
+        self.coarse_adapter = nn.Sequential(
+            nn.Conv2d(self.aligned_channels, coarse_channels, 1, 1, 0),
+            nn.GELU(),
+        )
 
         self.illum_extract = IllumExtract(
             img_channels=img_channels,
@@ -118,15 +129,32 @@ class IFPN(nn.Module):
     def forward(
         self,
         I_t_down: torch.Tensor,
-        F_t_L: torch.Tensor,
         s_illum: torch.Tensor,
-        feats: torch.Tensor,
-        coarse_feats: torch.Tensor,
+        aligned_feats: torch.Tensor,
         center_idx: int,
         imgs_down: torch.Tensor = None,
     ) -> Dict[str, torch.Tensor]:
-        B, T, C_f, H, W = feats.shape
-        _, _, _, h, w = coarse_feats.shape
+        """
+        Args:
+            I_t_down      : (B, 3, h, w) 下采样后的中心帧图像
+            s_illum       : (B, 1, H, W) TFSI 光照强度
+            aligned_feats : (B, T, C_a, H, W) SACE 对齐后的多帧特征
+            center_idx    : 中心帧索引
+            imgs_down     : (B, T, 3, h, w) 下采样后的多帧图像（可选）
+        """
+        B, T, C_a, H, W = aligned_feats.shape
+
+        # v5.3: 从 SACE 对齐特征生成粗特征（通道投影 + 空间下采样）
+        BT = B * T
+        aligned_flat = aligned_feats.view(BT, *aligned_feats.shape[2:])
+        projected = self.coarse_adapter(aligned_flat)
+        # 目标空间尺寸：从 I_t_down 推断
+        h, w = I_t_down.shape[-2:]
+        coarse_flat = F.adaptive_avg_pool2d(projected, (h, w))
+        coarse_feats = coarse_flat.view(B, T, self.coarse_channels, h, w)
+
+        # F_t_L: 中心帧粗特征（内部生成）
+        F_t_L = coarse_feats[:, center_idx]
 
         # Step 1: 中心帧光照
         L_t = self.illum_extract(I_t_down, F_t_L)

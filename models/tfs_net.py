@@ -117,20 +117,16 @@ class TFSNet(nn.Module):
 
         # Stage 0: 编码（支持逐帧缓存）
         feats_list: List[torch.Tensor] = []
-        coarse_list: List[torch.Tensor] = []
         for i in range(T):
             gidx = frame_indices[i] if frame_indices else None
             if gidx is not None and gidx in self.frame_cache:
                 feats_list.append(self.frame_cache[gidx]["feat"])
-                coarse_list.append(self.frame_cache[gidx]["coarse"])
             else:
-                f, c = self.encoder.forward_single(x[:, i], return_coarse=True)
+                f = self.encoder.forward_single(x[:, i], return_coarse=False)
                 feats_list.append(f)
-                coarse_list.append(c)
                 if gidx is not None:
-                    self.frame_cache[gidx] = {"feat": f, "coarse": c}
+                    self.frame_cache[gidx] = {"feat": f}
         feats = torch.stack(feats_list, dim=1)
-        coarse_feats = torch.stack(coarse_list, dim=1)
 
         # Stage 1: TFSI
         tfsi_out = self.tfsi(feats)
@@ -164,23 +160,23 @@ class TFSNet(nn.Module):
         # Stage 3: 三源恢复
         image_center = x[:, center_idx]
 
-        _, _, _, hc, wc = coarse_feats.shape
+        # v5.3: IFPN 改用 SACE 对齐特征（不再使用 Encoder 粗特征）
+        aligned_feats = torch.stack(F_aligned_list, dim=1)  # (B, T, C_f, H, W)
+
+        # 下采样图像到粗特征分辨率（H/4, W/4 由编码器结构决定）
+        h_c, w_c = H // 4, W // 4
         image_down = F.interpolate(
-            image_center, size=(hc, wc), mode='bicubic', align_corners=False
+            image_center, size=(h_c, w_c), mode='bicubic', align_corners=False
         )
         imgs_down = F.interpolate(
             x.view(B * T, C_in, H, W),
-            size=(hc, wc), mode='bicubic', align_corners=False,
-        ).view(B, T, C_in, hc, wc)
-
-        F_t_L = coarse_feats[:, center_idx]
+            size=(h_c, w_c), mode='bicubic', align_corners=False,
+        ).view(B, T, C_in, h_c, w_c)
 
         ifpn_out = self.ifpn(
             I_t_down=image_down,
-            F_t_L=F_t_L,
             s_illum=s_illum,
-            feats=feats,
-            coarse_feats=coarse_feats,
+            aligned_feats=aligned_feats,
             center_idx=center_idx,
             imgs_down=imgs_down,
         )
