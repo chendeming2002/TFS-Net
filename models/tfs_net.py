@@ -43,7 +43,7 @@ class TFSNet(nn.Module):
     def __init__(
         self,
         in_channels: int = 3,
-        level_channels: Tuple[int, ...] = (32, 64, 96, 128),
+        level_channels: Tuple[int, ...] = (32, 64, 96),
         fused_channels: int = 64,
         eps: float = 1e-6,
         n_groups: int = 4,
@@ -55,7 +55,7 @@ class TFSNet(nn.Module):
         self.in_channels = in_channels
         self.fused_channels = fused_channels
         self.share_lff = share_lff
-        # 支持 3 或 4 级编码器
+        # v5.5: 默认 3 级编码器, coarse_channels=96
         coarse_channels = level_channels[-1]  # 最粗层通道数
 
         # Stage 0: PyramidEncoder
@@ -178,7 +178,6 @@ class TFSNet(nn.Module):
 
         ifpn_out = self.ifpn(
             I_t_down=image_down,
-            s_illum=s_illum,
             aligned_feats=aligned_feats,
             center_idx=center_idx,
             imgs_down=imgs_down,
@@ -198,13 +197,16 @@ class TFSNet(nn.Module):
             center_idx=center_idx,
         )
 
-        # Stage 4: IGRF v4.3 - Denoise -> Motion -> Bounded Brighten
+        # Stage 4: IGRF v5.5 - Denoise -> Motion -> Hybrid Brighten
+        # v5.5: s_illum/s_noise directly injected into IGRF (no channel dilution)
         igrf_out = self.igrf(
             f_illum_feat=ifpn_out["f_illum_feat"],
             f_noise_out=ndpn_out["f_noise_out"],
             f_motion_out=mrpn_out["f_motion_out"],
             lit_up_map_raw=ifpn_out["lit_up_map_raw"],
             image_center=image_center,
+            s_illum=s_illum,
+            s_noise=s_noise,
         )
 
         return {

@@ -20,7 +20,7 @@ def test_model_construction():
     from models import TFSNet
     model = TFSNet(
         in_channels=3,
-        level_channels=[32, 64, 96, 128],
+        level_channels=[32, 64, 96],
         fused_channels=64
     )
     print(f"  OK - TFSNet created")

@@ -11,7 +11,7 @@ dataset:
 model:
   type: TFSNet
   in_channels: 3
-  level_channels: [32, 64, 96, 128]
+  level_channels: [32, 64, 96]
   fused_channels: 64
 train:
   batch_size: 3
@@ -29,7 +29,7 @@ loss:
   perceptual_pretrained: true
   lambda_perc: 0.1
   lambda_freq: 0.1
-  lambda_illum: 0.1
+  lambda_illum: 0.01
   lambda_ssim: 0.1
   lambda_inter: 0.3
   fused_channels: 64

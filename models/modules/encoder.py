@@ -1,14 +1,12 @@
 """
 PyramidEncoder — 多尺度金字塔编码器
-=====================================
+====================================
+
+v5.5: 默认 3 级金字塔 [32, 64, 96]，移除 4 级配置。
+      最粗尺度 l3 (96ch, H/4×W/4)，coarse_channels=96。
+      4 级配置仍通过 level_channels 长度 4 向后兼容，但不再推荐。
 
 v3 修改：新增 return_coarse 参数，支持返回最粗尺度特征 F_t^(L) 供 IFPN 双流使用。
-
-当前假设（待确认，详见 v3quest.md § 1.4.4）：
-  - coarse_feat = l3（stage3 直接输出，96 通道，H/4×W/4）
-  - 注：当前 PyramidEncoder 两次 stride=2 下采样，l3 分辨率为 H/4×W/4
-  - v3 设计文档写 H/8×W/8，与当前编码器结构不一致（需额外 stage 或修改下采样）
-  - 而非 p3（lateral 投影后，48 通道，H×W 全分辨率）
 
 向后兼容：return_coarse=False 时保持与 v1 MINSNet 完全一致的接口。
 """
@@ -33,7 +31,7 @@ class EncoderStage(nn.Module):
 
 
 class PyramidEncoder(nn.Module):
-    def __init__(self, in_channels=3, level_channels=(32, 64, 96, 128), fused_channels=64):
+    def __init__(self, in_channels=3, level_channels=(32, 64, 96), fused_channels=64):
         super().__init__()
         if len(level_channels) == 4:
             c1, c2, c3, c4 = level_channels

@@ -1,8 +1,9 @@
 """
-IFPN (Illumination-Filtering Pyramid Network) - TFS-Net v4.3
+IFPN (Illumination-Filtering Pyramid Network) - TFS-Net v5.5
 ============================================================
-v4.3: Hybrid lit_up_map (L_ratio anchor + feat_proj delta), sigmoid-bounded,
-      s_illum conditioning for illumination prior integration.
+v4.3: Hybrid lit_up_map (L_ratio anchor + feat_proj delta), sigmoid-bounded.
+v5.5: s_illum removed from IFPN — directly injected into IGRF BrightenStage.
+      IFPN now purely data-driven (aligned_feats + image), no intensity prior.
 """
 
 from __future__ import annotations
@@ -115,8 +116,8 @@ class IFPN(nn.Module):
 
         self.ratio_proj = nn.Conv2d(img_channels, fused_channels, kernel_size=1, bias=True)
 
-        # v4.3: s_illum (1ch) is expanded and concatenated with ratio_feat
-        self.illum_cond_proj = nn.Conv2d(fused_channels + 1, fused_channels, kernel_size=1, bias=True)
+        # v5.5: s_illum removed from IFPN (directly injected into IGRF instead)
+        # illum_cond_proj (65->64) no longer needed
 
         self.feat_refine = nn.Sequential(
             ConvBlock(fused_channels, fused_channels, kernel_size=3, stride=1, padding=1, act=True),
@@ -129,7 +130,6 @@ class IFPN(nn.Module):
     def forward(
         self,
         I_t_down: torch.Tensor,
-        s_illum: torch.Tensor,
         aligned_feats: torch.Tensor,
         center_idx: int,
         imgs_down: torch.Tensor = None,
@@ -137,10 +137,11 @@ class IFPN(nn.Module):
         """
         Args:
             I_t_down      : (B, 3, h, w) 下采样后的中心帧图像
-            s_illum       : (B, 1, H, W) TFSI 光照强度
             aligned_feats : (B, T, C_a, H, W) SACE 对齐后的多帧特征
             center_idx    : 中心帧索引
             imgs_down     : (B, T, 3, h, w) 下采样后的多帧图像（可选）
+
+        v5.5: s_illum removed — directly injected into IGRF BrightenStage instead.
         """
         B, T, C_a, H, W = aligned_feats.shape
 
@@ -188,12 +189,7 @@ class IFPN(nn.Module):
         L_ratio = F.interpolate(L_ratio_lr, size=(H, W), mode='bilinear', align_corners=False)
         ratio_feat = self.ratio_proj(L_ratio)
 
-        # v4.3: integrate s_illum prior into illumination features
-        if s_illum is not None:
-            s_illum_up = F.interpolate(s_illum, size=(H, W), mode='bilinear', align_corners=False)
-            illum_cond = torch.cat([ratio_feat, s_illum_up], dim=1)  # (B, C+1, H, W)
-            ratio_feat = self.illum_cond_proj(illum_cond)              # (B, C, H, W)
-
+        # v5.5: s_illum no longer concatenated here — directly injected into IGRF
         f_illum_feat = self.feat_refine(ratio_feat)
 
         # v4.3: hybrid estimation - L_ratio anchor + feature-space delta

@@ -1067,6 +1067,215 @@ PSNR 0.28dB 的差异在 4 epoch / 2 序列的简短训练下不具统计显著�
 | `outputs/ablation_baseline/best.pth` | Baseline 最佳 checkpoint |
 | `outputs/ablation_m4_decoupled/best.pth` | M4 最佳 checkpoint |
 
+### 4.10 梯度饥饿与 s_illum 失效的根因诊断（实证）
+
+> 本节基于 v5.4 实测梯度探针（`retain_grad()` 追踪中间 tensor 梯度），从当前架构精确定位 s_illum 失效与三分支梯度饥饿的成因。
+
+#### 4.10.1 s_illum 失效：两条梯度路径的 14000:1 悬殊比
+
+实测确认 s_illum 有两条梯度来源：
+
+| 梯度来源 | 路径 | 实测梯度范数 |
+|---------|------|-----------|
+| **L_illum**（直接） | `L_illum → ∂L/∂s_illum`（边缘感知平滑，1 步） | **0.0439** |
+| **L_pix**（间接） | `L_pix → res_t → lit_up_map → f_illum_feat → ratio_feat → illum_cond_proj → s_illum`（~8 步链式） | **0.0000031** |
+
+**比值 = 0.0439 / 0.0000031 ≈ 14,000 : 1**。即使 $\lambda_{illum}=0.1$，有效比仍是 **1,400 : 1**。
+
+##### 间接路径（L_pix）的三重衰减
+
+1. **乘性提亮的暗域衰减（~100×）**：$\partial res_t / \partial lit\_up\_map = img_{s2}$。实测 $img_{s2}$ 均值 = **0.036**（暗域），而 $lit\_up\_map$ 均值 = **3.63**。IFPN 路径的梯度乘数是 0.036，NDPN/MRPN 路径的梯度乘数是 3.63——**IFPN 天然获得 100× 更少的梯度**。这是 $res_t = img_{s2} \times lit\_up\_map$ 乘法结构的直接后果。
+
+2. **通道拼接稀释（~65×）**：s_illum 是 1 通道，与 ratio_feat 的 64 通道拼接成 65 通道，再经 `illum_cond_proj`（1×1 Conv 65→64）投影。s_illum 只占输入的 1/65，梯度被均摊。
+
+3. **多层卷积链式衰减**：`lit_up_proj(64→3) → feat_refine(2层Conv) → illum_cond_proj(1×1) → ratio_proj(1×1) → IllumExtract(3层Conv)`，约 7-8 层卷积深度。
+
+**三重衰减累计**：100 × 65 × (卷积链衰减) ≈ 14,000× — 与实测吻合。
+
+##### L_illum 的"平滑陷阱"
+
+$L_{illum} = |\nabla s_{illum}| \cdot \exp(-|\nabla I^{GT}|)$ 的**全局最小值是 $s_{illum}$ = 常数**（任意常数，梯度为零即 loss 为零）。由于 L_illum 梯度比 L_pix 间接梯度强 1400-14000 倍，优化器**完全被 L_illum 主导**：s_illum 在 1-2 个 epoch 内被驱动到空间常数 → $loss_{illum} \to 0$ → s_illum 失效。
+
+#### 4.10.2 梯度饥饿：三级级联的乘性不对称
+
+实测各模块梯度范数（仅 L_pix，排除 L_illum 干扰）：
+
+| 模块 | 梯度范数 | vs IGRF | 衰减倍数 |
+|------|---------|---------|---------|
+| IGRF | 2.570 | 1.000 | — |
+| encoder | 3.575 | 1.391 | 无衰减（主路径） |
+| TFSI（整体） | 4.149 | 1.614 | 无衰减（LFF梯度来自SACE） |
+| tfsi.intensity_head | 0.0007 | 0.0003 | **也处于饥饿中** |
+| **MRPN** | 0.260 | 0.101 | **10×** |
+| **NDPN** | 0.077 | 0.030 | **33×** |
+| **IFPN** | 0.0075 | 0.0029 | **346×** |
+| SACE | 4.289 | 1.669 | 无衰减 |
+
+##### 成因 1：乘性提亮对 IFPN 的不对称衰减（100×）
+
+IGRF 三级级联中，Stage 1/2 是加法（偏导=1），Stage 3 是乘法：
+$$res_t = img_{s2} \times lit\_up\_map$$
+
+- 对 $img_{s2}$（NDPN/MRPN 路径）：$\partial res_t / \partial img_{s2} = lit\_up\_map \approx 3.63$ → **放大**
+- 对 $lit\_up\_map$（IFPN 路径）：$\partial res_t / \partial lit\_up\_map = img_{s2} \approx 0.036$ → **衰减 100×**
+
+##### 成因 2：StageBlock 深度衰减（~10×）
+
+每个 StageBlock 约 6 层卷积深度，随机初始化权重对梯度产生 ~10× 衰减。
+
+##### 成因 3：encoder 主路径的梯度优势
+
+encoder 有直接到 IGRF 的路径（`image_center → img_s1 → img_s2 → res_t`），每级偏导为 1 或 lit_up_map（放大），梯度 = 1.39× IGRF——**比所有分支都高**。
+
+### 4.11 退化建模与三分支职能重梳理
+
+#### 4.11.1 三种退化因素的物理本质
+
+$$y_t = \gamma_t \cdot (x_t * k_t + n_t)$$
+
+| 退化因素 | 物理本质 | 统计性质 | 频域签名 | 是否"噪声" |
+|---------|---------|---------|---------|:---:|
+| **$\gamma_t$（光照衰减）** | 像素级乘性缩放 | **确定性**，空间平滑 | 低频幅度缩放，相位无影响 | ❌ 确定性退化 |
+| **$n_t$（传感器噪声）** | 加性随机扰动 | **随机性**，零均值 | 全频段幅度+相位扰动 | ✅ 真正的噪声 |
+| **$k_t$（运动模糊）** | 空间卷积核 | **确定性**，方向性 | 中高频带状衰减+线性相移 | ❌ 确定性退化 |
+
+关键区分：三个退化源中只有 $n_t$ 是统计意义上的"噪声"。TFS-Net 的"三源"指三种**退化源**，不是三种噪声。
+
+#### 4.11.2 TFSI 诊断两种强度的依据
+
+| 强度图 | 诊断 | 估计依据 | 为什么需要 |
+|--------|------|---------|-----------|
+| $s_{illum}$ | $\gamma_t$ | $\mu_t/\sigma_t$ + LFF 频域 | $\gamma_t$ 是乘性的，需显式估计"暗到什么程度" |
+| $s_{noise}$ | $n_t$ | $\sigma_t$ 时域方差 + SNR | $n_t$ 是随机的，需估计"噪声有多强" |
+| ~~$s_{motion}$~~ | ~~$k_t$~~ | — | v5 移除：MRPN 窗口相关性**隐式从对齐残差感知运动** |
+
+#### 4.11.3 修订后的三分支职能
+
+| 模块 | 建模的退化 | 输入来源 | 核心输出 | 角色 |
+|------|-----------|---------|---------|------|
+| TFSI | 诊断 $\gamma_t$、$n_t$ 强度 | Encoder 特征 | $s_{illum}$, $s_{noise}$ | **诊断**：退化有多严重 |
+| IFPN | $\gamma_t$（光照衰减） | SACE 对齐特征 + 图像 | $lit\_up\_map$, $f_{illum\_feat}$ | **方案估计**：每像素提亮多少 |
+| NDPN | $n_t$（传感器噪声） | SACE 对齐特征 + $\sigma_t^{clean}$ | $f_{noise\_out}$ | **方案估计**：SNR 加权去噪 |
+| MRPN | $k_t$（运动模糊） | SACE 对齐特征 | $f_{motion\_out}$ | **方案估计**：窗口相关运动补偿 |
+| IGRF | 执行逆序修复 | 分支特征 + $s_{illum}$ + $s_{noise}$ | $res_t$ | **执行**：按诊断+方案做修复 |
+
+**核心设计原则**：TFSI = 诊断（what's wrong），IFPN/NDPN/MRPN = 方案规划（how to fix），IGRF = 执行（apply fix）。$s_{illum}/s_{noise}$ 作为诊断信号**直接指导 IGRF 的执行强度**，不再被稀释进方案估计模块。
+
+**为什么 IFPN 不需要 $s_{illum}$**：IFPN 从多帧数据估计光照图（Retinex），这是内容感知的——区分"暗物体"（反射率低，不提亮）和"暗光照"（反射率高但光照低，提亮）。$s_{illum}$ 的"诊断"职能（这里光照退化有多严重）应移交 IGRF 执行层，而非在方案估计中作为 1/65 通道的弱先验。
+
+**为什么 MRPN 不需要 $s_{motion}$**：运动模糊的"强度"等价于帧间对齐残差的大小——MRPN 的窗口 dot-product 相关性直接从 $F_{aligned\_list}$ 残差中隐式估计。
+
+### 4.12 根治方案：s_illum/s_noise 直入 IGRF + 混合提亮 + Encoder 3 级
+
+#### 4.12.1 设计总览
+
+修订后 IGRF 三级级联：
+
+```
+Stage 1 (去噪):   img_s1 = clamp(img_center + Δ_noise(f_noise, img, s_noise), 0, 1)
+                  s_noise 作为 additive correction 直接参与 delta 计算
+                  ∂img_s1/∂s_noise = intensity_corr'  (无衰减)
+
+Stage 2 (去模糊): img_s2 = clamp(img_s1 + Δ_motion(f_motion, img_s1), 0, 1)
+                  无强度先验（s_motion 已移除）
+
+Stage 3 (提亮):   brighten_base = img_s2 × lit_up_map               (Retinex 乘法基座)
+                  illum_residual = s_illum × corr_mag(f_illum_feat)  (加法修正)
+                  res_t = clamp(brighten_base + illum_residual, 0, 1)
+                  ∂res_t/∂s_illum = corr_mag  (不经 img_s2，无 100× 衰减)
+```
+
+#### 4.12.2 方案 B 混合提亮的详细数据流
+
+```
+输入（全部保留，新增 s_illum）:
+  lit_up_map_raw  (B,3,H,W)   ← 来自 IFPN，不变
+  f_illum_feat    (B,64,H,W)  ← 来自 IFPN，不变
+  img_dark        (B,3,H,W)   ← img_s2，不变
+  s_illum         (B,1,H,W)   ← 新增：来自 TFSI，直入 IGRF
+
+─── 乘法基座路径（完全保留，不动）───
+  feat_cond = Conv3x3(f_illum_feat)     # 64→3
+  img_cond  = Conv3x3(img_dark)          # 3→3
+  delta = Fuse(concat[feat_cond, img_cond])  # 6→3，经 GELU+ResBlock×2+Conv
+  lit_up_map = lit_up_map_raw × (1 + tanh(delta) × 0.5)
+  brighten_base = img_dark × lit_up_map   ← Retinex 乘法提亮
+
+─── 加法修正路径（新增，零初始化）───
+  corr_mag = illum_corr(f_illum_feat)    # 64→3，新 Conv1x1，零初始化
+  illum_residual = s_illum × corr_mag    # 1ch × 3ch → 3ch
+
+─── 合并输出 ───
+  res_t = clamp(brighten_base + illum_residual, 0, 1)
+```
+
+**物理含义**：$lit\_up\_map$ = "内容感知的基座提亮"（区分暗物体/暗光照），$s_{illum}$ = "诊断驱动的修正提亮"（全局光照退化强度的加法补正）。
+
+#### 4.12.3 对称设计：s_noise 直入 Stage 1
+
+为框架对称，$s_{noise}$ 也直入 IGRF Stage 1：
+```
+delta = Fuse(concat[f_branch, img_proj(img)]) + intensity_corr(s_noise)
+img_s1 = clamp(img + delta, 0, 1)
+```
+$s_{noise}$ 作为 StageBlock 的加法修正项，直接参与 delta 计算。
+
+完整对称结构：
+- Stage 1：$f_{noise\_out}$ + **$s_{noise}$** + img → delta → $img_{s1}$
+- Stage 2：$f_{motion\_out}$ + $img_{s1}$ → delta → $img_{s2}$（无强度先验）
+- Stage 3：$lit\_up\_map$ + $f_{illum\_feat}$ + **$s_{illum}$** + $img_{s2}$ → $res_t$
+
+#### 4.12.4 零初始化策略
+
+所有新增路径零初始化，确保修改后**初始行为 = 修改前行为**：
+
+| 新增组件 | 初始化 | 初始效果 |
+|---------|--------|---------|
+| `BrightenStage.illum_corr` | weight=0, bias=0 | $illum\_residual=0$ → 纯乘法提亮（与当前一致） |
+| `StageBlock.intensity_corr` | weight=0, bias=0 | delta 修正=0 → 纯特征驱动 delta（与当前一致） |
+
+#### 4.12.5 预期梯度改善
+
+| 指标 | 修改前 | 修改后（预期） |
+|------|--------|--------------|
+| $s_{illum}$ 从 $L_{pix}$ 梯度 | 0.000003 | ~0.001-0.01（无乘法衰减、无通道稀释） |
+| $L_{illum}$ 有效梯度 ($\lambda=0.01$) | 0.044×0.1=0.0044 | 0.044×0.01=0.00044 |
+| $L_{pix}$ / $L_{illum}$ 梯度比 | 1:1400 | **~2:1 ~ 22:1**（$L_{pix}$ 主导） |
+
+$s_{illum}$ 将**首次被重建损失有效监督**。
+
+#### 4.12.6 Encoder 3 级简化
+
+当前 4 级 `[32, 64, 96, 128]` → 改为 3 级 `[32, 64, 96]`：
+- 移除 `stage4`（stride=2, 96→128）和 `lateral4`（128→64 投影）
+- `coarse_channels` 从 128 变为 96
+- 最粗尺度从 H/8 变为 H/4
+
+收益：编码器参数减少 ~150K，降低"主路径"梯度优势；IFPN 粗特征分辨率从 H/8 提升到 H/4，更多信息。
+
+#### 4.12.7 实施变更清单
+
+| 文件 | 改动 | 解决的问题 |
+|------|------|-----------|
+| `models/modules/igrf.py` | StageBlock 加 `intensity_corr`（s_noise 修正）；BrightenStage 加 `illum_corr`（s_illum 混合提亮）；IGRF.forward 加 s_illum/s_noise 参数 | 乘法 100× 衰减 + 通道 65× 稀释 |
+| `models/modules/ifpn.py` | 移除 s_illum 参数和 `illum_cond_proj`（65→64 改为不需要） | 简化 IFPN，消除稀释 |
+| `models/modules/encoder.py` | 移除 stage4/lateral4，3 级 `[32,64,96]` | 降低主路径优势 |
+| `models/tfs_net.py` | IFPN 调用去 s_illum；IGRF 调用加 s_illum/s_noise；level_channels 默认改 3 级 | 接线 |
+| `configs/sdsd_stage1.yaml` | `level_channels: [32,64,96]`；`lambda_illum: 0.01` | 超参 |
+| `test_grad_fix.py` | 新建：梯度改善验证 + shape + 零初始化 | 验证 |
+
+#### 4.12.8 参数量变化
+
+| 组件 | 变化 | 参数量 |
+|------|------|--------|
+| Encoder stage4 + lateral4 | 移除 | **-~150K** |
+| IFPN illum_cond_proj | 移除 | -4,224 |
+| BrightenStage illum_corr | 新增 Conv2d(64→3) | +195 |
+| StageBlock intensity_corr | 新增 Conv2d(1→3, 3×3) | +30 |
+| **净变化** | | **约 -154K** |
+
+总参数从 ~1.39M 降至 ~1.24M。
+
 ---
 
 ## 5. 版本演进总结
@@ -1079,7 +1288,7 @@ PSNR 0.28dB 的差异在 4 epoch / 2 序列的简短训练下不具统计显著�
 | v4.1 | 顺序级联（光照→噪声→运动）+ 中间监督 | IFPN 梯度改善 3x |
 | v4.2 | 去噪→运动→提亮 + 乘法提亮 | **训练失败**（loss 不下降） |
 | v4.3 | 有界乘法提亮 + hybrid lit_up_map + 移除 .detach() | **PSNR=19.9 dB, SSIM=0.765** |
-| **v5** | **MRPN 窗口相关+门控融合+残差精炼 / TFSI 移除 s_motion / v5.1 MRPN同域设计 / v5.2 TFSI concat融合 / v5.3 IFPN同域设计 / v5.4 LFF 相位保留+SNR一致化+噪声感知残差门控 (M1-M3)** | — |
+| **v5** | **MRPN 窗口相关+门控融合+残差精炼 / TFSI 移除 s_motion / v5.1 MRPN同域设计 / v5.2 TFSI concat融合 / v5.3 IFPN同域设计 / v5.4 LFF 相位保留+SNR一致化+噪声感知残差门控 (M1-M3) / v5.5 s_illum/s_noise直入IGRF+混合提亮+Encoder 3级** | — |
 
 ---
 
