@@ -85,12 +85,20 @@ def main():
 
     with torch.no_grad():
         for seq_path in sequences:
+            model.clear_frame_cache()
             frame_paths = sorted(glob(os.path.join(seq_path, "*")))
             seq_name = os.path.basename(seq_path.rstrip("\\/"))
             save_dir = os.path.join(args.output_root, seq_name)
             ensure_dir(save_dir)
+            half = window_size // 2
+            max_idx = len(frame_paths) - 1
             iterator = list(enumerate(frame_paths))
             for idx, frame_path in tqdm(iterator, total=len(frame_paths), desc=seq_name, leave=False):
+                # 构建全局帧索引（用于逐帧缓存）
+                indices = [
+                    min(max(idx + offset, 0), max_idx)
+                    for offset in range(-half, half + 1)
+                ]
                 clip = gather_clip(frame_paths, idx, window_size).unsqueeze(0).to(device)
                 output = tiled_forward(
                     model=model,
@@ -98,6 +106,7 @@ def main():
                     tile_size=cfg["eval"]["tile_size"],
                     tile_overlap=cfg["eval"]["tile_overlap"],
                     use_amp=cfg["eval"]["amp"] and device.type == "cuda",
+                    frame_indices=indices,
                 )[0]
                 save_image_tensor(output, os.path.join(save_dir, os.path.basename(frame_path)))
                 del clip, output

@@ -1,97 +1,103 @@
 """
-MRPN (Motion-Refining Pyramid Network) — TFS-Net v3
+MRPN (Motion-Refining Pyramid Network) — TFS-Net v5
 =====================================================
-基于残差驱动隐式遮挡的运动鲁棒聚合。
+基于 MSPN (MINS-Net) 结构的窗口相关 + 门控融合运动聚合。
 
-实现状态: ✅ 完整实现
+核心设计:
+    使用 SACE 对齐后的特征（而非原始 Encoder 特征），确保 f_t 与 f_omega 同域。
+    聚合仅来自对齐后的相邻帧（排除中心帧），避免中心帧自身参与聚合。
+
+与 MSPN 的差异:
+    - corr 由模块内部从 SACE 对齐特征计算（MSPN 由 MINS 外部提供）
+    - 输入为 SACE 预对齐的 F_aligned_list（MSPN 为原始邻帧 f_omega_m）
 
 数据流:
-    1. R_i = |F_i^aligned - F_t| (运动残差)
-    2. w_i_raw = sigmoid(-Conv(R_i)) (大残差→小权重)
-       w_t_raw = 1.0 (中心帧固定)
-    3. F_motion_agg = Σ (w_i/Σw) * F_i^aligned
-    4. f_motion_out = s_motion * Refine(F_motion_agg) + (1-s_motion) * F_t
+    f_t_aligned = F_aligned_list[center_idx]          (SACE 对齐后的中心帧)
+    f_neighbors = F_aligned_list \\ {center_idx}       (仅对齐后的相邻帧)
+    1. corr = softmax(f_t_aligned_win · f_neighbors_win^T / √C)  (窗口内相关性)
+    2. f_agg = corr · f_neighbors_win                (加权聚合邻帧)
+    3. g = σ(Conv1×1([f_t_aligned ∥ f_agg]))          (门控融合)
+    4. f_fuse = g ⊙ f_t_aligned + (1-g) ⊙ f_agg
+    5. hat_f_t = Refine(f_fuse) + f_t_aligned         (残差精炼)
 """
 
-from __future__ import annotations
-
-from typing import Dict, List
+import math
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from models.modules.blocks import ConvBlock
+from .blocks import (
+    ResBlock,
+    pad_to_window,
+    unpad_from_window,
+    window_partition_2d,
+    window_partition_video,
+    window_reverse_2d,
+)
 
 
 class MRPN(nn.Module):
-    """
-    Args:
-        channels: 特征通道数 (默认 64)
-    """
-
-    def __init__(self, channels: int = 64):
+    def __init__(self, channels=64, window_size=8):
         super().__init__()
         self.channels = channels
+        self.window_size = window_size
+        self.gate = nn.Conv2d(channels * 2, channels, 1, 1, 0)
+        self.refine = ResBlock(channels)
 
-        self.weight_conv = nn.Sequential(
-            nn.Conv2d(channels, channels // 2, kernel_size=3, padding=1, bias=True),
-            nn.GELU(),
-            nn.Conv2d(channels // 2, 1, kernel_size=1, bias=True),
-        )
-        nn.init.zeros_(self.weight_conv[-1].weight)
-        nn.init.zeros_(self.weight_conv[-1].bias)
+    def _aggregate_neighbors(self, f_t, f_omega):
+        """窗口 dot-product 相关聚合相邻帧（不含中心帧）。"""
+        b, t, c, h, w = f_omega.shape
+        feat = f_omega.view(b * t, c, h, w)
+        feat, pad_hw = pad_to_window(feat, self.window_size)
+        hp, wp = feat.shape[-2:]
+        feat = feat.view(b, t, c, hp, wp)
 
-        self.refine = nn.Sequential(
-            ConvBlock(channels, channels, kernel_size=3, stride=1, padding=1, act=True),
-            ConvBlock(channels, channels, kernel_size=3, stride=1, padding=1, act=False),
-        )
+        # center frame: pad + window partition
+        f_t_padded, _ = pad_to_window(f_t, self.window_size)
 
-    def forward(
-        self,
-        feats: torch.Tensor,
-        F_aligned_list: List[torch.Tensor],
-        s_motion: torch.Tensor,
-        center_idx: int,
-    ) -> Dict[str, torch.Tensor]:
-        B, T, C, H, W = feats.shape
-        assert C == self.channels
+        # window partition
+        center_windows = window_partition_2d(f_t_padded, self.window_size)
+        # (b, n_w, ws², c)
+        feat_windows = window_partition_video(feat, self.window_size)
+        # (b, n_w, t*ws², c)
 
-        F_t = feats[:, center_idx]
+        # dot-product correlation (replaces external corr from MINS)
+        corr = torch.matmul(center_windows, feat_windows.transpose(-1, -2)) / math.sqrt(c)
+        corr = torch.softmax(corr, dim=-1)
 
-        # Step 1-2: 计算每帧权重
-        weights_raw: List[torch.Tensor] = []
+        aligned_windows = torch.matmul(corr, feat_windows)
+        aligned = window_reverse_2d(aligned_windows, self.window_size, hp, wp)
+        aligned = unpad_from_window(aligned, pad_hw)
+        return aligned
 
-        for i in range(T):
-            F_i_aligned = F_aligned_list[i]
-            if i == center_idx:
-                w_i = torch.ones(B, 1, H, W, device=F_t.device, dtype=F_t.dtype)
-            else:
-                R_i = (F_i_aligned - F_t).abs()
-                logits_i = self.weight_conv(R_i)
-                w_i = torch.sigmoid(-logits_i)
-            weights_raw.append(w_i)
+    def forward(self, F_aligned_list, center_idx):
+        """
+        Args:
+            F_aligned_list: List[Tensor], SACE 对齐后的全帧特征, 每项 (B, C, H, W)
+            center_idx: int, 中心帧索引
+        """
+        f_t_aligned = F_aligned_list[center_idx]  # (B, C, H, W)
 
-        # Step 3: 归一化
-        eps = 1e-6
-        w_sum = torch.stack(weights_raw, dim=1).sum(dim=1) + eps
+        # 仅保留相邻帧（排除中心帧），避免中心帧自聚合
+        f_neighbors = torch.stack(
+            [F_aligned_list[i] for i in range(len(F_aligned_list)) if i != center_idx],
+            dim=1,
+        )  # (B, T-1, C, H, W)
 
-        F_motion_agg = torch.zeros_like(F_t)
-        weights_norm: List[torch.Tensor] = []
-        for i in range(T):
-            w_i_norm = weights_raw[i] / w_sum
-            weights_norm.append(w_i_norm)
-            F_motion_agg = F_motion_agg + w_i_norm * F_aligned_list[i]
+        f_omega_aligned = self._aggregate_neighbors(f_t_aligned, f_neighbors)
 
-        # Step 4: refine + 直接输出（移除双重门控，由 IGRF 统一做强度加权）
-        F_motion_refined = self.refine(F_motion_agg)
-        f_motion_out = F_motion_refined
+        # 门控融合: gate 决定信任对齐中心帧 vs 聚合邻帧
+        z_t = torch.cat([f_t_aligned, f_omega_aligned], dim=1)
+        g_t = torch.sigmoid(self.gate(z_t))
+        f_t_fuse = g_t * f_t_aligned + (1.0 - g_t) * f_omega_aligned
 
-        motion_weights = torch.cat(
-            [weights_norm[i] for i in range(T) if i != center_idx], dim=1
-        )
+        # 残差精炼 (ResBlock 内部有残差, +f_t_aligned 为第二层恒等跳跃)
+        hat_f_t = self.refine(f_t_fuse) + f_t_aligned
 
         return {
-            "f_motion_out":   f_motion_out,
-            "motion_weights": motion_weights,
+            "f_omega_aligned": f_omega_aligned,
+            "z_t": z_t,
+            "G_t": g_t,
+            "f_t_fuse": f_t_fuse,
+            "f_motion_out": hat_f_t,
         }

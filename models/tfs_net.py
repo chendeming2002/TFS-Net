@@ -5,7 +5,7 @@ TFS-Net v3 — Three-source Fusion & Synthesis Network
 
 整体结构 (5 stages):
     Stage 0: PyramidEncoder        多帧 → 多尺度特征 + 全分辨率融合
-    Stage 1: TFSI                  时序光照/噪声/运动强度场估计 + 频/空双分支
+    Stage 1: TFSI                  时序光照/噪声强度场估计 + 频/空双分支
     Stage 2: SACE                  可变形跨帧对齐 (与 TFSI 共享 LFF)
     Stage 3: IFPN/NDPN/MRPN        三源恢复分支 (光照/噪声/运动)
     Stage 4: IGRF                  强度引导残差融合 → 输出
@@ -13,7 +13,7 @@ TFS-Net v3 — Three-source Fusion & Synthesis Network
 
 from __future__ import annotations
 
-from typing import Dict, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -93,32 +93,70 @@ class TFSNet(nn.Module):
         # Stage 4: IGRF
         self.igrf = IGRF(channels=fused_channels, out_channels=in_channels)
 
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        # 逐帧特征缓存 (推理时滑动窗口复用)
+        self.frame_cache: Dict[int, Dict[str, torch.Tensor]] = {}
+
+    def clear_frame_cache(self):
+        """清空逐帧特征缓存（切换序列或释放显存时调用）。"""
+        self.frame_cache.clear()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        frame_indices: Optional[List[int]] = None,
+    ) -> Dict[str, torch.Tensor]:
         """
         Args:
             x: (B, T, 3, H, W) 多帧低光输入
 
         Returns:
-            dict with keys: res_t, delta, f_fused_igrf, s_illum, s_noise, s_motion, ...
+            dict with keys: res_t, delta, f_fused_igrf, s_illum, s_noise, ...
         """
         B, T, C_in, H, W = x.shape
         center_idx = T // 2
 
-        # Stage 0: 编码
-        feats, coarse_feats = self.encoder(x, return_coarse=True)
-        # feats        : (B, T, 48, H, W)
-        # coarse_feats : (B, T, 96, H/4, W/4)
+        # Stage 0: 编码（支持逐帧缓存）
+        feats_list: List[torch.Tensor] = []
+        coarse_list: List[torch.Tensor] = []
+        for i in range(T):
+            gidx = frame_indices[i] if frame_indices else None
+            if gidx is not None and gidx in self.frame_cache:
+                feats_list.append(self.frame_cache[gidx]["feat"])
+                coarse_list.append(self.frame_cache[gidx]["coarse"])
+            else:
+                f, c = self.encoder.forward_single(x[:, i], return_coarse=True)
+                feats_list.append(f)
+                coarse_list.append(c)
+                if gidx is not None:
+                    self.frame_cache[gidx] = {"feat": f, "coarse": c}
+        feats = torch.stack(feats_list, dim=1)
+        coarse_feats = torch.stack(coarse_list, dim=1)
 
         # Stage 1: TFSI
         tfsi_out = self.tfsi(feats)
         F_fused  = tfsi_out["F_fused"]
         s_illum  = tfsi_out["s_illum"]
         s_noise  = tfsi_out["s_noise"]
-        s_motion = tfsi_out["s_motion"]
         sigma_t  = tfsi_out["sigma_t"]
 
-        # Stage 2: SACE
-        sace_out       = self.sace(feats, tfsi_out)
+        # Stage 2: SACE（LFF 支持逐帧缓存）
+        cached_lff: Dict[int, torch.Tensor] = {}
+        if frame_indices:
+            for i, gidx in enumerate(frame_indices):
+                if gidx in self.frame_cache and "lff" in self.frame_cache[gidx]:
+                    cached_lff[i] = self.frame_cache[gidx]["lff"]
+
+        sace_out = self.sace(
+            feats, tfsi_out,
+            cached_lff=cached_lff if cached_lff else None,
+        )
+
+        # 将 SACE 返回的 lff_feats 存入缓存
+        if frame_indices and "lff_feats" in sace_out:
+            for i, gidx in enumerate(frame_indices):
+                if gidx in self.frame_cache:
+                    self.frame_cache[gidx]["lff"] = sace_out["lff_feats"][i]
+
         mu_t_clean     = sace_out["mu_t_clean"]
         F_aligned_list = sace_out["F_aligned_list"]
         attn_maps      = sace_out["attn_maps"]
@@ -157,9 +195,7 @@ class TFSNet(nn.Module):
         )
 
         mrpn_out = self.mrpn(
-            feats=feats,
             F_aligned_list=F_aligned_list,
-            s_motion=s_motion,
             center_idx=center_idx,
         )
 
@@ -180,7 +216,6 @@ class TFSNet(nn.Module):
             "image_center":   image_center,
             "s_illum":        s_illum,
             "s_noise":        s_noise,
-            "s_motion":       s_motion,
             "f_illum_feat":   ifpn_out["f_illum_feat"],
             "f_noise_out":    ndpn_out["f_noise_out"],
             "f_motion_out":   mrpn_out["f_motion_out"],
@@ -190,6 +225,6 @@ class TFSNet(nn.Module):
             "attn_maps":      attn_maps,
             "mu_t_clean":     mu_t_clean,
             "s_snr":          ndpn_out["s_snr"],
-            "motion_weights": mrpn_out["motion_weights"],
+            "motion_weights": mrpn_out["G_t"],
             "tfsi_out":       tfsi_out,
         }

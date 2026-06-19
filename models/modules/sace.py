@@ -256,16 +256,18 @@ class SACE(nn.Module):
         self,
         feats: torch.Tensor,
         tfsi_out: Dict = None,
+        cached_lff: Dict = None,
     ) -> Dict:
         B, T, C, H, W = feats.shape
         assert C == self.channels
 
-        # Step 1: 逐帧 LFF
+        # Step 1: 逐帧 LFF（支持缓存：cached_lff[local_idx] → 预计算特征）
         lff_feats: List[torch.Tensor] = []
         for t in range(T):
-            f_t = feats[:, t]
-            f_t_lff = self.lff(f_t)
-            lff_feats.append(f_t_lff)
+            if cached_lff and t in cached_lff:
+                lff_feats.append(cached_lff[t])
+            else:
+                lff_feats.append(self.lff(feats[:, t]))
         lff_stack = torch.stack(lff_feats, dim=1)
 
         # Step 2: 时域 soft-median → 参考帧 (梯度友好)
@@ -292,4 +294,5 @@ class SACE(nn.Module):
             "attn_maps":      attn_maps,
             "mu_t_clean":     mu_t_clean,
             "F_aligned_list": F_aligned_list,
+            "lff_feats":      lff_feats,
         }
