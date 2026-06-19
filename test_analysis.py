@@ -64,7 +64,6 @@ for k, v in out.items():
 # 检查s_*的初始分布
 print(f"\n  s_illum 初始均值: {out['s_illum'].mean():.4f} (理想≈0.5)")
 print(f"  s_noise 初始均值: {out['s_noise'].mean():.4f} (理想≈0.5)")
-print(f"  s_motion初始均值: {out['s_motion'].mean():.4f} (理想≈0.5)")
 
 # 梯度流测试 - 使用 v3.2 完整 loss
 print("\n" + "=" * 70)

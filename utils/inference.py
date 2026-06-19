@@ -24,10 +24,11 @@ def _pad_clip_for_tiling(clip, tile_size):
 
 
 @torch.no_grad()
-def tiled_forward(model, clip, tile_size=256, tile_overlap=32, use_amp=False):
+def tiled_forward(model, clip, tile_size=256, tile_overlap=32, use_amp=False,
+                  frame_indices=None):
     if tile_size is None or tile_size <= 0:
         with autocast(enabled=use_amp and clip.is_cuda):
-            return model(clip)["res_t"]
+            return model(clip, frame_indices=frame_indices)["res_t"]
 
     clip, pad_hw, original_hw = _pad_clip_for_tiling(clip, tile_size)
     b, t, c, h, w = clip.shape
@@ -37,6 +38,10 @@ def tiled_forward(model, clip, tile_size=256, tile_overlap=32, use_amp=False):
     h_starts = _compute_starts(h, tile_size, tile_overlap)
     w_starts = _compute_starts(w, tile_size, tile_overlap)
 
+    # 帧缓存仅在单 tile 时有效（多 tile 的空间裁剪不同，缓存特征不可复用）
+    use_cache = (len(h_starts) == 1 and len(w_starts) == 1)
+    cache_indices = frame_indices if use_cache else None
+
     output = clip.new_zeros((b, c, h, w))
     weight = clip.new_zeros((b, 1, h, w))
 
@@ -44,7 +49,7 @@ def tiled_forward(model, clip, tile_size=256, tile_overlap=32, use_amp=False):
         for left in w_starts:
             tile = clip[:, :, :, top : top + tile_size, left : left + tile_size]
             with autocast(enabled=use_amp and clip.is_cuda):
-                tile_pred = model(tile)["res_t"]
+                tile_pred = model(tile, frame_indices=cache_indices)["res_t"]
             output[:, :, top : top + tile_size, left : left + tile_size] += tile_pred
             weight[:, :, top : top + tile_size, left : left + tile_size] += 1.0
 

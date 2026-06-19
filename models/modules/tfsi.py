@@ -2,7 +2,7 @@
 TFSI — 时频源指示器 (Temporal-Frequency Source Indicator)
 ============================================================
 
-v3 设计：替代 MINSBlock，输出三源独立强度图 [s_illum, s_noise, s_motion]。
+v5 设计：输出双源独立强度图 [s_illum, s_noise]，s_motion 已废弃。
 
 实现状态：
   - 空间分支（时域统计量 → Conv）：✅ 已实现
@@ -169,19 +169,17 @@ class GatedFusion(nn.Module):
 
 class IntensityHead(nn.Module):
     """
-    TFSI 三源独立强度输出头
+    TFSI 双源独立强度输出头 (v5: 移除 s_motion)
 
     公式：
-        [s_illum, s_noise, s_motion] = σ(Conv1x1(F_fused))
+        [s_illum, s_noise] = σ(Conv1x1(F_fused))
         每个 s_* ∈ [0,1]，独立 Sigmoid，允许多源叠加（物理正确）
-
-    参考：TFSv3-result.md § 4.1 Step 4
     """
 
     def __init__(self, fused_channels: int):
         super().__init__()
-        # 输出 3 通道，分别对应 illum / noise / motion 强度
-        self.conv = nn.Conv2d(fused_channels, 3, 1, 1, 0)
+        # 输出 2 通道，分别对应 illum / noise 强度
+        self.conv = nn.Conv2d(fused_channels, 2, 1, 1, 0)
 
     def forward(self, f_fused: torch.Tensor) -> dict:
         """
@@ -192,17 +190,14 @@ class IntensityHead(nn.Module):
             dict:
                 s_illum : (B, 1, H, W) 光照退化强度，∈ [0,1]
                 s_noise : (B, 1, H, W) 噪声退化强度，∈ [0,1]
-                s_motion: (B, 1, H, W) 运动退化强度，∈ [0,1]
         """
-        raw = self.conv(f_fused)             # (B, 3, H, W)
-        intensities = torch.sigmoid(raw)     # (B, 3, H, W)
+        raw = self.conv(f_fused)             # (B, 2, H, W)
+        intensities = torch.sigmoid(raw)     # (B, 2, H, W)
         s_illum = intensities[:, 0:1]        # (B, 1, H, W)
         s_noise = intensities[:, 1:2]        # (B, 1, H, W)
-        s_motion = intensities[:, 2:3]       # (B, 1, H, W)
         return {
             "s_illum": s_illum,
             "s_noise": s_noise,
-            "s_motion": s_motion,
         }
 
 
@@ -217,7 +212,7 @@ class TFSI(nn.Module):
                     ↓
               GatedFusion(F_s, F_f) → F_fused (B,C_f,H,W)
                     ↓
-              IntensityHead(F_fused) → s_illum, s_noise, s_motion (B,1,H,W)
+              IntensityHead(F_fused) → s_illum, s_noise (B,1,H,W)
 
     freq_branch 属性可为 None（当前状态）或注入外部 LFF 模块（待实现），
     供后续 SACE 共享 LFF 时扩展。
@@ -257,7 +252,6 @@ class TFSI(nn.Module):
                 snr       : (B, C, H, W) 原始 SNR 估计
                 s_illum   : (B, 1, H, W) 光照强度
                 s_noise   : (B, 1, H, W) 噪声强度
-                s_motion  : (B, 1, H, W) 运动强度
         """
         b, t, c, h, w = feats.shape
         center_idx = t // 2
@@ -288,5 +282,4 @@ class TFSI(nn.Module):
             "snr": spatial_out["snr"],
             "s_illum": intensities["s_illum"],
             "s_noise": intensities["s_noise"],
-            "s_motion": intensities["s_motion"],
         }
