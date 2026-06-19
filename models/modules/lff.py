@@ -112,15 +112,24 @@ class LFFFeatureAdapter(nn.Module):
         F = FFT2(x)
         mag, phase = |F|, ∠F
         mag'   = mag * (1 + diff_mag)
-        phase' = phase + diff_phase
+        phase' = phase + diff_phase          # phase_preserving=False
+              或 phase                        # phase_preserving=True
         F' = mag' * exp(i * phase')
         x' = Real(IFFT2(F'))
+
+    phase_preserving 设计 (M1):
+        光照归一化只需幅度低频抑制 (ExpoMamba: 光照->幅度, 结构->相位)。
+        保留相位避免破坏结构信息 (SACE 对齐依赖相位) 与噪声指纹
+        (TFSI 的 s_noise 估计需要相位特征)。RadialBasisFilter 仍保留
+        相位参数 (coeff_phase/raw_gate_phase) 以支持 M4 解耦模式下
+        SACE 独立启用相位整形，仅 forward 时按标志跳过。
 
     Args:
         channels (int): 输入特征通道数 (不变)
         K (int): RBF 基函数个数
         n_ang_freq (int): 角度调制频率
         per_channel_rbf (bool): 是否每通道独立 RBF
+        phase_preserving (bool): True 则相位恒等 (默认), False 保留原行为
 
     Forward:
         Input:  x (B, C, H, W)
@@ -133,10 +142,12 @@ class LFFFeatureAdapter(nn.Module):
         K: int = 10,
         n_ang_freq: int = 1,
         per_channel_rbf: bool = False,
+        phase_preserving: bool = True,
     ):
         super().__init__()
         self.channels = channels
         self.per_channel_rbf = per_channel_rbf
+        self.phase_preserving = phase_preserving
 
         if per_channel_rbf:
             self.rbf_bank = nn.ModuleList([
@@ -179,7 +190,11 @@ class LFFFeatureAdapter(nn.Module):
 
         # Step 3: 残差整形
         mag_new = mag * (1.0 + diff_mag)
-        phase_new = phase + diff_phase
+        if self.phase_preserving:
+            # M1: 相位恒等 — 保留结构/噪声指纹，LFF 聚焦幅度域光照归一化
+            phase_new = phase
+        else:
+            phase_new = phase + diff_phase
 
         # Step 4: IFFT
         F_new = torch.polar(mag_new, phase_new)

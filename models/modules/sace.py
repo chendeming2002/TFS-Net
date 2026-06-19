@@ -212,6 +212,7 @@ class SACE(nn.Module):
         lff_module: LFFFeatureAdapter = None,
         K: int = 10,
         n_ang_freq: int = 1,
+        phase_preserving: bool = True,
     ):
         super().__init__()
         self.channels = channels
@@ -220,10 +221,13 @@ class SACE(nn.Module):
 
         self._lff_external = lff_module is not None
         if lff_module is not None:
+            # 共享模式: 使用外部 LFF (其 phase_preserving 由创建方决定)
             self.lff = lff_module
         else:
+            # 独立模式 (M4 消融): 内部创建, 可启用相位整形辅助对齐
             self.lff = LFFFeatureAdapter(
                 channels=channels, K=K, n_ang_freq=n_ang_freq, per_channel_rbf=False,
+                phase_preserving=phase_preserving,
             )
 
         self.offset_mask_head = OffsetMaskHead(
@@ -272,6 +276,11 @@ class SACE(nn.Module):
 
         # Step 2: 时域 soft-median → 参考帧 (梯度友好)
         mu_t_clean = self._soft_median(lff_stack, dim=1)
+        # M2: LFF 域时域标准差 — 与 mu_t_clean 同域, 供 NDPN 计算物理一致的 SNR
+        sigma_t_clean = lff_stack.std(dim=1, unbiased=False)
+
+        # M3: 从 TFSI 输出提取 s_noise, 用于噪声感知残差门控
+        s_noise = tfsi_out.get("s_noise") if tfsi_out else None
 
         # Step 3: 逐帧可变形对齐
         attn_maps: List[Tuple[torch.Tensor, torch.Tensor]] = []
@@ -285,14 +294,19 @@ class SACE(nn.Module):
 
             offset, mask = self.offset_mask_head(q_norm, kv_norm)
             f_aligned = self.deform_attn(q_norm, kv_norm, offset, mask)
-            f_aligned = f_aligned + kv  # 残差
+            # M3: 噪声感知残差门控 — 高噪区抑制残差(噪声), 低噪区保留信息流
+            if s_noise is not None:
+                f_aligned = f_aligned + (1.0 - s_noise) * kv
+            else:
+                f_aligned = f_aligned + kv  # 残差 (向后兼容: tfsi_out 未提供时)
 
             attn_maps.append((offset, mask))
             F_aligned_list.append(f_aligned)
 
         return {
-            "attn_maps":      attn_maps,
-            "mu_t_clean":     mu_t_clean,
-            "F_aligned_list": F_aligned_list,
-            "lff_feats":      lff_feats,
+            "attn_maps":       attn_maps,
+            "mu_t_clean":      mu_t_clean,
+            "sigma_t_clean":   sigma_t_clean,
+            "F_aligned_list":  F_aligned_list,
+            "lff_feats":       lff_feats,
         }

@@ -49,6 +49,7 @@ class TFSNet(nn.Module):
         n_groups: int = 4,
         kernel_size: int = 3,
         share_lff: bool = True,
+        sace_phase_preserving: bool = True,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -64,14 +65,16 @@ class TFSNet(nn.Module):
             fused_channels=fused_channels,
         )
 
-        # Stage 1: TFSI
+        # Stage 1: TFSI (M1: TFSI 频域分支始终相位保留)
         self.tfsi = TFSI(
             channels=fused_channels,
             fused_channels=fused_channels,
             eps=eps,
         )
 
-        # Stage 2: SACE (共享 LFF)
+        # Stage 2: SACE
+        # share_lff=True: 共享 TFSI 的相位保留 LFF (M1-M3 baseline)
+        # share_lff=False: SACE 内部独立创建 LFF, phase_preserving 由 sace_phase_preserving 决定 (M4 消融)
         shared_lff = self.tfsi.freq_branch.lff if share_lff else None
         self.sace = SACE(
             channels=fused_channels,
@@ -79,6 +82,7 @@ class TFSNet(nn.Module):
             kernel_size=kernel_size,
             use_optimized=True,
             lff_module=shared_lff,
+            phase_preserving=sace_phase_preserving,
         )
 
         # Stage 3: 三源恢复分支
@@ -133,7 +137,6 @@ class TFSNet(nn.Module):
         F_fused  = tfsi_out["F_fused"]
         s_illum  = tfsi_out["s_illum"]
         s_noise  = tfsi_out["s_noise"]
-        sigma_t  = tfsi_out["sigma_t"]
 
         # Stage 2: SACE（LFF 支持逐帧缓存）
         cached_lff: Dict[int, torch.Tensor] = {}
@@ -185,7 +188,7 @@ class TFSNet(nn.Module):
             feats=feats,
             F_aligned_list=F_aligned_list,
             mu_t_clean=mu_t_clean,
-            sigma_t=sigma_t,
+            sigma_t_clean=sace_out["sigma_t_clean"],
             s_noise=s_noise,
             center_idx=center_idx,
         )

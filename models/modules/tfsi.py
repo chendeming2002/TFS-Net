@@ -98,6 +98,7 @@ class FrequencyBranch(nn.Module):
         K: int = 10,
         n_ang_freq: int = 1,
         per_channel_rbf: bool = False,
+        phase_preserving: bool = True,
     ):
         super().__init__()
         self.channels = channels
@@ -112,12 +113,13 @@ class FrequencyBranch(nn.Module):
             self.out_proj = nn.Identity()
             lff_channels = fused_channels
 
-        # 核心: LFF 频率域适配器
+        # 核心: LFF 频率域适配器 (M1: TFSI 始终相位保留, 保留噪声指纹供 s_noise 估计)
         self.lff = LFFFeatureAdapter(
             channels=lff_channels,
             K=K,
             n_ang_freq=n_ang_freq,
             per_channel_rbf=per_channel_rbf,
+            phase_preserving=phase_preserving,
         )
 
     def forward(self, feats: torch.Tensor, center_idx: int) -> torch.Tensor:
@@ -226,13 +228,14 @@ class TFSI(nn.Module):
 
         self.norm = LayerNorm2d(channels)
         self.spatial_branch = SpatialBranch(channels, fused_channels, eps=eps)
-        # 频域分支：LFF 已实现
+        # 频域分支：LFF 已实现 (M1: 相位保留, 保留噪声指纹供 s_noise 估计)
         self.freq_branch = FrequencyBranch(
             channels=channels,
             fused_channels=fused_channels,
             K=10,
             n_ang_freq=1,
             per_channel_rbf=False,
+            phase_preserving=True,
         )
         self.concat_fusion = ConcatFusion(fused_channels)
         self.intensity_head = IntensityHead(fused_channels)

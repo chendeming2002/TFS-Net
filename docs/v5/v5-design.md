@@ -769,7 +769,307 @@ mrpn_out = self.mrpn(F_aligned_list=F_aligned_list,
 
 ---
 
-## 4. 版本演进总结
+## 4. LFF 机制修改（M1-M4）：相位保留、SNR 一致化、噪声感知残差门控
+
+> 本节记录针对 TFSI/SACE 共享 LFF 机制的原理分析、四项修改方案（M1-M4）及消融实证。
+> 动机：v4.3 训练中 `L_illum` 在 epoch 10 后趋零、`L_perc` 居高不下、PSNR 距 SOTA ~5 dB，
+> 怀疑共享 LFF 的任务冲突与噪声分离实现存在结构性缺陷。
+
+### 4.1 问题建模与 LFF 设计目的回顾
+
+**物理退化模型**（§1.1）：
+$$y_t = \gamma_t \cdot (x_t * k_t + n_t)$$
+
+**傅里叶域退化签名**（§1.2，源自 FRBNet + ExpoMamba WACV 2026）：
+
+| 退化类型 | 幅度谱影响 | 相位谱影响 | 频段 |
+|----------|-----------|-----------|------|
+| 光照衰减 $\gamma_t$ | 低频整体缩放 | **无影响**（乘性标量不改相位） | 低频 |
+| 传感器噪声 $n_t$ | 全频段能量提升 | 全频段随机扰动 | **宽带** |
+| 运动模糊 $k_t$ | 运动方向中高频带状衰减 | 线性相移 | 中高频 |
+
+**关键物理事实**：光照是低频幅度现象，噪声是宽带幅度+相位现象——二者在频域并非完全正交（低频段同时承载光照与低频噪声）。
+
+**LFF 的本职工作**（源自 FRBNet NeurIPS 2025）：从 Phong 光照模型扩展，理论证明频域通道比可提取"光照不变特征"。LFF 通过零DC 窗 + 可学习径向基滤波器抑制低频光照成分——**LFF 的设计目标是光照归一化，而非直接去噪**。
+
+### 4.2 TFSI 与 SACE 各自如何使用 LFF
+
+**TFSI 中的 LFF**（三源分离估计，`tfsi.py` FrequencyBranch）：
+```
+feats[:, center_idx] → LFF → F_f  (仅中心帧, 1 次调用)
+F_f ‖ F_s(μ_t,σ_t,SNR) → ConcatFusion → F_fused → IntensityHead → s_illum, s_noise
+```
+- 角色：为强度估计提供"光照不变的结构特征" $F_f$，与保留光照信息的空间分支 $F_s$ 互补
+- 目的：估计退化强度图 $s_{illum}$ / $s_{noise}$
+
+**SACE 中的 LFF**（跨帧对齐，`sace.py` Step 1-3）：
+```
+for t in T: feats[:,t] → LFF → F̄_t  (全部 T 帧, T 次调用)
+soft-median(F̄_1..F̄_T) → μ_t_clean  (参考帧)
+DeformAttn(query=μ_t_clean, kv=F̄_t) + F̄_t → F_aligned_t
+```
+- 角色：对每帧做光照归一化，**在时域聚合之前**消除光照闪烁
+- 目的：v3 关键"顺序修正"——若光照闪烁未消除，时域中位值会偏向某一光照水平的帧，扭曲结构信息
+
+**共享实现**（`tfs_net.py`）：
+```python
+shared_lff = self.tfsi.freq_branch.lff if share_lff else None
+self.sace = SACE(..., lff_module=shared_lff)
+```
+单一 `LFFFeatureAdapter` 实例（~2.4K 参数，全通道共享 RBF），权重绑定。
+
+设计文档给出的三点共享理由（`v3answer.md §2.2`）：
+1. **参数效率**：LFF 仅 ~20 个可学习标量，共享不影响表达力
+2. **物理一致性**：两者都"提取光照不变特征"，同一滤波器概念合理
+3. **训练稳定性**：避免两个 LFF 学出不同的"光照不变"定义
+
+### 4.3 原理与噪声分离的合理性分析
+
+#### 4.3.1 合理的部分
+
+**(1) "光照不变"目标的一致性 — 成立**
+TFSI 频域分支和 SACE Step 1 都在追求"光照不变特征"。FRBNet 的理论保证（频域通道比 → 光照不变）为二者共享同一组 RBF 系数提供概念基础。
+
+**(2) 参数效率论证 — 成立**
+LFF 仅 ~2.4K 参数（占 TFSNet ~1.26M 的 0.2%），共享 vs 独立的参数差异可忽略。
+
+**(3) 顺序修正的物理正确性 — 成立**
+SACE 先 LFF 后 median 是 v3 相对 v2 的关键修正。在光照归一化后的特征上做时域中位值，各帧光照水平一致，中位值才真实反映"干净结构"。
+
+**(4) 中心帧 LFF 复用的工程合理性 — 成立**
+TFSI 对中心帧做的 LFF 与 SACE 对中心帧做的 LFF 是同一操作，共享避免重复计算（推理时通过 `frame_cache["lff"]` 复用）。
+
+#### 4.3.2 存在的原理性张力
+
+**(1) TFSI 与 SACE 对 LFF 的下游目标存在隐性冲突**
+
+| 模块 | LFF 输出用途 | 期望 LFF 行为 |
+|------|------------|--------------|
+| TFSI | → $F_f$ → 估计 $s_{illum}$（光照强度） | 应让光照差异**可辨** |
+| SACE | → $\bar{F}_i$ → 对齐匹配 | 应让光照差异**消除** |
+
+TFSI 的强度头操作在 $F_{fused} = \text{concat}(F_s, F_f)$ 上，其中 $F_s$（空间分支的 $\mu_t/\sigma_t/\text{SNR}$）保留了光照信息。所以 $s_{illum}$ 主要靠 $F_s$ 贡献，$F_f$ 提供"光照不变结构"作互补——这缓解了冲突，但并未消除：**共享 LFF 被 SACE 的对齐目标主导时，$F_f$ 对光照的抑制可能过强，削弱 $s_{illum}$ 估计所需的低频光照线索**。
+
+经验佐证（§0.4）：`L_illum → 0`（epoch 10 后趋零），与上述冲突吻合。
+
+**(2) 中心帧 vs 全帧的梯度不对称**
+
+- TFSI：LFF 仅作用于**中心帧**（1 次）→ 梯度来自强度估计路径
+- SACE：LFF 作用于**全部 T 帧**（T 次）→ 梯度来自对齐路径
+
+共享权重下，SACE 的梯度贡献是 TFSI 的 ~T 倍。**LFF 实际被优化为"SACE 的对齐用光照归一化器"，而非"TFSI 的强度估计用频域特征提取器"**。
+
+**(3) 梯度饥饿严重削弱 LFF 的实际学习**
+
+`v3-design-analysis.md §2.1` 实测：SACE 平均梯度范数仅为 IGRF 的 **1.1%**，TFSI 为 52%。LFF 的梯度来自这两条路径，即便共享汇集两路梯度，仍处于"有效学习下限以下"。`v3-design-analysis.md §2.2 原因3` 进一步指出：median 操作使 T=5 时每个位置仅 1 帧获梯度（80% 帧梯度为 0），LFF（2.4K 参数）被稀疏梯度进一步削弱。
+
+#### 4.3.3 噪声分离的实现问题
+
+**(1) LFF 对噪声分离的作用是间接的，非直接的**
+根据问题建模：光照=低频幅度 → LFF **直接处理**；噪声=宽带幅度+相位 → LFF **不直接针对**。LFF 的 RBF 可以学到衰减高频，但这会同时损伤高频结构细节——这不是 LFF 的设计意图。噪声分离由以下机制承担：
+- TFSI 空间分支：$\sigma_t$（时域方差）直接度量噪声水平，**未经 LFF**
+- SACE soft-median：对 LFF 后的特征做时域中位值，零均值噪声被抑制（LFF + median 协同去噪）
+- NDPN：SNR 自适应加权多帧聚合，才是真正的去噪执行者
+
+**(2) SNR 估计的尺度不一致（最实质的问题）**
+NDPN 原实现（`ndpn.py`）：
+```python
+signal = mu_t_clean.abs().mean(dim=1, keepdim=True)   # 来自 SACE: LFF'd + soft-median
+noise  = sigma_t.mean(dim=1, keepdim=True)             # 来自 TFSI: 原始 feats 的时域方差
+snr_hat = signal / (noise + eps)
+```
+- 分子 $\mu_t^{clean}$：经过 LFF（抑制低频光照）+ soft-median（抑制噪声）→ 信号尺度已被改变
+- 分母 $\sigma_t$：原始 LayerNorm 后编码器特征的时域标准差 → 未经 LFF
+
+二者的**幅度尺度不在同一域**。这不是物理意义上的信噪比，而是混合了"清洁信号"与"原始噪声"的非一致量。$\tau_{mid}/\tau_{scale}$ 可学习参数可吸收绝对尺度差异，但 $s_{snr}$ 的**相对动态范围**和**物理可解释性**仍受损。
+
+**(3) SACE 残差把噪声又加回来**
+SACE 原实现（`sace.py`）：
+```python
+f_aligned = self.deform_attn(q_norm, kv_norm, offset, mask) + kv  # 残差 = +F̄_i
+```
+DeformAttn 输出（已被 query=$\mu_t^{clean}$ 清洁化）加上残差 $\bar{F}_i$（仍含噪声）。**$F_{aligned}$ 并非去噪特征**——噪声通过残差回流到 NDPN。这削弱了"三源分离"的干净性：SACE 的 LFF 没有阻断噪声向 NDPN 的传递。
+
+**(4) σ_t 未经 LFF——这反而是对的**
+TFSI 的 $\sigma_t$（噪声估计源）没有经过 LFF。如果 $\sigma_t$ 也经过 LFF，LFF 的低频抑制会改变噪声的频谱分布，使 $\sigma_t$ 不再反映真实噪声水平。当前设计让 $\sigma_t$ 绕过 LFF，对噪声估计合理——但也正是这种"绕过"造成了 (2) 的 SNR 尺度不一致。这是设计上的两难。
+
+### 4.4 修改方案
+
+针对上述分析，设计四项修改（M1-M4）。核心思路：**相位保留（安全化）+ SNR 尺度一致化（修真实缺陷）+ 噪声感知残差门控（堵噪声穿透）+ 可选的共享解耦（根治任务冲突）**。
+
+#### M1：相位保留 LFF（核心，低风险）
+
+**改动**：`LFFFeatureAdapter` 增加 `phase_preserving` 标志（默认 True）。`phase_preserving=True` 时 `phase_new = phase`（相位恒等），`False` 时保留原行为 `phase_new = phase + Δφ`。`RadialBasisFilter` 仍保留相位参数（`coeff_phase`/`raw_gate_phase`）以支持 M4 解耦模式下 SACE 独立启用相位整形。
+
+**理由**：
+1. 光照归一化只需幅度低频抑制，相位保留无损于光照处理（ExpoMamba：光照→幅度，结构→相位）
+2. 保留相位=保留结构信息，SACE 对齐匹配更可靠
+3. 保留相位=保留噪声指纹载体，让 TFSI 的 Conv 能从相位特征学到噪声模式，**有利于 $s_{noise}$ 估计**
+4. 减少约一半 LFF 可学参数的更新（`coeff_phase` 冻结），降低过拟合风险
+5. 恒等初始化+梯度饥饿下 $Δ\phi$ 本就≈0，显式移除只是把"de facto 行为"变成"by design"
+
+**相位保留能/不能解决的问题**：
+
+| 问题 | 相位保留是否解决 | 原因 |
+|------|:---:|------|
+| 相位破坏结构/噪声指纹风险 | ✅ 根治 | 相位恒等，不再整形 |
+| 任务冲突（SACE 梯度主导 LFF） | ❌ | 冲突主要在**幅度**域，与相位无关 |
+| SNR 尺度不一致 | ❌ | $\mu_t^{clean}$ 被**幅度**整形改变尺度 |
+| SACE 残差噪声穿透 | ❌ | 残差 `+kv` 与相位整形无关 |
+| 梯度饥饿 | ❌ | 根本性梯度衰减，与 LFF 相位无关 |
+
+**结论**：相位保留是**必要的安全修正**，但必须配合 M2/M3 才能实质解决噪声分离问题。
+
+#### M2：SNR 尺度一致化（修真实实现缺陷，中风险）
+
+**改动**：SACE 输出 `sigma_t_clean = lff_stack.std(dim=1)`（LFF 后特征的时域标准差），NDPN 改用 `(μ_t_clean, σ_t_clean)`——二者同处 LFF 域，尺度一致。
+
+**理由**：
+1. $\mu_t^{clean}$ 是 soft-median（去噪信号），$\sigma_t^{clean}$ 是 std（实际噪声），二者都在 LFF 域——这才是物理一致的 SNR
+2. $\tau_{mid}/\tau_{scale}$ 可学习参数吸收绝对尺度，但**相对动态范围**和**逐像素分布**需要一致才有意义
+3. LFF 对低频噪声的抑制会同时影响 $\mu_t^{clean}$ 和 $\sigma_t^{clean}$ 的低频分量，二者同步变化，SNR 比值更稳定
+4. 不增加参数，只增加一次 std 计算
+
+**代价**：$\sigma_t^{clean}$ 反映的是 LFF 后的噪声（低频部分被抑制），可能低估宽带噪声的低频分量。但这对 SNR 的**相对**判断影响有限，且 $\tau_{mid}$ 可学习补偿。
+
+#### M3：噪声感知残差门控（堵噪声穿透，中风险）
+
+**改动**：SACE 残差从 `f_aligned = deform_attn(...) + kv` 改为 `f_aligned = deform_attn(...) + (1 - s_noise) * kv`，其中 $s_{noise}$ 来自 TFSI（已在 `tfsi_out` 中传入 SACE）。`tfsi_out=None` 时回退到 `+kv`（向后兼容）。
+
+**理由**：
+1. 高噪声区：$s_{noise}→1$，残差→0，$F_{aligned}$ 更干净（来自 query=$\mu_t^{clean}$ 的清洁采样），NDPN 负担减轻
+2. 低噪声区：$s_{noise}→0$，残差≈kv，保留原始信息流和梯度路径
+3. 噪声感知耦合让 SACE 和 NDPN 的分工更清晰：SACE 在高噪区输出"准对齐+干净"，NDPN 再做精细多帧聚合
+4. 不破坏梯度流（低噪区残差仍在），符合 v3.2 soft-median 的"所有帧获梯度"理念
+
+**代价**：高噪区信息略损失，但 deform_attn 输出本身已携带 query($\mu_t^{clean}$) 的清洁结构，信息冗余足够。
+
+#### M4：解耦共享 LFF——任务特化（可选，较激进）
+
+**改动**：`share_lff=False` 时 SACE 内部创建独立 LFF（`phase_preserving=False`，启用相位整形辅助对齐），TFSI 保留相位保留 LFF。不共享，各自独立学习。
+
+**理由**：根治梯度不对称和任务冲突，让 TFSI 的 LFF 不被 SACE 的对齐目标带偏。
+**代价**：参数翻倍（~2.4K→~4.8K，仍可忽略），失去"统一光照不变定义"的一致性。**需消融验证**。
+
+### 4.5 各修改对原问题的覆盖矩阵
+
+| 原问题 | M1 相位保留 | M2 SNR一致 | M3 残差门控 | M4 解耦共享 |
+|--------|:---:|:---:|:---:|:---:|
+| 相位破坏结构/噪声指纹风险 | ✅ 根治 | — | — | ✅ |
+| 任务冲突（梯度主导） | ⚠️ 缓解 | — | — | ✅ 根治 |
+| SNR 尺度不一致 | — | ✅ 根治 | — | — |
+| SACE 残差噪声穿透 | — | — | ✅ 根治 | — |
+| 间接噪声分离（经对齐） | ✅ 增强 | ✅ 增强 | ✅ 增强 | ✅ 增强 |
+| 梯度饥饿 | — | — | — | ⚠️ 轻微 |
+
+**注**：梯度饥饿是架构性问题（归一化加权+median稀疏），需 v3.2 提出的辅助损失等独立措施，不在 LFF 修改范围。
+
+### 4.6 实施变更
+
+| 文件 | 改动 | 对应方案 |
+|------|------|---------|
+| `models/modules/lff.py` | `LFFFeatureAdapter` 增加 `phase_preserving` 标志（默认 True）；forward 中相位恒等分支 | M1 |
+| `models/modules/tfsi.py` | `FrequencyBranch` 透传 `phase_preserving=True`；TFSI 实例化时显式设 True | M1 |
+| `models/modules/sace.py` | SACE 增加 `phase_preserving` 参数（独立模式支持 M4）；计算 `sigma_t_clean` 并输出；残差改为 `(1-s_noise)*kv` 噪声感知门控 | M1/M2/M3 |
+| `models/modules/ndpn.py` | `sigma_t` 重命名为 `sigma_t_clean`；docstring 更新 | M2 |
+| `models/tfs_net.py` | NDPN 调用改用 `sace_out["sigma_t_clean"]`；移除冗余 `sigma_t` 解包；新增 `sace_phase_preserving` 参数透传 | M2/M4接口 |
+| `test_lff_phase.py` | 新建：7 项验证测试 | 验证 |
+| `datasets/sdsd_dataset.py` | 新增 `max_seqs` 参数（按序列限制，消融用） | 训练支持 |
+| `train.py` | `build_model` 读取消融开关；`build_dataloaders` 支持 `max_val_samples`；`validate` 支持 `val_crop_size` | 训练支持 |
+| `configs/ablation_baseline.yaml` | M1-M3 baseline 配置（共享+相位保留） | 消融 |
+| `configs/ablation_m4_decoupled.yaml` | M4 消融配置（解耦+SACE相位整形） | 消融 |
+
+### 4.7 验证：单元测试 + 梯度检查
+
+`test_lff_phase.py` 7 项测试全部通过（`python test_lff_phase.py`）：
+
+| 测试 | 验证内容 | 结果 |
+|------|---------|------|
+| LFF phase_preserving 行为 | True 时相位恒等，False 时相位整形，两者输出可区分 | ✅ diff=1.18e-2 |
+| LFF 梯度隔离 | True 时 `coeff_phase` 梯度为零（冻结），`coeff_mag` 正常学习；False 时两者均学习 | ✅ |
+| SACE sigma_t_clean 输出 | shape 正确，与 `lff_stack.std` 完全一致（diff=0） | ✅ |
+| NDPN SNR 一致性 | 接受 `sigma_t_clean`，SNR 单调（低噪 s_snr=1.0 > 高噪 0.289） | ✅ |
+| SACE 残差门控 | s_noise=0/0.5/1 时 norm 单调递减（2.47→1.32→0.54）；`tfsi_out=None` 回退兼容 | ✅ |
+| 端到端梯度 | LFF 共享保持；`coeff_mag` 收到梯度；三分支梯度非零；18 输出键 shape 正确 | ✅ |
+| Shape 一致性 | 全模块 I/O shape 与改动前一致 | ✅ |
+
+`test_smoke.py` 5/5 通过（无回归）。
+
+### 4.8 消融实证：M4 解耦共享 vs Baseline（M1-M3）
+
+**设置**：SDSD indoor，2 序列训练 / 1 序列 5 帧 validation，crop 64，batch 2，4 epoch，CPU，seed=42。此为**简短训练**，仅验证方向性趋势，非最终性能结论。
+
+#### 训练损失演进
+
+| Epoch | Baseline loss_total | M4 loss_total | Baseline loss_pix | M4 loss_pix | Baseline loss_perc | M4 loss_perc | Baseline loss_illum | M4 loss_illum |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| 1 | 0.2516 | 0.2221 | 0.1556 | 0.1362 | 0.0331 | 0.0313 | 0.00335 | 0.00284 |
+| 2 | 0.3521 | 0.2585 | 0.2317 | 0.1620 | 0.0468 | 0.0366 | **1.7e-6** | **4.5e-7** |
+| 3 | 0.2677 | 0.2114 | 0.1710 | 0.1326 | 0.0376 | 0.0311 | **9.5e-9** | **0.0** |
+| 4 | 0.2062 | 0.1912 | 0.1306 | 0.1194 | 0.0276 | 0.0263 | **0.0** | **0.0** |
+
+#### Validation 指标
+
+| 指标 | Baseline (共享+相位保留) | M4 (解耦+SACE相位整形) | 差异 |
+|------|:---:|:---:|:---:|
+| **PSNR (dB)** | **17.44** | 17.16 | M4 ↓0.28 |
+| **SSIM** | **0.607** | 0.588 | M4 ↓0.019 |
+| Val L1 | 0.1082 | 0.1077 | ≈持平 |
+| 参数量 | 1,392,993 | 1,397,194 | M4 +4,201 |
+
+#### 关键发现
+
+**1. 两者 `loss_illum` 均快速趋零（epoch 2-3 即降至 ~0）**
+这是最核心的发现——M4 解耦共享**未能解决 $s_{illum}$ 失效问题**。两者趋零速度几乎一致（baseline ep2=1.7e-6 vs M4 ep2=4.5e-7）。这证实了 §4.3.2 的分析：**$s_{illum}$ 失效是架构性的梯度饥饿问题**（归一化加权导致分支梯度衰减至 IGRF 的 1-8%），而非 LFF 共享/解耦所致。
+
+**2. M4 训练损失更低但验证指标略差（PSNR -0.28dB, SSIM -0.019）**
+这是典型的**过拟合信号**——M4 解耦后 SACE 独立 LFF（+4201 参数，含相位整形系数 `coeff_phase`/`raw_gate_phase`）增加了表达容量，在 2 序列的小数据上更易拟合训练集，但未泛化到验证集。
+
+**3. M4 的 `loss_perc` 略低（0.0263 vs 0.0276）**
+SACE 相位整形可能在特征层面提供了轻微的恢复辅助，但这一微小优势未转化为验证增益，反而被过拟合抵消。
+
+**4. 差异幅度在噪声水平内**
+PSNR 0.28dB 的差异在 4 epoch / 2 序列的简短训练下不具统计显著性。但方向一致（训练↓、验证↓），支持过拟合判断。
+
+#### 结论与决策
+
+| 决策 | 理由 |
+|------|------|
+| **保持 M1-M3 baseline 为默认** | 参数更少（-4201）、验证略优（PSNR +0.28dB）、相位保留物理正确 |
+| **不启用 M4 解耦** | 无验证收益、增加过拟合风险、失去"统一光照不变定义"一致性 |
+| **$s_{illum}$ 失效需独立解决** | 两者 `loss_illum` 均快速趋零 → 根因是梯度饥饿而非 LFF 策略 → 需辅助损失/分支重建头等 v3.2/v5 提案 |
+
+#### 对原分析问题的最终回应
+
+- **任务冲突（SACE 梯度主导 LFF）**：M4 试图通过解耦根治，但消融显示解耦后 $s_{illum}$ 仍失效（`loss_illum` 同样趋零）——说明任务冲突不是 $s_{illum}$ 失效的主因，梯度饥饿才是
+- **共享 LFF 的合理性**：消融支持"保留共享"——共享版本验证更优且参数更省，M4 解耦的额外容量在小数据上有害无益
+- **相位保留（M1）的价值**：作为安全基线，避免了 M4 相位整形带来的过拟合风险，是正确的默认选择
+
+### 4.9 未解决与后续方向
+
+本次 LFF 修改（M1-M3）解决了相位破坏风险、SNR 尺度不一致、SACE 残差噪声穿透三个实现缺陷，但**未解决以下架构性问题**（明确边界）：
+
+| 问题 | 根因 | 需要的独立措施 |
+|------|------|--------------|
+| 梯度饥饿 | 归一化加权导致分支梯度衰减至 IGRF 的 1-8% | v3.2 辅助分支损失（λ_aux=0.2） |
+| median 梯度稀疏 | T=5 时每个位置仅 1 帧获梯度 | v3.2 soft-median（已实施） |
+| $L_{inter}$ 与 $L_{pix}$ 同源 | 中间监督冗余（§2.1） | v5 候选方向 B/C（特征域级联/解耦中间监督） |
+| 三分支信息孤岛 | IFPN/NDPN/MRPN 完全并行无交互 | v5 候选方向 A（跨分支特征交互） |
+
+**保留的消融资产**：
+
+| 文件 | 用途 |
+|------|------|
+| `configs/ablation_baseline.yaml` | M1-M3 baseline 配置（可复现） |
+| `configs/ablation_m4_decoupled.yaml` | M4 消融配置（供后续更大规模消融） |
+| `outputs/ablation_baseline_train.log` | Baseline 训练日志 |
+| `outputs/ablation_m4_train.log` | M4 训练日志 |
+| `outputs/ablation_baseline/best.pth` | Baseline 最佳 checkpoint |
+| `outputs/ablation_m4_decoupled/best.pth` | M4 最佳 checkpoint |
+
+---
+
+## 5. 版本演进总结
 
 | 版本 | 核心架构 | 关键指标 |
 |------|---------|---------|
@@ -779,28 +1079,42 @@ mrpn_out = self.mrpn(F_aligned_list=F_aligned_list,
 | v4.1 | 顺序级联（光照→噪声→运动）+ 中间监督 | IFPN 梯度改善 3x |
 | v4.2 | 去噪→运动→提亮 + 乘法提亮 | **训练失败**（loss 不下降） |
 | v4.3 | 有界乘法提亮 + hybrid lit_up_map + 移除 .detach() | **PSNR=19.9 dB, SSIM=0.765** |
-| **v5** | **MRPN 窗口相关+门控融合+残差精炼 / TFSI 移除 s_motion / v5.1 MRPN同域设计 / v5.2 TFSI concat融合 / v5.3 IFPN同域设计** | — |
+| **v5** | **MRPN 窗口相关+门控融合+残差精炼 / TFSI 移除 s_motion / v5.1 MRPN同域设计 / v5.2 TFSI concat融合 / v5.3 IFPN同域设计 / v5.4 LFF 相位保留+SNR一致化+噪声感知残差门控 (M1-M3)** | — |
 
 ---
 
-## 5. 文件对应关系
+## 6. 文件对应关系
 
 | 文件 | 内容 |
 |------|------|
-| `models/tfs_net.py` | 主网络（5 stage pipeline） |
+| `models/tfs_net.py` | 主网络（5 stage pipeline，v5.4 新增 `share_lff`/`sace_phase_preserving` 消融开关） |
 | `models/modules/igrf.py` | IGRF v4.3（StageBlock + BrightenStage） |
 | `models/modules/ifpn.py` | IFPN v5.3（hybrid lit_up_map + coarse_adapter） |
-| `models/modules/ndpn.py` | NDPN 去噪分支 |
+| `models/modules/ndpn.py` | NDPN 去噪分支（v5.4: `sigma_t` → `sigma_t_clean` 尺度一致化） |
 | `models/modules/mrpn.py` | MRPN 运动补偿分支 |
-| `models/modules/tfsi.py` | TFSI 时频源指示器 |
-| `models/modules/sace.py` | SACE 可变形跨帧对齐 |
+| `models/modules/tfsi.py` | TFSI 时频源指示器（v5.4: FrequencyBranch 相位保留） |
+| `models/modules/sace.py` | SACE 可变形跨帧对齐（v5.4: `sigma_t_clean` 输出 + 噪声感知残差门控 + `phase_preserving` 参数） |
+| `models/modules/lff.py` | LFF 可学习频率滤波器（v5.4: `phase_preserving` 标志） |
 | `models/modules/encoder.py` | PyramidEncoder 4级金字塔 |
 | `losses/losses.py` | TFSNetLoss v4.3 |
 | `configs/sdsd_stage1.yaml` | 训练超参数 |
+| `configs/ablation_baseline.yaml` | v5.4 M1-M3 baseline 消融配置 |
+| `configs/ablation_m4_decoupled.yaml` | v5.4 M4 解耦消融配置 |
+| `test_lff_phase.py` | v5.4 LFF 机制修改验证测试（7 项） |
+| `datasets/sdsd_dataset.py` | SDSD 数据集（v5.4: `max_seqs` 参数支持消融） |
 
 ---
 
-## 6. 参考文献
+## 7. 参考文献
+
+> §4 LFF 机制修改的相关文献见下方 §7.1；§1-§3 原始设计文献见 §7.2。
+
+### 7.1 LFF 机制修改相关（§4）
+
+6. **[Sing et al., NeurIPS 2025]** FRBNet: Revisiting Low-Light Vision through Frequency-Domain Radial Basis Network — LFF 光照不变特征理论依据（[GitHub](https://github.com/Sing-Forevet/FRBNet) / [OpenReview](https://openreview.net/pdf?id=FWflRgqt8X)）
+7. **[Adhikarla et al., WACV 2026]** ExpoMamba: From Darkness to Detail — 幅度↔光照、相位↔结构解耦建模（M1 相位保留的物理依据）
+
+### 7.2 原始设计相关（§1-§3）
 
 1. Tu et al., "Fourier-Based Decoupling Network for Joint Low-Light Image Enhancement and Deblurring," IEEE TIP, 2025
 2. Zamir et al., "Multi-Stage Progressive Image Restoration (MPRNet)," CVPR 2021

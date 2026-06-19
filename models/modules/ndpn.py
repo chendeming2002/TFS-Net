@@ -3,10 +3,11 @@ NDPN (Noise-Denoising Pyramid Network) — TFS-Net v3
 =====================================================
 基于 SNR 自适应聚合的多帧降噪。
 
-实现状态: ✅ 完整实现
+实现状态: ✅ 完整实现 (M2: sigma_t_clean 尺度一致化)
 
 数据流:
     1. SNR 估计: s_SNR = sigmoid((SNR_hat - τ_mid) / τ_scale)
+       SNR_hat = |μ_t_clean| / (σ_t_clean + ε)   (M2: 二者同处 LFF 域)
     2. 双因素权重: α_i = sigmoid(Conv(残差)) * (1 - s_SNR), α_t = s_SNR
     3. 加权聚合: F_denoised = Σ w_i * F_i^aligned
     4. 强度门控: f_noise_out = s_noise * F_denoised + (1-s_noise) * F_t
@@ -61,7 +62,7 @@ class NDPN(nn.Module):
         feats: torch.Tensor,
         F_aligned_list: List[torch.Tensor],
         mu_t_clean: torch.Tensor,
-        sigma_t: torch.Tensor,
+        sigma_t_clean: torch.Tensor,
         s_noise: torch.Tensor,
         center_idx: int,
     ) -> Dict[str, torch.Tensor]:
@@ -69,10 +70,10 @@ class NDPN(nn.Module):
         assert len(F_aligned_list) == T
         assert C == self.channels
 
-        # Step 1: SNR 估计
+        # Step 1: SNR 估计 (M2: sigma_t_clean 与 mu_t_clean 同处 LFF 域, 尺度一致)
         eps = 1e-6
         signal = mu_t_clean.abs().mean(dim=1, keepdim=True)
-        noise = sigma_t.mean(dim=1, keepdim=True)
+        noise = sigma_t_clean.mean(dim=1, keepdim=True)
         snr_hat = signal / (noise + eps)
 
         tau_scale = torch.exp(self.log_tau_scale).clamp(min=1e-2)

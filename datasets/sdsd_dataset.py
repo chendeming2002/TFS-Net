@@ -16,7 +16,7 @@ def read_image(path):
 
 
 class SDSDDataset(Dataset):
-    def __init__(self, input_root, target_root, window_size=5, mode="train", crop_size=256):
+    def __init__(self, input_root, target_root, window_size=5, mode="train", crop_size=256, max_seqs=None):
         super().__init__()
         self.input_root = input_root
         self.target_root = target_root
@@ -24,11 +24,14 @@ class SDSDDataset(Dataset):
         self.half_window = window_size // 2
         self.mode = mode
         self.crop_size = crop_size
+        self.max_seqs = max_seqs
         self.samples = self._build_samples()
 
     def _build_samples(self):
         samples = []
         seq_names = sorted([name for name in os.listdir(self.input_root) if os.path.isdir(os.path.join(self.input_root, name))])
+        if self.max_seqs is not None:
+            seq_names = seq_names[: self.max_seqs]
         for seq_name in seq_names:
             lq_paths = sorted(glob(os.path.join(self.input_root, seq_name, "*")))
             gt_paths = sorted(glob(os.path.join(self.target_root, seq_name, "*")))

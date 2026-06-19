@@ -46,24 +46,34 @@ def load_config(path):
 
 
 def build_dataloaders(cfg, smoke=False):
+    ds_cfg = cfg["dataset"]
+    max_train = ds_cfg.get("max_train_seqs", None)
+    max_val = ds_cfg.get("max_val_seqs", None)
     train_set = SDSDDataset(
-        input_root=cfg["dataset"]["train_input_root"],
-        target_root=cfg["dataset"]["train_target_root"],
-        window_size=cfg["dataset"]["window_size"],
+        input_root=ds_cfg["train_input_root"],
+        target_root=ds_cfg["train_target_root"],
+        window_size=ds_cfg["window_size"],
         mode="train",
-        crop_size=cfg["dataset"]["crop_size"],
+        crop_size=ds_cfg["crop_size"],
+        max_seqs=max_train,
     )
     val_set = SDSDDataset(
-        input_root=cfg["dataset"]["val_input_root"],
-        target_root=cfg["dataset"]["val_target_root"],
-        window_size=cfg["dataset"]["window_size"],
+        input_root=ds_cfg["val_input_root"],
+        target_root=ds_cfg["val_target_root"],
+        window_size=ds_cfg["window_size"],
         mode="val",
-        crop_size=cfg["dataset"]["crop_size"],
+        crop_size=ds_cfg["crop_size"],
+        max_seqs=max_val,
     )
 
     if smoke:
         train_set = Subset(train_set, list(range(min(8, len(train_set)))))
         val_set = Subset(val_set, list(range(min(4, len(val_set)))))
+    else:
+        # 简短训练: 限制 validation 帧数避免 CPU 推理耗时过长
+        max_val_samples = ds_cfg.get("max_val_samples", None)
+        if max_val_samples is not None and len(val_set) > max_val_samples:
+            val_set = Subset(val_set, list(range(max_val_samples)))
 
     train_loader = DataLoader(
         train_set,
@@ -85,10 +95,13 @@ def build_dataloaders(cfg, smoke=False):
 
 
 def build_model(cfg, device):
+    model_cfg = cfg["model"]
     model = TFSNet(
-        in_channels=cfg["model"]["in_channels"],
-        level_channels=tuple(cfg["model"]["level_channels"]),
-        fused_channels=cfg["model"]["fused_channels"],
+        in_channels=model_cfg["in_channels"],
+        level_channels=tuple(model_cfg["level_channels"]),
+        fused_channels=model_cfg["fused_channels"],
+        share_lff=model_cfg.get("share_lff", True),
+        sace_phase_preserving=model_cfg.get("sace_phase_preserving", True),
     )
     return model.to(device)
 
@@ -174,7 +187,7 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
 
 
 @torch.no_grad()
-def validate(model, loader, device, tile_size, tile_overlap, use_amp):
+def validate(model, loader, device, tile_size, tile_overlap, use_amp, val_crop_size=None):
     model.eval()
     psnr_meter = AverageMeter()
     ssim_meter = AverageMeter()
@@ -182,6 +195,14 @@ def validate(model, loader, device, tile_size, tile_overlap, use_amp):
     for clip, target, _ in tqdm(loader, total=len(loader), desc="val", leave=False):
         clip = clip.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
+        # 简短训练/消融: 中心裁剪到小尺寸避免 CPU 全分辨率推理耗时过长
+        if val_crop_size is not None:
+            _, _, _, h, w = clip.shape
+            cs = min(val_crop_size, h, w)
+            top = (h - cs) // 2
+            left = (w - cs) // 2
+            clip = clip[:, :, :, top:top + cs, left:left + cs]
+            target = target[:, :, top:top + cs, left:left + cs]
         pred = tiled_forward(
             model=model,
             clip=clip,
@@ -251,6 +272,7 @@ def main():
                 tile_size=cfg["eval"]["tile_size"],
                 tile_overlap=cfg["eval"]["tile_overlap"],
                 use_amp=cfg["eval"]["amp"] and device.type == "cuda",
+                val_crop_size=cfg["dataset"].get("val_crop_size", None),
             )
             logger.info("Val stats: %s", val_stats)
             save_checkpoint(
