@@ -17,3 +17,11 @@
 2026-06-19 23:38:08,128 - INFO - step 100/123 loss=0.2035 pix=0.1278 freq=0.0162 ssim=0.3163 perc=0.0410 illum=0.0000 inter=0.1278
 2026-06-19 23:39:04,311 - INFO - Train stats: {'loss_total': 0.20458515091397897, 'loss_pix': 0.1283547708355799, 'loss_freq': 0.016005362278017087, 'loss_ssim': 0.3204680652153201, 'loss_perc': 0.04078180775258357, 'loss_illum': 0.0001530842102939107, 'loss_inter': 0.12834441628519114}
 2026-06-19 23:39:14,773 - INFO - Val stats: {'val_l1': 0.08630788326263428, 'psnr': 19.186377613683682, 'ssim': 0.6365732192993164}
+2026-06-20 10:15:46,677 - INFO - Loading config from configs\ablation_v55.yaml
+2026-06-20 10:15:46,677 - INFO - Using device: cpu
+2026-06-20 10:15:48,942 - INFO - Epoch 1 / 1
+2026-06-20 10:16:06,746 - INFO - Train stats: {'loss_total': 0.5919922068715096, 'loss_pix': 0.3912649527192116, 'loss_freq': 0.028802239801734686, 'loss_ssim': 0.7196890115737915, 'loss_perc': 0.08361018635332584, 'loss_illum': 0.013762086302466581, 'loss_inter': 0.3912649527192116}
+2026-06-20 10:23:23,794 - INFO - Loading config from configs\ablation_v55.yaml
+2026-06-20 10:23:23,794 - INFO - Using device: cpu
+2026-06-20 10:23:25,585 - INFO - Epoch 1 / 1
+2026-06-20 10:23:42,858 - INFO - Train stats: {'loss_total': 0.5919922068715096, 'loss_pix': 0.3912649527192116, 'loss_freq': 0.028802239801734686, 'loss_ssim': 0.7196890115737915, 'loss_perc': 0.08361018635332584, 'loss_illum': 0.013762086302466581, 'loss_inter': 0.3912649527192116}

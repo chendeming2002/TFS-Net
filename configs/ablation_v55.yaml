@@ -1,0 +1,45 @@
+seed: 42
+output_dir: outputs/ablation_v55
+dataset:
+  train_input_root: E:/Low-LightDatasets/Videos/SDSD/indoor_png/indoor/input
+  train_target_root: E:/Low-LightDatasets/Videos/SDSD/indoor_png/indoor/GT
+  val_input_root: E:/Low-LightDatasets/Videos/SDSD/indoor_png/indoor/input
+  val_target_root: E:/Low-LightDatasets/Videos/SDSD/indoor_png/indoor/GT
+  window_size: 5
+  crop_size: 64
+  num_workers: 2
+  max_train_seqs: 2
+  max_val_seqs: 1
+  max_val_samples: 5
+  val_crop_size: 64
+model:
+  type: TFSNet
+  in_channels: 3
+  level_channels: [32, 64, 96]
+  fused_channels: 64
+  share_lff: true
+  sace_phase_preserving: true
+train:
+  batch_size: 2
+  epochs: 4
+  lr: 0.001
+  weight_decay: 0.0001
+  amp: false
+  log_interval: 50
+  val_interval: 4
+  warmup_epochs: 1
+  grad_clip: 0.5
+loss:
+  type: TFSNetLoss
+  use_freq_loss: true
+  perceptual_pretrained: false
+  lambda_perc: 0.1
+  lambda_freq: 0.1
+  lambda_illum: 0.01
+  lambda_ssim: 0.1
+  lambda_inter: 0.3
+  fused_channels: 64
+eval:
+  tile_size: 64
+  tile_overlap: 8
+  amp: false

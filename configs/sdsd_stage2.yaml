@@ -14,11 +14,11 @@ model:
   level_channels: [32, 64, 96]
   fused_channels: 64
 train:
-  batch_size: 4
+  batch_size: 3
   epochs: 150
-  lr: 0.0015
+  lr: 0.001
   weight_decay: 0.0001
-  amp: true
+  amp: false
   log_interval: 50
   val_interval: 5
   warmup_epochs: 10
@@ -30,10 +30,10 @@ loss:
   lambda_perc: 0.2
   lambda_freq: 0.1
   lambda_illum: 0.01
-  lambda_ssim: 0.2
+  lambda_ssim: 0.1
   lambda_inter: 0.3
   fused_channels: 64
 eval:
   tile_size: 512
   tile_overlap: 64
-  amp: true
+  amp: false

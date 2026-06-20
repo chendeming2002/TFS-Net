@@ -139,7 +139,8 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
         optimizer.zero_grad(set_to_none=True)
         with autocast(enabled=use_amp):
             outputs = model(clip)
-            loss, loss_dict = criterion(outputs, target)
+        # 损失计算在 fp32（autocast 外），避免 SSIM/VGG 的 fp16 精度问题（§8.4 修复 A）
+        loss, loss_dict = criterion(outputs, target)
 
         if not torch.isfinite(loss):
             logger.warning("Skipping non-finite loss at step %d", step + 1)

@@ -1330,3 +1330,165 @@ $s_{illum}$ 将**首次被重建损失有效监督**。
 3. Feijoo et al., "DarkIR: Robust Low-Light Image Restoration," CVPR 2025
 4. Chen et al., "Simple Baselines for Image Restoration (NAFNet)," ECCV 2022
 5. Cai et al., "Retinexformer: One-stage Retinex-based Transformer for Low-light Image Enhancement," ICCV 2023
+
+---
+
+## 8. Stage2 训练崩溃分析（4090, 2026-06-20）
+
+### 8.1 训练配置
+
+| 参数 | stage2 值 |
+|------|-----------|
+| 硬件 | 4090 (24GB), CUDA |
+| batch_size | 4 |
+| epochs | 150 |
+| lr | 0.0015 (warmup 10 epoch) |
+| amp | **true** (fp16 混合精度) |
+| λ_ssim | **0.2** (stage1=0.1) |
+| λ_perc | **0.2** (stage1=0.1) |
+| λ_illum | 0.01 |
+| crop_size | 256 |
+| level_channels | [32, 64, 96] (3 级) |
+
+### 8.2 崩溃现象
+
+**Epoch 1-9：稳定收敛**
+
+| Epoch | loss_total | loss_pix | loss_ssim | loss_perc | loss_illum | 备注 |
+|:---:|:---:|:---:|:---:|:---:|:---:|------|
+| 1 | 0.3192 | 0.1196 | 0.2992 | 0.5128 | 1.4e-4 | 正常下降 |
+| 5 | 0.2962 | 0.1119 | 0.2734 | 0.4737 | 5e-7 | 稳定 |
+| 9 | 0.2972 | 0.1145 | 0.2795 | 0.4553 | 1.2e-16 | 稳定（loss_illum 已趋零） |
+
+**Epoch 5 验证**：PSNR=19.04, SSIM=0.760（与 stage1 的 v4.3 基线 epoch 5 的 18.57 相当，略优）
+
+**Epoch 10：中途开始渐进式发散**
+
+| Step | loss_total | loss_pix | loss_ssim | 趋势 |
+|:---:|:---:|:---:|:---:|------|
+| 2300 | 0.3013 | 0.1168 | 0.2808 | 最后一个稳定点 |
+| 2350 | 0.3025 | 0.1175 | 0.2817 | 微涨 |
+| **2400** | **0.3120** | **0.1230** | **0.2923** | **发散起点** |
+| 2500 | 0.3350 | 0.1358 | 0.3204 | 持续上升 |
+| 3000 | 0.4267 | 0.1868 | 0.4326 | 快速上升 |
+| 3950 | 0.5328 | 0.2446 | 0.5674 | epoch 末尾 |
+
+**Epoch 10 验证**：PSNR=**6.48**, SSIM=**0.006**（崩溃！输出退化为近常数图像）
+
+**Epoch 11-12：锁定在崩溃状态**
+
+| Epoch | loss_total | loss_pix | loss_ssim | SSIM metric | 备注 |
+|:---:|:---:|:---:|:---:|:---:|------|
+| 11 | 0.8834 | 0.4405 | 0.9937 | **~0.006** | 输出≈常数 |
+| 12 | 0.8795 | 0.4376 | 0.9935 | ~0.006 | 锁定，无法恢复 |
+
+### 8.3 崩溃特征诊断
+
+| 特征 | 观测 | 诊断 |
+|------|------|------|
+| 发作速度 | 渐进式（~1700 step 从 0.30→0.53） | 非数值爆炸，是权重缓慢漂移 |
+| NaN/Inf | **无** `isfinite` 触发 | loss 始终有限，只是方向错误 |
+| 发作时机 | Epoch 10 step 2400（非 epoch 边界） | 非 LR 跳变（lr=0.001365，warmup 末段） |
+| SSIM metric | 0.006（近零） | 输出退化为**空间常数**图像 |
+| pix loss | 0.44（非零） | 常数输出与 GT 不匹配，但无法逃离 |
+| 可恢复性 | 不可恢复（ep11-12 锁定） | 权重陷入坏区域的吸引盆地 |
+
+### 8.4 根因分析
+
+**结论：AMP fp16 数值不稳定导致的渐进式发散**
+
+三个因素共同作用：
+
+#### 因素 1（主因）：AMP fp16 在 SSIM/感知损失中的精度不足
+
+`train.py:140-142` 中 `autocast` 包裹了**整个前向+损失计算**：
+```python
+with autocast(enabled=use_amp):
+    outputs = model(clip)
+    loss, loss_dict = criterion(outputs, target)  # SSIM + VGG 在 fp16 下计算
+```
+
+SSIM 损失（`losses.py:23-35`）涉及：
+- `F.conv2d(x*x, ...)` — 平方运算，fp16 下易溢出（暗光输入值小，但平方后乘累积可能精度丢失）
+- 除法 `numerator / (denominator + 1e-6)` — fp16 的 1e-6 接近其精度下限（fp16 最小正规数 ~6e-8，但有效精度仅 ~3 位十进制）
+- `gaussian_window` 卷积 — 权重和为 1，但 fp16 累加误差
+
+VGG 感知损失（`losses.py:63-70`）在 fp16 下运行 VGG-16 前向，relu 激活的 fp16 精度损失累积。
+
+**stage1 未崩溃的原因**：stage1 的 `amp=false`，全部 fp32 计算，无此问题。
+
+#### 因素 2（加剧）：λ_ssim=0.2 放大了 SSIM 的 fp16 误差
+
+stage2 将 λ_ssim 从 0.1 提高到 0.2。SSIM 损失的 fp16 误差被放大 2× 后参与反向传播，梯度方向可能因精度丢失而偏离正确方向。当 SSIM 梯度方向错误时，优化器可能将输出推向"平坦化"方向（SSIM 对常数输出给出 1-SSIM≈1 的损失，但梯度在 fp16 下可能指示错误方向）。
+
+#### 因素 3（使不可恢复）：`isfinite` 检查无法捕获渐进发散
+
+`train.py:144` 检查 `torch.isfinite(loss)` 只能捕获 NaN/Inf，无法检测"loss 有限但方向错误"的渐进发散。一旦权重漂移到坏区域，每个 step 的有限但错误的梯度持续推离，`GradScaler` 的 scale factor 不会降低（因为梯度非 Inf），形成不可逆的崩溃。
+
+### 8.5 修复建议
+
+| 修复 | 优先级 | 改动 | 预期效果 |
+|------|:---:|------|---------|
+| **A. 损失计算移出 autocast** | **P0** | `train.py:140-142` 拆分：`with autocast: outputs=model(clip)` → `loss=criterion(outputs, target)` 在 autocast 外 | SSIM/VGG 在 fp32 计算，消除精度问题 |
+| **B. 降低 λ_ssim 回 0.1** | P1 | `configs/sdsd_stage2.yaml` | 减少 SSIM 梯度误差的放大 |
+| **C. 添加梯度范数监控** | P1 | `train.py` log 中增加梯度范数 | 早期发现发散（grad norm 异常增长） |
+| **D. 降低 lr** | P2 | `lr: 0.001`（回到 stage1 值） | 减缓权重漂移速度 |
+
+**推荐组合**：A（必须）+ B（保险）+ C（监控）。A 是根治——让数值敏感的损失在 fp32 计算，AMP 仅用于模型前向（这是 PyTorch 官方推荐做法：autocast 应包裹模型前向，损失计算通常在 fp32）。
+
+### 8.6 修复 A 的代码变更
+
+`train.py:139-142` 当前：
+```python
+optimizer.zero_grad(set_to_none=True)
+with autocast(enabled=use_amp):
+    outputs = model(clip)
+    loss, loss_dict = criterion(outputs, target)
+```
+
+改为：
+```python
+optimizer.zero_grad(set_to_none=True)
+with autocast(enabled=use_amp):
+    outputs = model(clip)
+# 损失计算在 fp32（autocast 外），避免 SSIM/VGG 的 fp16 精度问题
+loss, loss_dict = criterion(outputs, target)
+```
+
+PyTorch 官方文档明确推荐：**"It is safe to perform loss computation outside autocast"**，且 `outputs` 从 autocast 退出时会自动转为 fp32。这不影响 AMP 加速（模型前向仍在 fp16），只确保损失计算的数值稳定性。
+
+### 8.7 最终决定：关闭 AMP
+
+经实测发现，**AMP（fp16）与 LFF 模块的复数运算不兼容**。LFF（`models/modules/lff.py`）使用 `torch.fft.fft2` / `torch.fft.ifft2` / `torch.polar` 进行频域整形，这些复数运算在 fp16 autocast 下：
+- `fft2` 对 fp16 输入的精度支持不完整（PyTorch 的 FFT 在 autocast 下可能静默降级或产生不可预期的精度损失）
+- `torch.polar(mag_new, phase_new)` 涉及 `exp(iθ)` 的复数指数运算，fp16 下相位精度不足
+- IFFT 后 `.real` 取实部时，复数到实数的转换在 fp16 下可能丢失有效位
+
+即使将损失计算移出 autocast（修复 A），LFF 前向仍在 fp16 下运行，复数运算的精度问题依然存在。因此**最终决定完全关闭 AMP**（`amp: false`），全部使用 fp32 训练。
+
+### 8.8 最终 stage2 配置
+
+| 参数 | stage1 | stage2 最终值 | 变更理由 |
+|------|--------|-------------|---------|
+| batch_size | 3 | **3** | 显存不足，无法增大 |
+| amp | false | **false** | AMP 与 LFF 复数运算不兼容 |
+| lr | 0.001 | **0.001** | batch=3 匹配（从 0.0015 降回） |
+| epochs | 100 | **150** | 确保完全收敛 |
+| warmup_epochs | 5 | **10** | 缓解早期振荡 |
+| λ_perc | 0.1 | **0.2** | 增强高频细节（§0.4） |
+| λ_ssim | 0.1 | **0.1** | 保持（从 0.2 降回，AMP 关闭后无需额外保险） |
+| λ_illum | 0.1→0.01 | **0.01** | v5.5 s_illum 直入 IGRF |
+| level_channels | [32,64,96,128] | **[32,64,96]** | v5.5 3 级编码器 |
+| tile_size | 256 | **512** | 4090 可处理大 tile |
+| num_workers | 4 | **8** | 4090 多核 |
+
+**训练时间估算**（4090, fp32, batch=3, crop=256）：
+- ~4127 steps/epoch × 0.8s/step ≈ 55 min/epoch
+- 150 epoch ≈ **~138 小时（5.7 天）**
+- 验证 10 序列每 5 epoch ≈ 30 次 × ~30 min ≈ 15 小时
+- **总计 ~153 小时（6.4 天）**
+
+> 注：fp32 下无 AMP 加速，训练时间较长。如需加速，可考虑：
+> 1. 将 LFF 的 FFT 运算用 `with autocast(enabled=False)` 局部禁用 fp16（需验证 PyTorch 版本支持）
+> 2. 使用 `torch.cuda.amp.autocast(dtype=torch.bfloat16)` 替代 fp16（bf16 有更大动态范围，可能兼容复数运算）
+> 3. 减少验证频率（val_interval=10）
