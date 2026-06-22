@@ -15,6 +15,7 @@ v5 设计：输出双源独立强度图 [s_illum, s_noise]，s_motion 已废弃�
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .blocks import ConvBlock, LayerNorm2d
 from .lff import LFFFeatureAdapter
@@ -24,24 +25,37 @@ class SpatialBranch(nn.Module):
     """
     TFSI 空间分支：时域统计量 → Conv → F_s
 
+    v5.6 P1-5: median 改为 soft_median（可导），让 μ_t 梯度能回传到 encoder。
+    旧版用 torch.median（不可导），μ_t 不向 encoder 传梯度。
+
     对多帧特征 {F_i} 沿时间维计算：
-        μ_t(x,y)  = Median_i{F_i(x,y)}          # 时域中位值（结构先验）
+        μ_t(x,y)  = soft_median_i{F_i(x,y)}     # v5.6: 可导软中位值
         σ_t²(x,y) = Var_i{F_i(x,y)}             # 时域方差（噪声/运动度量）
         SNR(x,y)  = μ_t / (σ_t + ε)             # 信噪比估计
 
     拼接后经 3×3 Conv 得到空间特征 F_s ∈ R^{C_f × H × W}。
     """
 
-    def __init__(self, channels: int, fused_channels: int, eps: float = 1e-6):
+    def __init__(self, channels: int, fused_channels: int, eps: float = 1e-6,
+                 soft_median_tau: float = 0.1, use_soft_median: bool = True):
         super().__init__()
         self.eps = eps
+        self.use_soft_median = use_soft_median
+        self.soft_median_tau = soft_median_tau
         # 输入：[μ_t, σ_t, SNR]，共 3 通道（每通道为 C 维特征的压缩统计）
-        # 注：Median/Var 对每个空间位置 (x,y) 在通道维度上分别统计，
-        #     结果 shape 为 (B, C, H, W)，拼接后为 (B, 3C, H, W)
         self.conv = nn.Sequential(
             ConvBlock(channels * 3, fused_channels, kernel_size=3, stride=1, padding=1, act=True),
             ConvBlock(fused_channels, fused_channels, kernel_size=3, stride=1, padding=1, act=True),
         )
+
+    @staticmethod
+    def _soft_median(x: torch.Tensor, dim: int = 1, tau: float = 0.1) -> torch.Tensor:
+        """梯度友好的软中位值近似（参照 SACE._soft_median）。"""
+        with torch.no_grad():
+            med = x.median(dim=dim).values.unsqueeze(dim)
+        dist = (x - med).abs()
+        weights = F.softmax(-dist / tau, dim=dim)
+        return (weights * x).sum(dim=dim)
 
     def forward(self, feats: torch.Tensor) -> dict:
         """
@@ -55,8 +69,12 @@ class SpatialBranch(nn.Module):
                 sigma_t   : (B, C, H, W) 时域标准差（供 SACE/NDPN 使用）
                 snr       : (B, C, H, W) 原始 SNR 估计 μ_t/(σ_t+ε)
         """
-        # 时域中位值：对 T 维取 median
-        mu_t = feats.median(dim=1).values          # (B, C, H, W)
+        if self.use_soft_median:
+            # v5.6 P1-5: soft_median 可导，梯度能回传到 encoder
+            mu_t = self._soft_median(feats, dim=1, tau=self.soft_median_tau)
+        else:
+            # 旧版: torch.median 不可导
+            mu_t = feats.median(dim=1).values          # (B, C, H, W)
 
         # 时域方差：对 T 维取 var
         sigma_t_sq = feats.var(dim=1, unbiased=False)  # (B, C, H, W)
@@ -173,15 +191,21 @@ class IntensityHead(nn.Module):
     """
     TFSI 双源独立强度输出头 (v5: 移除 s_motion)
 
+    v5.6 (P1-6): 加深为 2 层 + LayerNorm2d，让 s_illum/s_noise 有足够容量表达空间结构，
+    不被平滑正则压到 0。单层 1x1 + sigmoid 太弱，易塌缩。
+
     公式：
-        [s_illum, s_noise] = σ(Conv1x1(F_fused))
+        h = GELU(LayerNorm2d(Conv1x1(F_fused)))   # 64 -> 32
+        [s_illum, s_noise] = σ(Conv1x1(h))         # 32 -> 2
         每个 s_* ∈ [0,1]，独立 Sigmoid，允许多源叠加（物理正确）
     """
 
-    def __init__(self, fused_channels: int):
+    def __init__(self, fused_channels: int, hidden_channels: int = 32):
         super().__init__()
-        # 输出 2 通道，分别对应 illum / noise 强度
-        self.conv = nn.Conv2d(fused_channels, 2, 1, 1, 0)
+        self.conv1 = nn.Conv2d(fused_channels, hidden_channels, 1, 1, 0)
+        self.norm = LayerNorm2d(hidden_channels)
+        self.act = nn.GELU()
+        self.conv2 = nn.Conv2d(hidden_channels, 2, 1, 1, 0)
 
     def forward(self, f_fused: torch.Tensor) -> dict:
         """
@@ -193,10 +217,11 @@ class IntensityHead(nn.Module):
                 s_illum : (B, 1, H, W) 光照退化强度，∈ [0,1]
                 s_noise : (B, 1, H, W) 噪声退化强度，∈ [0,1]
         """
-        raw = self.conv(f_fused)             # (B, 2, H, W)
-        intensities = torch.sigmoid(raw)     # (B, 2, H, W)
-        s_illum = intensities[:, 0:1]        # (B, 1, H, W)
-        s_noise = intensities[:, 1:2]        # (B, 1, H, W)
+        h = self.act(self.norm(self.conv1(f_fused)))
+        raw = self.conv2(h)                    # (B, 2, H, W)
+        intensities = torch.sigmoid(raw)       # (B, 2, H, W)
+        s_illum = intensities[:, 0:1]          # (B, 1, H, W)
+        s_noise = intensities[:, 1:2]          # (B, 1, H, W)
         return {
             "s_illum": s_illum,
             "s_noise": s_noise,
@@ -220,14 +245,16 @@ class TFSI(nn.Module):
     供后续 SACE 共享 LFF 时扩展。
     """
 
-    def __init__(self, channels: int = 64, fused_channels: int = 64, eps: float = 1e-6):
+    def __init__(self, channels: int = 64, fused_channels: int = 64, eps: float = 1e-6,
+                 use_soft_median: bool = True):
         super().__init__()
         self.channels = channels
         self.fused_channels = fused_channels
         self.eps = eps
 
         self.norm = LayerNorm2d(channels)
-        self.spatial_branch = SpatialBranch(channels, fused_channels, eps=eps)
+        self.spatial_branch = SpatialBranch(channels, fused_channels, eps=eps,
+                                            use_soft_median=use_soft_median)
         # 频域分支：LFF 已实现 (M1: 相位保留, 保留噪声指纹供 s_noise 估计)
         self.freq_branch = FrequencyBranch(
             channels=channels,

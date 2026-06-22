@@ -16,6 +16,9 @@ from .ifpn import IFPN, IllumExtract
 from .ndpn import NDPN
 from .mrpn import MRPN
 
+# v5.6 新增 block
+from .blocks import ConvBlock, ResBlock, NAFBlock, LayerNorm2d
+
 __all__ = [
     # v1
     "PyramidEncoder", "MINSBlock", "ISPN", "MSPN", "FinalReconstruction",
@@ -25,5 +28,7 @@ __all__ = [
     "SACE", "DeformableCrossAttention", "OffsetMaskHead",
     "IFPN", "IllumExtract",
     "NDPN", "MRPN",
+    # v5.6
+    "ConvBlock", "ResBlock", "NAFBlock", "LayerNorm2d",
 ]
 

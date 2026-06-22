@@ -1492,3 +1492,345 @@ PyTorch 官方文档明确推荐：**"It is safe to perform loss computation out
 > 1. 将 LFF 的 FFT 运算用 `with autocast(enabled=False)` 局部禁用 fp16（需验证 PyTorch 版本支持）
 > 2. 使用 `torch.cuda.amp.autocast(dtype=torch.bfloat16)` 替代 fp16（bf16 有更大动态范围，可能兼容复数运算）
 > 3. 减少验证频率（val_interval=10）
+
+---
+
+## 9. Stage2 重启训练实证分析（v5.5, 4090, 2026-06-20 夜）
+
+### 9.1 背景
+
+§8 的崩溃（AMP fp16 与 LFF 复数运算不兼容）已通过 `amp: false` 修复。本节记录按 §8.8 最终配置重启后的 v5.5 训练实证，目的是**检验 §4.12 根治方案的实际效果**——尤其是"$s_{illum}$ 直入 IGRF + 混合提亮"能否让 $s_{illum}$ 摆脱 §4.10 诊断的失效。
+
+训练于 2026-06-20 10:36 启动，在 epoch 16 第 ~900 step 经 SIGSTOP 暂停后终止，用于无损诊断。
+
+### 9.2 实际训练配置（`configs/sdsd_stage2.yaml`）
+
+| 参数 | 值 | 与 §8.8 一致性 |
+|------|-----|---------------|
+| batch_size | 3 | ✓（显存约束） |
+| amp | **false** | ✓（§8.7 决定） |
+| lr | 0.001, warmup 10 epoch | ✓ |
+| epochs | 150 | ✓ |
+| level_channels | [32, 64, 96] | ✓（v5.5 3 级） |
+| λ_perc / λ_ssim / λ_illum / λ_inter | 0.2 / 0.1 / 0.01 / 0.3 | ✓ |
+| num_workers | 8 | ✓ |
+| eval.tile_size | 512 | ✓ |
+
+### 9.3 验证集趋势（每 5 epoch）
+
+| epoch | 时间 | PSNR (dB) | SSIM | val_l1 | 备注 |
+|:---:|:---:|:---:|:---:|:---:|------|
+| 5 | 14:41 | 19.094 | 0.7577 | 0.0797 | 起点即 v4.3 基线上沿 |
+| 10 | 18:59 | 19.026 | 0.7590 | 0.0830 | PSNR 略降、SSIM 略升 |
+| 15 | 23:34 | **19.235** | 0.7515 | 0.0813 | PSNR 微涨但 SSIM 反降 |
+
+PSNR 在 19.0–19.2 振荡，**完全落在 §0.2 记录的 v4.3 基线带（18.2–19.3）内**，15 epoch 未见突破。SSIM 与 PSNR 此消彼长，说明优化在"提亮强度 vs 结构保真"间徘徊，未找到共同改善方向。
+
+### 9.4 训练损失行为
+
+| epoch | loss_total | loss_pix | loss_perc | loss_ssim | loss_illum | loss_inter |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| 13 | 0.2771 | 0.1123 | 0.5061 | 0.2863 | 3.04e-5 | 0.1123 |
+| 14 | 0.2755 | 0.1122 | 0.5007 | 0.2823 | 3.04e-5 | 0.1122 |
+| 15 | 0.2753 | 0.1124 | 0.4991 | 0.2819 | 3.04e-5 | 0.1124 |
+
+- `loss_total` 三 epoch 仅降 0.0018，**极平**；`loss_perc≈0.50` 主导且不降。
+- **`loss_illum≈3e-5` 全程为 0**（epoch 16 各 step 仍 `illum=0.0000`）。与 §8.2 中 epoch 9 的 `1.2e-16` 同一现象——$s_{illum}$ 的边缘平滑正则在训练早期就已饱和。
+
+### 9.5 Checkpoint 实证诊断（CPU 无损前向，`latest.pth`）
+
+对 epoch 10（`latest.pth` @18:59）与 epoch 15（`latest.pth` @23:34）两个检查点做 CPU 前向（batch=1, 128×128, 输入均值 0.025 的暗帧）：
+
+| 量 | epoch 10 ckpt | epoch 15 ckpt | 结论 |
+|------|:---:|:---:|------|
+| `s_illum` mean / std | 0.0001 / 7.8e-3 | **0.0001 / 7.8e-3** | 塌缩为 0，未恢复 |
+| `s_noise` mean / std | 0.0000 / 4.5e-5 | **0.0000 / 0.0** | 彻底塌缩（更严重） |
+| `igrf.brighten.illum_corr.weight` norm | 0.67 | 0.48 | 非零（冷启动已打破） |
+| `igrf.stage_noise.intensity_corr.weight` norm | 0.18 | 0.18 | 非零 |
+| `lit_up_map` mean / max | 1.113 / 1.805 | 1.153 / 1.679 | 乘法提亮在增强 |
+| 输出提亮倍率（out/in 均值） | 6.28× | **7.63×** | 全靠 lit_up_map |
+
+**关键观察**：
+1. §4.12.4 的零初始化**冷启动已打破**——`illum_corr` / `intensity_corr` 权重已学到非零值，加法通路在结构上是通的。
+2. **但 $s_{illum}$ 与 $s_{noise}$ 都塌缩到 0**：`s_illum` 全图均值 1e-4，`s_noise` 在 epoch 15 甚至全图恒为 0。
+3. **提亮完全由乘法 `lit_up_map` 承担**（7.63×），加法项 `illum_residual = s_illum · corr_mag ≈ 0` 实际是 no-op。
+
+### 9.6 根因：监督缺失 + 功能冗余
+
+§4.12 修好了**梯度衰减**（$s_{illum}$ 直入 IGRF，$\partial res_t/\partial s_{illum}=corr\_mag$ 不经暗域 100× 衰减、不经 65× 通道稀释），实测 `corr_mag` 通路权重也确实非零。但 $s_{illum}$ 仍塌缩到 0，原因有二：
+
+#### 因素 1（主因）：$s_{illum}$ 无显式监督目标
+
+唯一涉及 $s_{illum}$ 的损失是 `L_illum`（`losses/losses.py:236`）——**边缘感知平滑正则**：
+
+$$L_{illum} = \text{mean}(|\partial_x s| \cdot e^{-|\partial_x I|}) + \text{mean}(|\partial_y s| \cdot e^{-|\partial_y I|})$$
+
+它只惩罚 $s_{illum}$ 的**梯度**、偏好**空间常量**，并不告诉 $s_{illum}$ 该取什么值。常量-0 同时满足：(a) 最小化正则；(b) 让加法项 `illum_residual` 静止——因此是正则的最优解。$s_{illum}$ 没有任何"应为多少"的监督，自然塌缩到 0。
+
+#### 因素 2（加剧）：与乘法提亮功能冗余
+
+`lit_up_map`（IFPN 的 Retinex 乘法路径）已能独立完成 7.63× 提亮，且其监督来自 $L_{pix}$/$L_{inter}$（`lit_up_map` 经 `img_s2 × lit_up_map` 参与 $L_{inter}$，`res_t` 经乘法参与 $L_{pix}$）。模型发现**单靠乘法路径就能降低重建损失**，便没有理由去激活 $s_{illum}$ 的加法修正——把它学成 0、让加法项变 no-op 是更"省力"的解。
+
+$s_{noise}$ 同理：NDPN 的 $f_{noise\_out}$ 已驱动 Stage 1 去噪，$s_{noise}$ 的加法 `intensity_corr` 修正被旁路，故 epoch 15 时 $s_{noise}$ 全图恒为 0。
+
+> **一句话**：v5.5 的直接注入通路在结构上通了、权重也非零，但**模型选择不走它**——没有监督逼 $s_{illum}$/$s_{noise}$ 有意义，且乘法/特征路径已冗余地承担了对应职能。
+
+### 9.7 与 §4.12 预期对照
+
+| §4.12.5 预期 | 实证结果 | 评判 |
+|------|------|------|
+| $s_{illum}$ 从 $L_{pix}$ 梯度提升到 ~0.001-0.01 | 通路权重非零，但 $s_{illum}\approx 0$ 使 $corr\_mag$ 对 $s_{illum}$ 的梯度 $\partial L/\partial s = \partial L/\partial res \cdot corr\_mag$ 数值上仍小 | 梯度通路修好，但被冗余路径"抢功" |
+| $L_{pix}$/$L_{illum}$ 梯度比 ~2:1~22:1，$L_{pix}$ 主导 | $L_{illum}=3e-5$ 已饱和，$L_{pix}=0.112$ 主导 | 形式上达成，但 $L_{illum}$ 饱和意味着正则失效而非 $s_{illum}$ 被有效利用 |
+| "$s_{illum}$ 将首次被重建损失有效监督" | **未实现**——$s_{illum}$ 塌缩为 0，重建损失经乘法路径走，不经 $s_{illum}$ | 预期落空 |
+
+**结论**：§4.12 解决了 §4.10 的"梯度衰减"问题，但暴露了更深层的"**目标缺失 + 功能冗余**"问题——这正是 §4.10 之外、本节新发现的失效模式。
+
+### 9.8 训练效率（实测）
+
+- 训练 ~42 min/epoch（2751 step × ~0.9s），验证 ~62 min/次（1120 step × 3.3s/it，`tile_size=512` 代价高）。
+- 150 epoch + 30 次验证 ≈ **~5 天**。验证成本（~31 小时总计）偏高，是 §8.8 注释项 3 所述的可优化点。
+
+### 9.9 结论与下一步
+
+**实证结论**：
+1. §8 的 AMP 崩溃已根治（`amp: false` 后 16 epoch 稳定，无发散）。
+2. v5.5 的 $s_{illum}$ 直入 IGRF 在结构上生效（通路权重非零），但**未能让 $s_{illum}$ 被实际利用**——$s_{illum}$/$s_{noise}$ 塌缩到 0，模型功能退化回 v4.3（仅乘法提亮），PSNR 停在 19.0–19.2 dB 基线带。
+
+**待解决的根因**（本节新增诊断，承接 §4.10）：
+- $s_{illum}$/$s_{noise}$ **缺显式监督目标**——仅有平滑正则，偏好常量-0。
+- **加法修正与乘法 `lit_up_map` 功能冗余**——乘法路径抢走了所有提亮职能。
+
+**候选根治方向**（待实施，不在本节范围内）：
+1. **给 $s_{illum}$ 显式监督**：构造目标图，如 $s_{illum}^{target} \approx \text{normalize}(1 - L_t / L_{ref})$（光照退化越深、$s_{illum}$ 越大），新增 $L_1$ 监督损失；$s_{noise}$ 同理以 SNR 为目标。
+2. **消除功能冗余**：让 `lit_up_map` 受 $s_{illum}$ 门控，如 $lit\_up\_map = 1 + s_{illum} \cdot (lit\_up\_map\_raw - 1)$，使乘法提亮必须经过 $s_{illum}$，迫使其承担职能。
+3. 两项可组合：先加监督让 $s_{illum}$ 有意义，再用门控确保它不可旁路。
+
+> 本节实证数据保存于 `outputs/sdsd_stage2/{train.log, nohup.out}`，诊断脚本为临时文件（CPU 无损前向，未污染 GPU 训练）。训练已于 epoch 16 暂停并终止，待上述方案定稿后重启。
+
+---
+
+## 10. 收敛改进方案设计（P0+P1，2026-06-21）
+
+### 10.0 背景
+
+§9 实证显示 v5.5 训练停在 v4.3 基线 19.2 dB，`s_illum`/`s_noise` 塌缩到 0。在系统对比 `reference_repos/` 中 NAFNet、DAT、Retinexformer、FRBNet、BasicSR 的 Conv Block / 注意力 / 损失实现后，定位到 12 个根因（详见对话记录）。本节给出 **P0 四项必做 + P1 七项重要** 共 11 项改动的逐文件方案，按 7 组 ablation 实施。
+
+### 10.1 关键澄清：本模型无 Swin Transformer
+
+全仓搜索 `swin|Swin|WindowAttention|W-MSA` 确认：
+- `window_partition` 仅用于 **MRPN**（`mrpn.py:59-61`）的**窗口化 dot-product 相关聚合**（`matmul + softmax`，不是自注意力）。
+- **SACE** 用 DAT 风格**可变形跨帧注意力**（`sace.py:30-158`），靠 `grid_sample` 在采样点上加权求和，**无 QK 点积、无窗口自注意力**。
+- 整个模型没有任何 MSA/Self-Attention。
+
+**SACE 帧间注意力的本质**（对比标准 QKV 注意力与 DAT）：
+
+| 维度 | 标准 QKV | DAT 可变形 | **TFS-Net SACE** |
+|---|---|---|---|
+| 注意力权重 | `softmax(Q·K^T/√d)` | `softmax(Q·K^T/√d)`+位置编码 | `softmax(mask)`（head 直接预测） |
+| 采样位置 | 全空间 | `offset+reference`（每 group 1 点） | `offset+reference+k×k 邻域`（每 group 9 点） |
+| QK 点积 | 有 | 有 | **无** |
+| offset head 输入 | — | 仅 query | `cat([query,kv])` (2C) |
+| offset head 内部 LN | — | 有 `LayerNormProxy` | **无** |
+| V 投影时机 | 标准 | 采样**后** | 采样**前** |
+| 残差 | 无 | 无 | `+(1-s_noise)·kv`（M3 门控） |
+
+**MRPN `window_partition` 的作用**（非对齐，是 SACE 之后的二次聚合）：
+- 在 SACE 已对齐特征上做窗口内 dot-product 相关聚合，`ws` 决定二次聚合感受野（ws=8 → 8 像素半径）。
+- 复杂度 `O(B·HW·(T-1)·ws²·C)`，**ws 翻倍 → MRPN 开销 4×**。
+- SACE 已对齐 → MRPN 的 ws 不需太大，默认 ws=8 合理。
+
+### 10.2 根因分析（12 项）
+
+#### 10.2.1 Conv Block 实现细节（最核心）
+
+**TFS-Net 现状**（`blocks.py:8-29`）：
+```
+ConvBlock: Conv2d + GELU          (无归一化、无残差、无 depthwise)
+ResBlock:  Conv-GELU-Conv + skip  (无归一化、无 LayerScale、系数=1)
+```
+
+**对比 NAFNet NAFBlock**（`reference_repos/NAFNet/NAFNet_arch.py:22-80`）：
+
+| 维度 | TFS-Net | NAFNet NAFBlock |
+|---|---|---|
+| 归一化 | **无** | LayerNorm2d Pre-LN ×2 |
+| 激活 | GELU | SimpleGate (channel split × multiply，无非线性激活) |
+| 结构 | 单 conv / Conv-Act-Conv | 双分支：1×1 PW → 3×3 DW → SG → SCA → 1×1 PW + FFN |
+| 残差缩放 | 系数 1，非零初始化 | `beta/gamma` 零初始化（LayerScale=0 → 初始恒等） |
+| depthwise | 不用 | 大量使用 |
+
+**最讽刺**：`LayerNorm2d` 已在 `blocks.py:32-43` 定义好（数学等价 NAFNet 版本），但 `ConvBlock/ResBlock` **没有引用它**——只在 `TFSI`（`tfsi.py:229`）和 `SACE`（`sace.py:244-245`）用。**整个 IFPN/IGRF/NDPN/MRPN/Encoder 的所有 conv 均无归一化**，特征分布随深度漂移，是训练不稳定和 SSIM/感知损失难下降的结构性根因。
+
+DAT 的 `conv_offset` 内部也有 `LayerNormProxy`（`dat_blocks.py:163`），而 SACE `OffsetMaskHead` 内部无归一化——进一步削弱可变形注意力训练稳定性。
+
+Retinexformer（ICCV 2023, LOL-v1 25.16 dB）的 conv block 也无归一化，但它的 IG-MSA 在 attention 前用 `PreNorm(LayerNorm)` 包裹，且整体是 Transformer 架构（每层有 LN）。TFS-Net 是 Conv 主干 + 轻量注意力，主干无归一化问题更严重。
+
+#### 10.2.2 损失函数与加权问题
+
+**当前损失**（`losses.py:205-263`, `configs/sdsd_stage2.yaml`）：
+```
+L_total = Charb(res_t, GT) + 0.1·L1(|FFT(res_t)|, |FFT(GT)|)        # L_recon
+        + 0.1·(1-SSIM(res_t, GT))                                   # L_ssim
+        + 0.2·VGG(relu3_3)(res_t, GT)                               # L_perc (单层!)
+        + 0.01·EdgeSmooth(s_illum, GT)                              # L_illum (错误监督)
+        + 0.3·Charb(clamp(img_s2·lit_up_map,0,1), GT)               # L_inter (只监督乘法路径!)
+```
+
+**问题 1**：L_inter 和 L_pix 都只监督乘法路径，加法 `s_illum` 路径无监督 → 模型让 s_illum 塌缩到 0（§9 实证）。
+**问题 2**：L_illum 是错误的监督——边缘平滑正则只惩罚 s_illum 梯度、偏好空间常量；常量-0 同时满足 (a) 最小化正则 (b) 让加法项静止 → 是正则最优解。应给 s_illum 显式目标。
+**问题 3**：感知损失只用单层 VGG（`vgg16.features[:16]` ≈ relu3_3）。主流用多层（relu1_2/2_2/3_3/4_3）加权 L1 或加 Gram matrix。单层对纹理细节不敏感。
+**问题 4**：频域损失只看幅度，不看相位。SSIM 对结构/相位敏感，相位缺失使 SSIM 难以下降。
+**问题 5**：λ_ssim=0.1 过小，被 λ_inter=0.3 淹没。
+
+#### 10.2.3 架构与数据流问题
+
+**问题 6**：IGRF 三级 `clamp` 的梯度死区——`img_s1=clamp(img+delta,0,1)`, `img_s2=clamp(...)`, `res_t=clamp(...)`。暗区(img≈0)/亮区(img≈1) clamp 梯度为 0 → 这些区域结构无法修复。低光增强恰恰最需在暗区提亮+保结构。DarkIR/Retinexformer 都不在中间级 clamp。
+
+**问题 7**：TFSI `IntensityHead` 太弱——`sigmoid(Conv1x1(64→2))` 单层线性 + sigmoid，无隐藏层、无归一化。输出塌缩到 0 与此直接相关。
+
+**问题 8**：TFSI `SpatialBranch` 用 `torch.median`（`tfsi.py:59`，不可导）。SACE 的 soft_median 用了 softmax 近似（`sace.py:248-257`），但 TFSI 直接用 `torch.median` → μ_t 不向 encoder 传梯度。
+
+**问题 9**：TFSI `FrequencyBranch` 只处理中心帧（`tfsi.py:134`），浪费多帧频域信息。
+
+**问题 10**：IFPN `lit_up_map` 有界化 `[1,5]` 限制动态范围；Retinexformer 用无界 `img·illu_map + img`（含 `+img` 加法 skip）。有界化更稳定但限制动态范围，`+img` skip 缺失使残差路径变弱。
+
+**问题 11**：SACE `OffsetMaskHead` 全零初始化 + 无内部归一化。`offset_head/mask_head` 的 weight AND bias 都 `nn.init.zeros_`（`sace.py:180-183`），DAT 用 kaiming weight + zero bias（weight 非零，BP 梯度尺度正常）。全零 weight → 初始 mask=0 → softmax 均匀 → 退化为均值滤波 → 可变形注意力学习启动慢。无内部 LayerNorm（DAT 有）→ offset 学习不稳定。
+
+**问题 12**：SACE 残差过强——`f_aligned = deform_attn + (1-s_noise)·kv`，s_noise 塌缩到 0 → 残差=kv → 恒等残差过强可能让 deform_attn 学习变懒。
+
+#### 10.2.4 SSIM/感知不收敛的根因链
+
+```
+ConvBlock 无归一化 → 深层特征分布漂移 → 训练不稳定
+    ↓
+s_illum/s_noise 塌缩到 0 → 加法路径 no-op → 模型退化到仅乘法提亮
+    ↓
+乘法 lit_up_map 有界[1,5] + 无 +img skip → 提亮受限
+    ↓
+IGRF 三级 clamp → 暗区/亮区梯度消失 → 这些区域结构无法修复
+    ↓
+频域损失只看幅度 + 感知损失单层 → 纹理/结构监督不足
+    ↓
+SSIM (结构) 和 L_perc (纹理) 都难以下降 → PSNR 停在 19.2 dB
+```
+
+### 10.3 改进方案（11 项，已锁定细节）
+
+#### P0：核心修复（必做，预期 PSNR +1.5~3 dB）
+
+**P0-1 主干归一化**（`blocks.py`）
+- ConvBlock：`Conv2d + GELU` → `LayerNorm2d → Conv2d → GELU`（Pre-LN，加 `use_norm=True` 默认 True）
+- ResBlock：`Conv-GELU-Conv + skip(系数1)` → `LayerNorm2d → Conv1(3x3) → GELU → Conv2(3x3) → ×beta + skip`，`beta = nn.Parameter(zeros(1,c,1,1))` 零初始化（LayerScale=0 → 初始恒等，深层堆叠稳定）
+- 影响范围：encoder.py、ifpn.py、ndpn.py、mrpn.py、igrf.py 所有 conv 块自动获益
+
+**P0-2 s_illum/s_noise 显式监督**（`losses.py`, `train.py`, yaml）—— 方案 A：基于 L_ratio
+- 新增 `L_illum_sup = L1(s_illum, clamp(1 - L_t/(L_ref+eps), 0, 1).detach())`，`lambda_illum_sup=0.1`
+- 新增 `L_noise_sup = L1(s_noise, clamp(1 - SNR/τ_high, 0, 1).detach())`，`lambda_noise_sup=0.05`
+- 保留原 L_illum（边缘平滑）但降权到 `lambda_illum=0.001`（不再是主监督）
+- s_illum_target 物理含义：光照退化越深（L_t 越小于 L_ref）→ s_illum 越大
+
+**P0-3 L_inter 修复**（`losses.py`）—— 方案 B：保留 L_inter + 新增 L_recon
+- 保留原 `L_inter = Charb(clamp(img_s2·lit_up_map,0,1), GT)`（中间监督乘法路径）
+- 新增 `L_recon = Charb(res_t, GT)`（监督含 s_illum 加法路径的最终输出），`lambda_recon=0.5`
+- 中间监督 + 最终监督都有
+
+**P0-4 clamp 梯度修复**（`igrf.py`）—— 方案 B：soft clamp
+- Stage1/Stage2 中间级：`clamp(x, 0, 1)` → `soft_clamp(x) = sigmoid(20·(x-0.5))`（梯度处处非零，值域近似 [0,1]）
+- 最终 res_t 保留硬 clamp（输出必须严格 [0,1]）
+
+#### P1：重要改进（预期再 +1~2 dB）
+
+**P1-1 SACE OffsetMaskHead 加 LayerNorm2d**（`sace.py:171-176`）
+- `shared`：`Conv2d(2C→64,1×1) → GELU → Conv2d(64→64,3×3,groups=64) → GELU`
+- 改为：`Conv2d(2C→64,1×1) → LayerNorm2d(64) → GELU → Conv2d(64→64,3×3,groups=64) → LayerNorm2d(64) → GELU`
+- 参照 DAT `conv_offset`（`dat_blocks.py:161-166`，LayerNormProxy 在 depthwise conv 后）
+
+**P1-2 offset_head/mask_head kaiming 初始化**（`sace.py:180-183`）
+- 当前：weight 和 bias 全部 `nn.init.zeros_`
+- 改为：weight 用 `nn.init.kaiming_normal_(..., mode='fan_in')`，bias 保持 `nn.init.zeros_`
+- 参照 DAT 默认初始化（`dat.py:246-251`）。mask 初始仍为 0 → softmax 均匀 → 均值聚合（保留"初始接近 identity"哲学），但梯度更健康。
+
+**P1-3 多层 VGG 感知损失**（`losses.py:38-70`）
+- 当前：`vgg16.features[:16]`（relu3_3，单层）
+- 改为：提取多层 + 加权 L1
+  ```
+  layer1 = vgg.features[:4]    # relu1_2, weight=0.1
+  layer2 = vgg.features[4:9]   # relu2_2, weight=0.2
+  layer3 = vgg.features[9:16]  # relu3_3, weight=0.5
+  L_perc = Σ_w L1(feat_i(pred), feat_i(target))
+  ```
+
+**P1-4 频域损失加相位**（`losses.py:220-225`）
+- 当前：`L_freq = L1(|FFT(pred)|, |FFT(target)|)`
+- 改为：`L_freq = L1(|F_pred|, |F_gt|) + 0.5·L1(∠F_pred, ∠F_gt)`
+- yaml `lambda_freq` 可从 0.1 提到 0.2
+
+**P1-5 TFSI soft_median**（`tfsi.py:59`）
+- 当前：`mu_t = feats.median(dim=1).values`（不可导）
+- 改为 soft_median（参照 `sace.py:248-257`）：
+  ```
+  with no_grad: med = feats.median(dim=1).values.unsqueeze(1)
+  dist = (feats - med).abs()
+  weights = softmax(-dist/tau, dim=1)   # tau=0.1
+  mu_t = (weights * feats).sum(dim=1)   # 可导
+  ```
+
+**P1-6 IntensityHead 加深**（`tfsi.py:181-203`）
+- 当前：`Conv2d(64→2,1×1) → sigmoid`
+- 改为：`Conv2d(64→32,1×1) → LayerNorm2d(32) → GELU → Conv2d(32→2,1×1) → sigmoid`
+- 加深 + 归一化让 s_illum/s_noise 有足够容量表达空间结构，不被平滑正则压到 0
+
+**P1-7 NAFBlock 升级**（`blocks.py` 新增 + 多模块替换）—— 显存策略：先试 batch=3，OOM 再降
+- 新增 `NAFBlock` 类（参照 `reference_repos/NAFNet/NAFNet_arch.py:22-80`）
+- 结构：`LayerNorm2d → Conv1(1×1,c→2c) → Conv2(3×3 DW,2c) → SimpleGate(2c→c) → ×SCA → Conv3(1×1,c→c) → ×beta + skip` + FFN 分支 `LayerNorm2d → Conv4(1×1,c→2c) → SimpleGate(2c→c) → Conv5(1×1,c→c) → ×gamma + skip`
+- `SimpleGate`：`x.chunk(2,dim=1)` 然后 `x1*x2`
+- `SCA`：`AdaptiveAvgPool2d(1) → Conv2d(c→c,1×1)`
+- `beta/gamma` 零初始化
+- 替换 IFPN feat_refine、NDPN refine、IGRF StageBlock.fuse 的 ResBlock×2、BrightenStage.delta_refine 的 ResBlock
+
+### 10.4 Ablation 分组与执行顺序
+
+```
+Group A (P0-1 主干LN)                → 30 epoch → 验证 PSNR > 19.5
+Group B (P0-2+P0-3+P1-6 s_illum监督) → 30 epoch → 验证 s_illum mean > 0.1
+Group C (P0-4 soft clamp)            → 30 epoch → 验证暗区 SSIM 改善
+Group D (P1-1+P1-2 SACE LN+init)     → 30 epoch → 验证对齐质量
+Group E (P1-3+P1-4 损失增强)          → 30 epoch → 验证 loss_perc/ssim 下降
+Group F (P1-5 TFSI soft_median)      → 30 epoch → 验证 encoder 梯度
+Group G (P1-7 NAFBlock)              → 30 epoch → 验证 PSNR > 20
+```
+
+- 每组独立 `output_dir`（`outputs/sdsd_ablation_A`…`_G`）
+- 每组用前一组 checkpoint 初始化（迁移加速）或 scratch 重训
+- 每组 30 epoch ~21h（SDSD indoor, batch=3, crop=256, fp32）
+- 总 ablation ~6 天
+
+### 10.5 文件影响矩阵
+
+| 文件 | P0-1 | P0-2 | P0-3 | P0-4 | P1-1 | P1-2 | P1-3 | P1-4 | P1-5 | P1-6 | P1-7 |
+|------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| `blocks.py` | ✓ | | | | | | | | | | ✓ |
+| `tfsi.py` | | | | | | | | | ✓ | ✓ | |
+| `sace.py` | | | | | ✓ | ✓ | | | | | |
+| `igrf.py` | | | | ✓ | | | | | | | ✓ |
+| `ifpn.py` | | | | | | | | | | | ✓ |
+| `ndpn.py` | | | | | | | | | | | ✓ |
+| `losses.py` | | ✓ | ✓ | | | | ✓ | ✓ | | | |
+| `tfs_net.py` | | (确认) | | | | | | | | | |
+| `train.py` | | ✓ | ✓ | | | | ✓ | ✓ | | | |
+| `configs/*.yaml` | | ✓ | ✓ | | | | ✓ | ✓ | | | |
+
+### 10.6 实施状态
+
+| 组 | 状态 | 日期 | 结果 |
+|---|---|---|---|
+| A (P0-1) | ✅ 代码完成，训练中 | 2026-06-21 | smoke test 通过，ep5 PSNR=18.76（-0.33dB，训练加速但泛化待观察） |
+| B (P0-2+P0-3+P1-6) | ✅ 代码完成，训练中 | 2026-06-21 | smoke test 通过，s_illum mean=0.479（不再为0！），10 个损失项正常 |
+| B2 (近全量) | ❌ 回退 | 2026-06-22 | ep5=17.81, ep10=18.34, ep15=17.70 — 比v5.5差1.3dB，改进互相干扰 |
+| B3 (架构only) | ❌ 回退 | 2026-06-22 | ep5=17.62 — 最差，soft_clamp在低光场景掐死动态范围 |
+| C (P0-4) | ❌ 回退 | 2026-06-22 | soft_clamp 对低光输入是灾难（sigmoid(20×(0.05-0.5))≈0），默认改回 false |
+| D (P1-1+P1-2) | ❌ 回退 | 2026-06-22 | SACE kaiming init 未带来收益，默认改回 false（保留全零初始化） |
+| E (P1-3+P1-4) | ⏸ 暂缓 | 2026-06-22 | 损失改进待架构稳定后再评估 |
+| F (P1-5) | ✅ 保留 | 2026-06-22 | soft_median 可导性是正面改进，默认 true |
+| G (P1-7) | ⏸ 暂缓 | 2026-06-22 | NAFBlock 待架构稳定后再评估 |
+| A2 (LN+IH only) | ✅ 训练中 | 2026-06-22 | batch=3 crop=224 v5.5参数，最干净对照 |

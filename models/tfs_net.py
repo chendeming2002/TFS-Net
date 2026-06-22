@@ -50,6 +50,11 @@ class TFSNet(nn.Module):
         kernel_size: int = 3,
         share_lff: bool = True,
         sace_phase_preserving: bool = True,
+        use_soft_clamp: bool = True,
+        sace_offset_use_norm: bool = True,
+        sace_offset_kaiming_init: bool = True,
+        use_soft_median: bool = True,
+        use_nafblock: bool = False,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -70,6 +75,7 @@ class TFSNet(nn.Module):
             channels=fused_channels,
             fused_channels=fused_channels,
             eps=eps,
+            use_soft_median=use_soft_median,
         )
 
         # Stage 2: SACE
@@ -83,6 +89,8 @@ class TFSNet(nn.Module):
             use_optimized=True,
             lff_module=shared_lff,
             phase_preserving=sace_phase_preserving,
+            offset_use_norm=sace_offset_use_norm,
+            offset_kaiming_init=sace_offset_kaiming_init,
         )
 
         # Stage 3: 三源恢复分支
@@ -95,7 +103,8 @@ class TFSNet(nn.Module):
         self.mrpn = MRPN(channels=fused_channels)
 
         # Stage 4: IGRF
-        self.igrf = IGRF(channels=fused_channels, out_channels=in_channels)
+        self.igrf = IGRF(channels=fused_channels, out_channels=in_channels,
+                         use_soft_clamp=use_soft_clamp, use_nafblock=use_nafblock)
 
         # 逐帧特征缓存 (推理时滑动窗口复用)
         self.frame_cache: Dict[int, Dict[str, torch.Tensor]] = {}

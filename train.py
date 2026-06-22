@@ -102,6 +102,11 @@ def build_model(cfg, device):
         fused_channels=model_cfg["fused_channels"],
         share_lff=model_cfg.get("share_lff", True),
         sace_phase_preserving=model_cfg.get("sace_phase_preserving", True),
+        use_soft_clamp=model_cfg.get("use_soft_clamp", True),
+        sace_offset_use_norm=model_cfg.get("sace_offset_use_norm", False),
+        sace_offset_kaiming_init=model_cfg.get("sace_offset_kaiming_init", False),
+        use_soft_median=model_cfg.get("use_soft_median", True),
+        use_nafblock=model_cfg.get("use_nafblock", False),
     )
     return model.to(device)
 
@@ -113,10 +118,19 @@ def build_loss(cfg, device):
         perceptual_pretrained=loss_cfg.get("perceptual_pretrained", False),
         lambda_perc=loss_cfg.get("lambda_perc", 0.1),
         lambda_freq=loss_cfg.get("lambda_freq", 0.1),
-        lambda_illum=loss_cfg.get("lambda_illum", 0.01),
+        lambda_illum=loss_cfg.get("lambda_illum", 0.001),
         lambda_ssim=loss_cfg.get("lambda_ssim", 0.2),
         lambda_inter=loss_cfg.get("lambda_inter", 0.3),
         fused_channels=loss_cfg.get("fused_channels", 64),
+        # v5.6 P0-2/P0-3
+        lambda_illum_sup=loss_cfg.get("lambda_illum_sup", 0.1),
+        lambda_noise_sup=loss_cfg.get("lambda_noise_sup", 0.05),
+        lambda_recon=loss_cfg.get("lambda_recon", 0.5),
+        noise_tau_high=loss_cfg.get("noise_tau_high", 5.0),
+        # v5.6 P1-3/P1-4
+        perc_multilayer=loss_cfg.get("perc_multilayer", True),
+        freq_with_phase=loss_cfg.get("freq_with_phase", True),
+        freq_phase_weight=loss_cfg.get("freq_phase_weight", 0.5),
     )
     return criterion.to(device)
 
@@ -129,6 +143,8 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
     meter_ssim = AverageMeter()
     meter_perc = AverageMeter()
     meter_illum = AverageMeter()
+    meter_illum_sup = AverageMeter()
+    meter_noise_sup = AverageMeter()
     meter_inter = AverageMeter()
 
     progress = tqdm(enumerate(loader), total=len(loader), desc="train", leave=False)
@@ -159,12 +175,15 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
         meter_ssim.update(loss_dict["loss_ssim"].item(), clip.size(0))
         meter_perc.update(loss_dict["loss_perc"].item(), clip.size(0))
         meter_illum.update(loss_dict["loss_illum"].item(), clip.size(0))
+        meter_illum_sup.update(loss_dict["loss_illum_sup"].item(), clip.size(0))
+        meter_noise_sup.update(loss_dict["loss_noise_sup"].item(), clip.size(0))
         meter_inter.update(loss_dict["loss_inter"].item(), clip.size(0))
 
-        progress.set_postfix(loss=meter_total.avg, pix=meter_pix.avg, ssim=meter_ssim.avg)
+        progress.set_postfix(loss=meter_total.avg, pix=meter_pix.avg, ssim=meter_ssim.avg,
+                             i_sup=meter_illum_sup.avg, n_sup=meter_noise_sup.avg)
         if (step + 1) % log_interval == 0:
             logger.info(
-                "step %d/%d loss=%.4f pix=%.4f freq=%.4f ssim=%.4f perc=%.4f illum=%.4f inter=%.4f",
+                "step %d/%d loss=%.4f pix=%.4f freq=%.4f ssim=%.4f perc=%.4f illum=%.4f i_sup=%.4f n_sup=%.4f inter=%.4f",
                 step + 1,
                 len(loader),
                 meter_total.avg,
@@ -173,6 +192,8 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
                 meter_ssim.avg,
                 meter_perc.avg,
                 meter_illum.avg,
+                meter_illum_sup.avg,
+                meter_noise_sup.avg,
                 meter_inter.avg,
             )
 
@@ -183,6 +204,8 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
         "loss_ssim": meter_ssim.avg,
         "loss_perc": meter_perc.avg,
         "loss_illum": meter_illum.avg,
+        "loss_illum_sup": meter_illum_sup.avg,
+        "loss_noise_sup": meter_noise_sup.avg,
         "loss_inter": meter_inter.avg,
     }
 

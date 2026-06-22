@@ -159,28 +159,45 @@ class DeformableCrossAttention(nn.Module):
 
 
 class OffsetMaskHead(nn.Module):
-    """从 [query, key_value] 拼接特征生成 offset 和 mask。"""
+    """从 [query, key_value] 拼接特征生成 offset 和 mask。
 
-    def __init__(self, channels: int, n_groups: int, kernel_size: int, hidden: int = 64):
+    v5.6 P1-1: 内部加 LayerNorm2d（depthwise conv 后、GELU 前），参照 DAT conv_offset。
+    v5.6 P1-2: offset_head/mask_head 改为 kaiming weight + zero bias（不全零），参照 DAT。
+    """
+
+    def __init__(self, channels: int, n_groups: int, kernel_size: int, hidden: int = 64,
+                 use_norm: bool = True, kaiming_init: bool = True):
         super().__init__()
         self.n_groups = n_groups
         self.n_points = kernel_size * kernel_size
         n_off = n_groups * self.n_points * 2
         n_msk = n_groups * self.n_points
 
-        self.shared = nn.Sequential(
-            nn.Conv2d(channels * 2, hidden, kernel_size=1, bias=True),
-            nn.GELU(),
-            nn.Conv2d(hidden, hidden, kernel_size=3, padding=1, groups=hidden, bias=True),
-            nn.GELU(),
-        )
+        layers = [nn.Conv2d(channels * 2, hidden, kernel_size=1, bias=True)]
+        if use_norm:
+            layers.append(LayerNorm2d(hidden))
+        layers.append(nn.GELU())
+        layers.append(nn.Conv2d(hidden, hidden, kernel_size=3, padding=1, groups=hidden, bias=True))
+        if use_norm:
+            layers.append(LayerNorm2d(hidden))
+        layers.append(nn.GELU())
+        self.shared = nn.Sequential(*layers)
+
         self.offset_head = nn.Conv2d(hidden, n_off, kernel_size=1, bias=True)
         self.mask_head = nn.Conv2d(hidden, n_msk, kernel_size=1, bias=True)
 
-        nn.init.zeros_(self.offset_head.weight)
-        nn.init.zeros_(self.offset_head.bias)
-        nn.init.zeros_(self.mask_head.weight)
-        nn.init.zeros_(self.mask_head.bias)
+        if kaiming_init:
+            # v5.6 P1-2: kaiming weight + zero bias (DAT 风格，梯度尺度健康)
+            nn.init.kaiming_normal_(self.offset_head.weight, mode='fan_in')
+            nn.init.zeros_(self.offset_head.bias)
+            nn.init.kaiming_normal_(self.mask_head.weight, mode='fan_in')
+            nn.init.zeros_(self.mask_head.bias)
+        else:
+            # v5.5 旧行为: 全零初始化
+            nn.init.zeros_(self.offset_head.weight)
+            nn.init.zeros_(self.offset_head.bias)
+            nn.init.zeros_(self.mask_head.weight)
+            nn.init.zeros_(self.mask_head.bias)
 
     def forward(self, query: torch.Tensor, key_value: torch.Tensor):
         x = torch.cat([query, key_value], dim=1)
@@ -213,6 +230,8 @@ class SACE(nn.Module):
         K: int = 10,
         n_ang_freq: int = 1,
         phase_preserving: bool = True,
+        offset_use_norm: bool = False,
+        offset_kaiming_init: bool = False,
     ):
         super().__init__()
         self.channels = channels
@@ -232,6 +251,7 @@ class SACE(nn.Module):
 
         self.offset_mask_head = OffsetMaskHead(
             channels=channels, n_groups=n_groups, kernel_size=kernel_size, hidden=64,
+            use_norm=offset_use_norm, kaiming_init=offset_kaiming_init,
         )
 
         self.deform_attn = DeformableCrossAttention(

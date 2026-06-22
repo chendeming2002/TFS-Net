@@ -24,7 +24,22 @@ References:
 import torch
 import torch.nn as nn
 
-from .blocks import ResBlock
+from .blocks import ResBlock, NAFBlock
+
+
+def soft_clamp(x: torch.Tensor, sharpness: float = 20.0) -> torch.Tensor:
+    """v5.6 P0-4: soft clamp with non-zero gradient everywhere.
+
+    sigmoid(sharpness * (x - 0.5)) maps R -> (0, 1), gradient = sharpness * s * (1-s) > 0.
+    At x=0 or x=1, gradient is tiny but non-zero (vs hard clamp's 0 gradient).
+    """
+    return torch.sigmoid(sharpness * (x - 0.5))
+
+
+def _make_res_blocks(channels: int, n: int, use_nafblock: bool = False):
+    """创建 n 个残差块，可选 NAFBlock 或 ResBlock。"""
+    Block = NAFBlock if use_nafblock else ResBlock
+    return nn.Sequential(*[Block(channels) for _ in range(n)])
 
 
 class StageBlock(nn.Module):
@@ -32,17 +47,20 @@ class StageBlock(nn.Module):
 
     v5.5: When use_intensity=True, s_intensity (s_noise) is injected as additive correction
     to delta via intensity_corr (Conv2d 1->img_channels, zero-initialized).
+    v5.6 P0-4: use_soft_clamp controls whether intermediate stages use soft clamp (default True).
+    v5.6 P1-7: use_nafblock controls whether to use NAFBlock instead of ResBlock in fuse.
     """
 
-    def __init__(self, channels: int, img_channels: int = 3, use_intensity: bool = False):
+    def __init__(self, channels: int, img_channels: int = 3, use_intensity: bool = False,
+                 use_soft_clamp: bool = False, use_nafblock: bool = False):
         super().__init__()
         self.use_intensity = use_intensity
+        self.use_soft_clamp = use_soft_clamp
         self.img_proj = nn.Conv2d(img_channels, channels, 3, 1, 1)
         self.fuse = nn.Sequential(
             nn.Conv2d(channels * 2, channels, 1, 1, 0),
             nn.GELU(),
-            ResBlock(channels),
-            ResBlock(channels),
+            _make_res_blocks(channels, 2, use_nafblock),
             nn.Conv2d(channels, img_channels, 3, 1, 1),
         )
         if use_intensity:
@@ -59,7 +77,11 @@ class StageBlock(nn.Module):
         # v5.5: additive intensity correction (zero-init -> initial behavior unchanged)
         if self.use_intensity and s_intensity is not None:
             delta = delta + self.intensity_corr(s_intensity)
-        img_next = torch.clamp(img_current + delta, 0.0, 1.0)
+        # v5.6 P0-4: soft clamp for intermediate stages (gradient non-zero in dark/bright regions)
+        if self.use_soft_clamp:
+            img_next = soft_clamp(img_current + delta)
+        else:
+            img_next = torch.clamp(img_current + delta, 0.0, 1.0)
         return img_next, delta
 
 
@@ -80,15 +102,17 @@ class BrightenStage(nn.Module):
         d(res_t)/d(s_illum) = corr_mag  (no img_s2 decay, no 65x channel dilution)
     """
 
-    def __init__(self, channels: int, img_channels: int = 3, max_delta: float = 0.5):
+    def __init__(self, channels: int, img_channels: int = 3, max_delta: float = 0.5,
+                 use_nafblock: bool = False):
         super().__init__()
         self.max_delta = max_delta
         self.feat_proj = nn.Conv2d(channels, img_channels, 3, 1, 1)
         self.img_proj = nn.Conv2d(img_channels, img_channels, 3, 1, 1)
+        Block = NAFBlock if use_nafblock else ResBlock
         self.delta_refine = nn.Sequential(
             nn.Conv2d(img_channels * 2, img_channels, 1, 1, 0),
             nn.GELU(),
-            ResBlock(img_channels),
+            Block(img_channels),
             nn.Conv2d(img_channels, img_channels, 3, 1, 1),
         )
         # v5.5: s_illum direct injection — zero-init so initial behavior = v4.3
@@ -122,22 +146,29 @@ class BrightenStage(nn.Module):
 
 class IGRF(nn.Module):
     """
-    IGRF v5.5 - Denoise -> Motion -> Brighten (sequential cascade)
+    IGRF v5.6 - Denoise -> Motion -> Brighten (sequential cascade)
 
-    Stage 1 (denoise):   img_s1 = clamp(img_center + delta_noise(f_noise, img, s_noise), 0, 1)
-    Stage 2 (motion):    img_s2 = clamp(img_s1 + delta_motion(f_motion, img_s1), 0, 1)
-    Stage 3 (brighten):  res_t = clamp(img_s2 * lit_up_map + s_illum * corr_mag, 0, 1)
+    Stage 1 (denoise):   img_s1 = soft_clamp(img_center + delta_noise(f_noise, img, s_noise))
+    Stage 2 (motion):    img_s2 = soft_clamp(img_s1 + delta_motion(f_motion, img_s1))
+    Stage 3 (brighten):  res_t = clamp(img_s2 * lit_up_map + s_illum * corr_mag, 0, 1)  (硬 clamp 最终输出)
                           (NO .detach(): L_recon gradient flows through to NDPN/MRPN/IFPN)
+    v5.6 P0-4: intermediate stages use soft clamp (gradient non-zero in dark/bright regions)
     """
 
-    def __init__(self, channels: int = 64, out_channels: int = 3):
+    def __init__(self, channels: int = 64, out_channels: int = 3, use_soft_clamp: bool = False,
+                 use_nafblock: bool = False):
         super().__init__()
         self.channels = channels
         self.out_channels = out_channels
 
-        self.stage_noise = StageBlock(channels, out_channels, use_intensity=True)   # denoise + s_noise
-        self.stage_motion = StageBlock(channels, out_channels, use_intensity=False)  # motion (no intensity)
-        self.brighten = BrightenStage(channels, out_channels)    # hybrid brighten + s_illum
+        self.stage_noise = StageBlock(channels, out_channels, use_intensity=True,
+                                       use_soft_clamp=use_soft_clamp,
+                                       use_nafblock=use_nafblock)   # denoise + s_noise
+        self.stage_motion = StageBlock(channels, out_channels, use_intensity=False,
+                                       use_soft_clamp=use_soft_clamp,
+                                       use_nafblock=use_nafblock)  # motion (no intensity)
+        self.brighten = BrightenStage(channels, out_channels,
+                                      use_nafblock=use_nafblock)    # hybrid brighten + s_illum (final hard clamp)
 
     def forward(
         self,
