@@ -191,37 +191,23 @@ class IntensityHead(nn.Module):
     """
     TFSI 双源独立强度输出头 (v5: 移除 s_motion)
 
-    v5.6 (P1-6): 加深为 2 层 + LayerNorm2d，让 s_illum/s_noise 有足够容量表达空间结构，
-    不被平滑正则压到 0。单层 1x1 + sigmoid 太弱，易塌缩。
+    v5.6: 回退到 v5.5 单层 Conv1x1 + Sigmoid。P1-6 加深版（Conv→LN→GELU→Conv）
+    在实证中未阻止 s_illum 塌缩, 反而增加过拟合风险。
 
     公式：
-        h = GELU(LayerNorm2d(Conv1x1(F_fused)))   # 64 -> 32
-        [s_illum, s_noise] = σ(Conv1x1(h))         # 32 -> 2
+        [s_illum, s_noise] = σ(Conv1x1(F_fused))
         每个 s_* ∈ [0,1]，独立 Sigmoid，允许多源叠加（物理正确）
     """
 
     def __init__(self, fused_channels: int, hidden_channels: int = 32):
         super().__init__()
-        self.conv1 = nn.Conv2d(fused_channels, hidden_channels, 1, 1, 0)
-        self.norm = LayerNorm2d(hidden_channels)
-        self.act = nn.GELU()
-        self.conv2 = nn.Conv2d(hidden_channels, 2, 1, 1, 0)
+        self.conv = nn.Conv2d(fused_channels, 2, 1, 1, 0)
 
     def forward(self, f_fused: torch.Tensor) -> dict:
-        """
-        Args:
-            f_fused: (B, C_f, H, W) 融合特征
-
-        Returns:
-            dict:
-                s_illum : (B, 1, H, W) 光照退化强度，∈ [0,1]
-                s_noise : (B, 1, H, W) 噪声退化强度，∈ [0,1]
-        """
-        h = self.act(self.norm(self.conv1(f_fused)))
-        raw = self.conv2(h)                    # (B, 2, H, W)
-        intensities = torch.sigmoid(raw)       # (B, 2, H, W)
-        s_illum = intensities[:, 0:1]          # (B, 1, H, W)
-        s_noise = intensities[:, 1:2]          # (B, 1, H, W)
+        raw = self.conv(f_fused)
+        intensities = torch.sigmoid(raw)
+        s_illum = intensities[:, 0:1]
+        s_noise = intensities[:, 1:2]
         return {
             "s_illum": s_illum,
             "s_noise": s_noise,

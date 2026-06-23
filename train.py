@@ -37,6 +37,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--resume", type=str, default=None, help="checkpoint path to resume from")
     return parser.parse_args()
 
 
@@ -271,7 +272,18 @@ def main():
     grad_clip = cfg["train"].get("grad_clip", 1.0)
 
     best_psnr = -1.0
-    for epoch in range(total_epochs):
+    start_epoch = 0
+
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        start_epoch = ckpt["epoch"]
+        best_psnr = ckpt.get("best_psnr", -1.0)
+        logger.info("Resumed from %s (epoch %d, best_psnr=%.4f)", args.resume, start_epoch, best_psnr)
+
+    for epoch in range(start_epoch, total_epochs):
         logger.info("Epoch %d / %d", epoch + 1, total_epochs)
         train_stats = train_one_epoch(
             model=model,

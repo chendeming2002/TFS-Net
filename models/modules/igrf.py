@@ -87,19 +87,22 @@ class StageBlock(nn.Module):
 
 class BrightenStage(nn.Module):
     """
-    Hybrid brightening stage (v5.5).
+    v5.7: s_illum 门控提亮 — 消除功能冗余, 解决 s_illum 塌缩。
 
-    Multiplicative base (Retinex, preserved from v4.3):
-        lit_up_map = lit_up_map_raw * (1 + tanh(delta) * max_delta)
-        brighten_base = img_dark * lit_up_map
+    旧 v5.5 (加法修正, 已废弃):
+        res_t = img_dark * lit_up_map + s_illum * corr_mag
+        问题: lit_up_map 独立完成提亮, s_illum 可旁路为 0
 
-    Additive s_illum correction (v5.5 new):
-        corr_mag = illum_corr(f_illum_feat)           # 64->3, zero-init
-        illum_residual = s_illum * corr_mag
-        res_t = clamp(brighten_base + illum_residual, 0, 1)
+    新 v5.7 (乘法门控):
+        lit_up_map_full = lit_up_map_raw * (1 + tanh(delta) * max_delta)   # "提亮什么" (空间模式)
+        lit_up_map = 1 + s_illum * (lit_up_map_full - 1)                   # "提亮多少" (强度门控)
+        res_t = clamp(img_dark * lit_up_map, 0, 1)
 
-    Gradient benefit:
-        d(res_t)/d(s_illum) = corr_mag  (no img_s2 decay, no 65x channel dilution)
+    关键性质:
+        - s_illum=0 → lit_up_map=1 → 无提亮 → 高重建损失 → 模型被迫让 s_illum>0
+        - s_illum=1 → lit_up_map=lit_up_map_full → 完全提亮
+        - d(res_t)/d(s_illum) = img_dark * (lit_up_map_full - 1)  (非零, 无衰减)
+        - lit_up_map_raw 提供"提亮什么"(内容感知), s_illum 提供"提亮多少"(诊断驱动)
     """
 
     def __init__(self, channels: int, img_channels: int = 3, max_delta: float = 0.5,
@@ -115,10 +118,7 @@ class BrightenStage(nn.Module):
             Block(img_channels),
             nn.Conv2d(img_channels, img_channels, 3, 1, 1),
         )
-        # v5.5: s_illum direct injection — zero-init so initial behavior = v4.3
-        self.illum_corr = nn.Conv2d(channels, img_channels, kernel_size=1, bias=True)
-        nn.init.zeros_(self.illum_corr.weight)
-        nn.init.zeros_(self.illum_corr.bias)
+        # v5.7: 移除 illum_corr (加法修正路径), 改用乘法门控
 
     def forward(self, lit_up_map_raw: torch.Tensor, f_illum_feat: torch.Tensor,
                 img_dark: torch.Tensor, s_illum: torch.Tensor = None):
@@ -126,33 +126,33 @@ class BrightenStage(nn.Module):
         img_cond = self.img_proj(img_dark)
         delta = self.delta_refine(torch.cat([feat_cond, img_cond], dim=1))
 
-        # Bounded delta: adjustment limited to +/- max_delta (default +/-50%)
-        lit_up_map = lit_up_map_raw * (1.0 + torch.tanh(delta) * self.max_delta)
-        lit_up_map = lit_up_map.clamp(min=0.5)
+        # lit_up_map_full: 内容感知的提亮模式 (1 ~ 5, bounded)
+        lit_up_map_full = lit_up_map_raw * (1.0 + torch.tanh(delta) * self.max_delta)
+        lit_up_map_full = lit_up_map_full.clamp(min=0.5)
 
-        # Multiplicative base (Retinex)
-        brighten_base = img_dark * lit_up_map
-
-        # v5.5: additive s_illum correction (zero-init -> initial res_t = brighten_base)
+        # v5.7: s_illum 门控 — 消除功能冗余
         if s_illum is not None:
-            corr_mag = self.illum_corr(f_illum_feat)
-            illum_residual = s_illum * corr_mag
-            res_t = torch.clamp(brighten_base + illum_residual, 0.0, 1.0)
+            # s_illum 控制"提亮多少": s_illum=0→无提亮, s_illum=1→完全提亮
+            lit_up_map = 1.0 + s_illum * (lit_up_map_full - 1.0)
         else:
-            res_t = torch.clamp(brighten_base, 0.0, 1.0)
+            lit_up_map = lit_up_map_full
 
+        res_t = torch.clamp(img_dark * lit_up_map, 0.0, 1.0)
         return res_t, lit_up_map
 
 
 class IGRF(nn.Module):
     """
-    IGRF v5.6 - Denoise -> Motion -> Brighten (sequential cascade)
+    IGRF v5.7 - Denoise -> Motion -> Brighten (sequential cascade)
 
-    Stage 1 (denoise):   img_s1 = soft_clamp(img_center + delta_noise(f_noise, img, s_noise))
-    Stage 2 (motion):    img_s2 = soft_clamp(img_s1 + delta_motion(f_motion, img_s1))
-    Stage 3 (brighten):  res_t = clamp(img_s2 * lit_up_map + s_illum * corr_mag, 0, 1)  (硬 clamp 最终输出)
+    Stage 1 (denoise):   img_s1 = clamp(img_center + delta_noise(f_noise, img, s_noise))
+                          s_noise 作为 additive correction 直接参与 delta
+    Stage 2 (motion):    img_s2 = clamp(img_s1 + delta_motion(f_motion, img_s1))
+    Stage 3 (brighten):  lit_up_map = 1 + s_illum * (lit_up_map_full - 1)   (v5.7 乘法门控)
+                          res_t = clamp(img_s2 * lit_up_map, 0, 1)
+                          s_illum 门控 lit_up_map: s_illum=0→无提亮, s_illum=1→完全提亮
                           (NO .detach(): L_recon gradient flows through to NDPN/MRPN/IFPN)
-    v5.6 P0-4: intermediate stages use soft clamp (gradient non-zero in dark/bright regions)
+    v5.7: 移除加法修正路径, 改用乘法门控, 消除 s_illum 功能冗余
     """
 
     def __init__(self, channels: int = 64, out_channels: int = 3, use_soft_clamp: bool = False,

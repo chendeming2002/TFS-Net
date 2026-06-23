@@ -9,10 +9,10 @@ class ConvBlock(nn.Module):
     """v5.6: Pre-LN Conv block — LayerNorm2d → Conv2d → GELU.
 
     Args:
-        use_norm: True 启用 Pre-LN（默认）；False 退回 v4.3 行为（向后兼容）。
+        use_norm: True 启用 Pre-LN；False 退回 v5.5 行为（默认 False，实证 LN 在浅 Conv 主干导致过拟合）。
     """
 
-    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, act=True, use_norm=True):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, act=True, use_norm=False):
         super().__init__()
         layers = []
         if use_norm:
@@ -27,23 +27,33 @@ class ConvBlock(nn.Module):
 
 
 class ResBlock(nn.Module):
-    """v5.6: Pre-LN ResBlock with LayerScale (beta zero-init → 初始恒等).
+    """v5.6: Pre-LN ResBlock with LayerScale.
 
-    LayerNorm2d → Conv1(3x3) → GELU → Conv2(3x3) → ×beta + skip
-    beta 初始化为 0 → 训练初始时残差块为恒等映射，深层堆叠稳定。
+    use_norm=True: LayerNorm2d → Conv1 → GELU → Conv2 → ×beta + skip (beta 零初始化)
+    use_norm=False: Conv1 → GELU → Conv2 + skip (v5.5 行为, 默认)
+
+    实证结论: LN 在 TFS-Net 浅 Conv 主干 (2-4 conv/模块) 上导致过拟合,
+    NAFNet 用 LN 有效是因为 30+ 层深度堆叠。默认关闭。
     """
 
-    def __init__(self, channels):
+    def __init__(self, channels, use_norm=False):
         super().__init__()
-        self.norm = LayerNorm2d(channels)
+        self.use_norm = use_norm
+        if use_norm:
+            self.norm = LayerNorm2d(channels)
         self.conv1 = nn.Conv2d(channels, channels, 3, 1, 1)
         self.act = nn.GELU()
         self.conv2 = nn.Conv2d(channels, channels, 3, 1, 1)
-        self.beta = nn.Parameter(torch.zeros(1, channels, 1, 1))
+        if use_norm:
+            self.beta = nn.Parameter(torch.zeros(1, channels, 1, 1))
 
     def forward(self, x):
-        residual = self.conv2(self.act(self.conv1(self.norm(x))))
-        return x + residual * self.beta
+        if self.use_norm:
+            residual = self.conv2(self.act(self.conv1(self.norm(x))))
+            return x + residual * self.beta
+        else:
+            residual = self.conv2(self.act(self.conv1(x)))
+            return x + residual
 
 
 class SimpleGate(nn.Module):

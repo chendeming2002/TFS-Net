@@ -1,0 +1,1049 @@
+                                                                                                                                                                                         1
+
+
+
+
+                                         DPMambaIR: All-in-One Image Restoration via Degradation-Aware
+                                                                                      Prompt State Space Model
+                                                            Zhanwen Liu, Sai Zhou, Yuchao Dai, Yang Wang† , Yisheng An, Xiangmo Zhao
+
+
+
+
+                                           Abstract—All-in-One image restoration aims to address mul-                                             Rain PSNR
+                                        tiple image degradation problems using a single model, offering                              Rain SSIM                Snow SSIM
+                                        a more practical and versatile solution compared to designing
+                                        dedicated models for each degradation type. Existing approaches                      Fog PSNR                                 Snow PSNR
+                                        typically rely on Degradation-specific models or coarse-grained
+arXiv:2504.17732v3 [cs.CV] 5 Feb 2026
+
+
+
+
+                                        degradation prompts to guide image restoration. However, they
+                                        lack fine-grained modeling of degradation information and face                  Fog SSIM                                          LOL SSIM
+                                        limitations in balancing multi-task conflicts. To overcome these
+                                        limitations, we propose DPMambaIR, a novel All-in-One image
+                                        restoration framework that introduces a fine-grained degradation              Jpeg PSNR                                            LOL PSNR
+                                        extractor and a Degradation-Aware Prompt State Space Model
+                                        (DP-SSM). The DP-SSM leverages the fine-grained degradation
+                                        features captured by the extractor as dynamic prompts, which                    Jpeg SSIM                                         Avg SSIM
+                                        are then incorporated into the state space modeling process.
+                                        This enhances the model’s adaptability to diverse degradation                                                                Avg PSNR
+                                                                                                                             Noise PSNR
+                                        types, while a complementary High-Frequency Enhancement                                                                            PromptIR
+                                        Block (HEB) recovers local high-frequency details. Extensive                                 Noise SSIM               Blur SSIM    IDR
+                                        experiments on a mixed dataset containing seven degradation                                               Blur PSNR                OneRestore
+                                                                                                                                                                           AdaIR
+                                        types show that DPMambaIR achieves the best performance,                                                                           Ours
+                                        with 27.69 dB and 0.893 in PSNR and SSIM, respectively. These
+                                        results highlight the potential and superiority of DPMambaIR as             Fig. 1. Comparison with SOTA All-in-One Image Restoration Methods on
+                                        a unified solution for All-in-One image restoration.                        mixed Dataset. Our DPMambaIR achieves consistently better performance.
+
+                                          Keywords—All-in-One, Image Restoration, State Space Model                 uncertainty-aware router. However, these methods suffer from
+                                                                                                                    high computational costs and lack explicit degradation model-
+                                                                                                                    ing, limiting adaptability to unseen degradations. Alternatively,
+                                                                 I. I NTRODUCTION                                   Prompt-based methods like OneRestore [9] guide restoration
+                                                                                                                    using degradation prompts, integrating scene descriptors via
+                                        I   MAGE restoration is a fundamental task in computer vi-
+                                            sion, aiming to recover high-quality images from degraded
+                                        inputs. Recent advances in deep learning have significantly im-
+                                                                                                                    cross-attention mechanisms.
+                                                                                                                       However, existing prompt-based strategies [9], [10] suffer
+                                        proved performance in degradation-specific restoration tasks,               from fundamental limitations in how degradation information
+                                        such as image denoising [1], [2], deblurring [3], deraining [4],            is represented and exploited. A key shortcoming lies in their
+                                        dehazing [5], [6], and low-light enhancement [7]. However,                  reliance on static priors, where degradations are encoded as
+                                        traditional methods typically rely on degradation-specific mod-             discrete class labels or fixed semantic tokens. Such categorical
+                                        els explicitly tailored to individual degradation types. These              representations are inherently inadequate for modeling the
+                                        approaches often require prior knowledge of the degradation                 continuous nature of real-world degradations and their spatial
+                                        type, which limits their practicality in real-world scenarios,              variability, for example, differentiating between light haze and
+                                        such as autonomous driving and nighttime surveillance, where                dense, spatially accumulating fog. Furthermore, most of these
+                                        diverse and unknown degradations frequently coexist.                        methods follow an additive fusion paradigm in which degrada-
+                                           To address this limitation, recent studies explore All-in-One            tion cues are treated merely as auxiliary information appended
+                                        image restoration frameworks that unify multiple restoration                to visual features. This mechanism is intrinsically limited,
+                                        tasks into a single model. Existing methods can be broadly                  as the underlying network architecture remains governed by
+                                        categorized into Mixture-of-Experts (MoE)-based and Prompt-                 fixed convolutional kernels or static attention patterns. Con-
+                                        based approaches. MoE-based methods, such as MoFME [8],                     sequently, the model is compelled to address heterogeneous
+                                        dynamically route tasks to specialized experts using an                     restoration demands, such as suppressing high-frequency noise
+                                                                                                                    while simultaneously enhancing global contrast, within a rigid
+                                          † Corresponding author.                                                   geometric structure. This conflict ultimately degrades perfor-
+                                          Zhanwen Liu, Sai Zhou, Yang Wang, Yisheng An and Xiangmo Zhao are
+                                        with the School of Information Engineering, Chang’an University, Shaanxi,   mance across diverse and complex degradation scenarios.
+                                        Xi’an 710000, China (e-mail: zwliu@chd.edu.cn; 2024124095@chd.edu.cn;          To address these challenges, we propose DPMambaIR, a
+                                        ywang120@chd.edu.cn, aysm@chd.edu.cn, xmzhao@chd.edu.cn).                   novel All-in-One framework that shifts the design philosophy
+                                          Yuchao Dai is with the School of Electronics and Information,
+                                        Northwestern Polytechnical University, Xi’an 710072, China (e-mail:         from conventional feature fusion to explicit dynamic param-
+                                        daiyuchao@gmail.com).                                                       eter modulation. Our approach is built upon a fine-grained
+                                                                                                                                     2
+
+
+
+degradation extractor and a Degradation-Aware Prompt State          corrupted inputs. While traditional approaches, such as Dark
+Space Model (DP-SSM). Unlike methods that rely on discrete          Channel Prior [11] and Color Line Prior [12], relied on
+degradation labels, the proposed extractor employs a recon-         handcrafted heuristics that often struggle in complex scenar-
+struction objective to regress continuous degradation embed-        ios, the advent of deep learning [13] has revolutionized the
+dings, enabling it to encode nuanced information regarding          field. Significant strides have been made in specific domains,
+both degradation type and severity. These embeddings are            including super-resolution [14]–[16], denoising [1], [2], de-
+utilized to directly modulate the core State Space Model            blurring [3], [17], [18], deraining [4], [19], dehazing [5], [20],
+parameters (∆, B, C). Modulating the discretization step ∆          desnowing [21], [22], and low-light enhancement [7]. Lever-
+effectively alters the integration step size of the underlying      aging CNN-based [23], Transformer-based [24], or diffusion-
+ordinary differential equation, allowing the model to realize       based [25] architectures, these methods excel at feature rep-
+distinct continuous dynamics conditioned on degradation char-       resentation. However, their reliance on degradation-specific
+acteristics. Specifically, the network learns to assign smaller ∆   designs fundamentally limits their utility in real-world envi-
+values to induce a high-inertia state favorable for smoothing       ronments where degradations are diverse, compounded, and
+high-frequency noise, whereas larger values are generated to        often unknown.
+enter a high-gain regime that amplifies weak signals in low-           Recent research has consequently pivoted towards All-in-
+light conditions. Concurrently, the input projection matrix B       One frameworks that emphasize flexibility and unified pro-
+is modulated to control how strongly external observations          cessing. These methods generally employ multi-task learn-
+drive the latent state transitions, while the output matrix C       ing strategies, such as Mixture-of-Experts (MoE) or prompt-
+is adjusted to inject global degradation priors. Furthermore,       guided adaptation. For instance, AirNet [26] utilizes con-
+we observe that jointly optimizing heterogeneous degradations       trastive learning to derive degradation representations, while
+often induces an implicit bias toward low-frequency structures,     MoFME [8] implements an uncertainty-aware router to dy-
+making the consistent recovery of fine details challenging.         namically dispatch features to specialized experts. Although
+To alleviate this issue, we incorporate a lightweight High-         effective, MoE architectures often incur high computational
+frequency Enhancement Block (HEB) that complements the              overhead and lack explicit physical modeling of the degrada-
+proposed dynamic modulation and facilitates the restoration         tion. In parallel, prompt-based methods such as PromptIR [10],
+of local textures.                                                  OneRestore [9], and DA-CLIP [27] integrate degradation cues,
+   Extensive experiments on a mixed dataset containing seven        ranging from learned visual prompts to text embeddings, via
+degradation types demonstrate the efficacy of DPMambaIR.            cross-attention mechanisms. IDR [28] further explores meta-
+As shown in Fig. 1, DPMambaIR achieves state-of-the-art             learning for decomposition, and AdaIR [29] adopts frequency
+performance in terms of PSNR and SSIM, outperforming                domain decoupling for adaptive restoration.
+existing All-in-One methods such as AdaIR and OneRestore.              Despite these advancements, fundamental limitations persist
+Moreover, DPMambaIR achieves competitive results across             in the representation and exploitation of degradation informa-
+individual tasks, including deraining, low-light enhancement,       tion. Most prompt-based strategies [9], [10] rely on coarse-
+deblurring, and dehazing, demonstrating its potential as an         grained priors or discrete class labels, which fail to capture
+effective and robust All-in-One image restoration solution.         the continuous nature and spatial variability inherent in real-
+   The contributions of this paper are summarized as follows:       world images. Furthermore, they typically adopt an additive
+   • We propose a degradation extractor capable of capturing        fusion paradigm where degradation cues are treated merely
+      fine-grained, continuous degradation features from com-       as auxiliary inputs. This mechanism is intrinsically limited
+      plex degraded images via a regression-based reconstruc-       because the underlying network parameters remain fixed,
+      tion objective.                                               governed by static weights or attention patterns that lack the
+   • We design a Degradation-aware Prompt State Space               flexibility to adapt to heterogeneous restoration demands. In
+      Model (DP-SSM) that introduces a dynamic parameter            contrast, our DPMambaIR framework employs a regression-
+      modulation mechanism. By dynamically modulating the           based extractor to derive fine-grained, continuous degradation
+      state-space evolution parameters based on degradation         embeddings. We depart from simple feature concatenation and
+      priors, it enhances the model’s physical adaptability to      utilize these embeddings to dynamically re-parameterize the
+      diverse degradation dynamics.                                 State Space Model. This shift from additive fusion to explicit
+   • Extensive experiments on a mixed dataset containing            dynamic parameter modulation allows the system to adapt its
+      seven types of degradation demonstrate that DPMambaIR         evolution dynamics to the specific physical properties of the
+      achieves state-of-the-art performance on PSNR and SSIM        degradation.
+      metrics, outperforming existing methods. The results val-
+      idate the effectiveness and robustness of the proposed
+                                                                    B. State Space Model based Image Restoration
+      approach.
+                                                                       Convolutional Neural Networks (CNNs) [13] and Trans-
+                     II. R ELATED W ORK                             formers [24] have long dominated image restoration. While
+                                                                    CNNs excel at capturing local high-frequency details, their
+A. All-in-One Image Restoration                                     limited receptive fields hinder the modeling of long-range
+  Image restoration remains a foundational challenge in com-        dependencies essential for correcting global degradations like
+puter vision, striving to reconstruct high-fidelity content from    haze or uneven lighting. Transformers address this with global
+                                                                                                                                                            3
+
+
+
+
+ Images with Unknown                                                                                             Restored( )          DPSS Module
+    Degradation( )
+
+                                     DPSS                                       DPSS
+                                                                                                                                      DConv
+                                     Block                                      Block
+
+                                                                                                                DPSS Block             DPSS
+                                     DPSS                                       DPSS                              LayerNorm
+                                                                                                                                       HEB
+     Degradation                     Block                                      Block
+      Extractor
+                                                                                                                    DPSS
+                                                                                                                    Module                       EFFN
+             1 512
+                                     DPSS                                       DPSS
+
+
+
+
+                                                                                                  Block
+                                                                                                  DPSS
+
+
+
+
+                                                                                                                                                  DConv
+                                     Block                                      Block                                                 DConv
+    Degradation                                                                                                   LayerNorm
+   Embedding( )
+                                                          DPSS                                                       EFFN
+                                                          Block
+         DownSampling
+
+        UpSampling                    DConv       Depth-wise Convolution          Channel-wise concatenation
+
+            Degradation-Aware                                                                                                  Efficient Feed
+   DPSS                                  Degradation Prompt        HEB       High-frequency Enhancement Block        EFFN      Forward Network
+            Prompt Selective Scan
+
+
+Fig. 2. The overall framework of DPMambaIR consists of a shallow feature extractor and multiple DPSS blocks, with an upsampler implemented by pixel
+shuffle and a downsampler by pixel unshuffle. Additionally, a degradation extractor is included to extract degradation embeddings, which are then inserted
+into the DPSS blocks.
+
+
+self-attention but suffer from quadratic computational com-                   pixels. While multi-directional scanning can alleviate this, it
+plexity relative to image resolution.                                         increases computation without always yielding proportional
+   To reconcile long-range modeling with efficiency, re-                      gains in low-level tasks [36]. Second, and more critically, Lack
+searchers have revisited the State Space Model (SSM) [30].                    of Degradation-Awareness: Existing SSM-based restoration
+SSMs map a 1D input sequence x(t) to an output y(t) via                       methods rely on fixed transition dynamics (A, B, C) or purely
+a latent state h(t) ∈ RN , governed by the linear ordinary                    input-driven modulation. They lack an explicit mechanism to
+differential equation (ODE):                                                  adapt the system’s evolution rules based on external degrada-
+                      h′ (t) = Ah(t) + Bx(t),                                 tion priors (e.g., adjusting the integration step ∆ for different
+                                                                       (1)    noise levels). Consequently, their ability to generalize across
+                        y(t) = Ch(t) + Dx(t).                                 the diverse degradation types encountered in All-in-One set-
+where A, B, C, D are learnable parameters. For digital imple-                 tings remains constrained.
+mentation, this continuous system is discretized with a step                     Motivated by these gaps, we propose the Degradation-aware
+size ∆, yielding the recurrence:                                              Prompt State Space Model (DP-SSM). Unlike prior works,
+                                                                              our method utilizes fine-grained degradation embeddings to
+                         hi = Ahi−1 + Bxi ,
+                                                                       (2)    dynamically modulate the discretization step ∆, along with
+                         yi = Chi + Dxi .                                     the state-space transition and output matrices. This design es-
+Here, the discretized matrices are defined as A = exp(∆A)                     tablishes a dynamics-aware mechanism that harmonizes global
+and B = (∆A)−1 (exp(∆A)−I)∆B. This formulation allows                         context modeling with degradation-specific physical guidance,
+for linear-complexity inference while maintaining a global                    significantly enhancing robustness in complex restoration sce-
+receptive field.                                                              narios.
+   The Vision Mamba [31] first adapted SSMs for computer
+                                                                                                      III. M ETHOD
+vision, demonstrating that the Vision State Space Module
+could outperform Vision Transformers [32] with significantly                  A. Problem Definition
+lower computational costs. This success has sparked adoption                     All-in-One Image Restoration aims to address a wide
+across tasks including object detection [33], segmentation [34],              range of image degradation types within a unified framework.
+and classification [35]. In image restoration, MambaIR [36]                   Specifically, given a degraded image I D ∈ R3×H×W , where
+pioneered the use of SSMs to achieve a balance between                        D denotes the degradation process, our goal is to restore the
+efficiency and perceptual quality, inspiring subsequent vari-                 clean image Ô ∈ R3×H×W using a unified model F . This
+ants [37]–[39].                                                               can be formulated as:
+   However, applying standard SSMs to All-in-One restora-
+                                                                                                            Ô = F (I D ).                                (3)
+tion faces two primary limitations. First, Limited Global
+Context Utilization: The causal nature of standard scanning                   where F is designed to generalize across various degradation
+means the i-th pixel only accesses information from preceding                 types, such as noise, blur, compression artifacts, and weather
+                                                                                                                                                                                                                                                             4
+
+
+
+
+                 (a)                                                (b)            Degradation Extractor                                                              Degradation Reconstructor
+                                                                                          3 3 RCDC                                5                                                    8
+
+
+
+
+                                                                                                                                                                      MLP MLP
+                                                                                           x1 x2 x3
+
+
+
+
+                                                                                                      ReLU
+                                                                                           x4 x5 x6          3 3 RCDC                                                             Fusion Block
+
+
+
+
+                                                                                                                                            Average Pooling
+
+
+
+
+                                                                                                                                                                                                      Concatenation
+                  LowLight
+
+
+
+
+                                                                                                                                                                                                                              Refine Block
+                                                                                           x7 x8 x9
+
+
+
+                        α(x)J(x)
+
+
+
+
+                                                                                                                                                                                                                      RConv
+                                      Real World                                                             5 5 RCDC                                                             Fusion Block
+                                                                                          5 5 RCDC
+
+
+
+
+                                                                                                                                                                      MLP
+                                     Medium
+                                              Motion
+
+                                                        Light
+                                                                                          7 7 RCDC           7 7 RCDC                                                             Fusion Block
+                         Blur                                   Target Degraded
+
+
+
+
+                                                                                                                                                                      MLP
+                                                                                                                                                                                                                                             Reconstructed
+                 J(x)           K                                                         7 7 RConv          7 7 RConv                                                            Fusion Block
+
+                           Haze
+  α(x)J(x) + β(x)γ(x)
+
+
+
+
+                                                                    (c)            Degradation Extractor                                                      Degradation Reconstructor
+                          Snow                ISP                                                              6                                              MLP
+
+                                                                                           3 3 CDC                                                                  Fusion Block                                       8
+
+
+
+
+                                                                                                                          Average Pooling
+
+
+
+
+                                                                                                                                                                                                                              Refine Block
+                           Rain
+
+
+
+
+                                                                                                                   ReLU
+                                                                                           5 5 CDC                                                                                     Block
+                           Noise          Transmit
+                                                                                           7 7 CDC
+                                                                Target Degraded                                                                                                                                                              Reconstructed
+                         Jpeg                                                              7 7 Conv                                                                             Origin Kernel     New Kernel
+
+
+                        Q(J(x))
+                                                                     Degradation        Content                                                                     Residual Central Difference
+                                    Degraded Images                  Embedding          Embedding
+                                                                                                              Subtraction                      RCDC                                                RConv                Residual Convolution Block
+                                                                                                                                                                    Convolution Block
+
+
+
+
+Fig. 3. (a) Real-World Image Degradation Modeling Process. (b) Architecture details of the Large version degradation extractor and reconstructor. (c)
+Architecture details of the normal version degradation extractor and reconstructor.
+
+
+
+effects, without explicit knowledge of Deg. The degradation                                                                  To address the challenges posed by unknown degradation
+process Deg can be mathematically represented as:                                                                         types and severities in All-in-One image restoration, we pro-
+                                                                                                                          pose a Degradation Extractor pre-trained via a self-supervised
+                                                       I D = Deg(O) + η.                                     (4)          reconstruction objective. This module encodes heterogeneous
+Here, O ∈ R                             3×H×W
+                          denotes the original clean image,                                                               degradation patterns into a compact embedding, effectively
+Deg represents the degradation operator (e.g., blur kernel,                                                               bridging the gap between blind and non-blind restoration by
+brightness, or quality compression), and η signifies additive                                                             providing explicit degradation representations. To fully exploit
+noise. The main challenge arises from the fact that Deg is                                                                these representations, we revisit the selective state-space mod-
+usually unknown and varies across tasks, making it difficult                                                              eling paradigm. Specifically, we propose a Degradation-Aware
+to design a universal model capable of effectively handling all                                                           Prompt State Space Model, which dynamically modulates the
+possible degradations.                                                                                                    restoration trajectory by injecting global degradation priors
+   Unlike degradation-specific restoration, the All-in-One set-                                                           into the state transition process.
+ting requires the model to generalize across a broad spectrum
+of degradation types without prior knowledge of degradation
+parameters. This introduces two main challenges: (a) how to                                                               C. Degradation Extractor
+represent fine-grained degradation information in a unified                                                                  To effectively extract degradation priors, we formulate a
+way; and (b) how to dynamically adapt the model behavior                                                                  generalized degradation model that encapsulates the physical
+based on such information during inference.                                                                               corruption process from image capture to transmission, as
+                                                                                                                          shown in Fig. 3 (a). This process typically involves four degra-
+B. DPMambaIR                                                                                                              dation categories: (1) illumination degradation, (2) motion-
+                                                                                                                          induced blur, (3) transmission medium artifacts, and (4) com-
+   We propose DPMambaIR, a degradation-aware framework                                                                    pression artifacts. We unify these factors into a composite
+for All-in-One image restoration. As illustrated in Fig. 2, our                                                           formation model:
+method is built upon a Mamba-based U-shaped architecture
+with an asymmetric encoder-decoder design. Initially, a 3 × 3
+                                                                                                                                                                              
+                                                                                                                                    I(x) = Q (α(x)J(x) + β(x)γ(x)) ⊗ K .               (5)
+convolution extracts shallow features F ∈ RH×W ×C from
+the degraded input. The encoder comprises three stages, each                                                              where J(x) denotes the latent clean image. The term α(x)
+utilizing downsampling to progressively halve the feature reso-                                                           models luminance variations, encompassing low-light condi-
+lution while doubling the channel dimension. Correspondingly,                                                             tions or uneven illumination caused by weather. γ(x) repre-
+the decoder employs upsampling and skip connections to fuse                                                               sents additive artifacts introduced by the transmission medium,
+multi-scale features from the encoding path. Finally, the clean                                                           such as rain streaks, snow, or haze aerosols, while β(x)
+image is reconstructed via a refinement stage, utilizing a global                                                         modulates the spatial intensity of these artifacts. K denotes the
+residual connection to superimpose the learned residual onto                                                              blur kernel resulting from relative motion, and Q represents
+the degraded input.                                                                                                       quantization or compression operations applied during storage.
+                                                                                                                                                   5
+
+
+
+
+             (a) DPSS                                                                                                        (b) HEB
+
+                                                  Forward Scan                                             Forward Scan
+
+
+
+
+                                  Reshape
+
+
+
+
+                                                                                              Pooling
+                                                                                                           High-freq Extra
+
+
+
+
+Fig. 4. The Architecture of (a) Degradation-aware Prompt Selective Scan (DPSS) and (b) High-frequency Enhancement Block (HEB), with Three Inputs F1 ,
+F2 , and Degradation Embedding E d .
+
+
+
+   Guided by this formulation, we design a degradation ex-                  D. Degradation-aware Prompt State Space Model
+tractor capable of capturing heterogeneous corruption patterns,                To address the limitations of SSM-based image restoration,
+as illustrated in Fig. 3(b). Specifically, we employ Central                specifically the insufficient use of global context and the
+Difference Convolution (CDC) [40]–[42] to identify gradient-                lack of effective degradation-aware mechanisms, we propose
+based degradation cues, such as edges and textures associ-                  a novel Degradation-aware Prompt State Space Model (DP-
+ated with blur and noise. A multi-scale module aggregates                   SSM) to effectively adapt SSM to All-in-One image restora-
+features from four parallel CDC branches with varying kernel                tion. Specifically, we propose a novel Degradation-aware
+sizes, enabling the perception of degradations across differ-               Prompt Selective Scan, which incorporates degradation infor-
+ent frequency bands. Additionally, we integrate a standard                  mation into the State Space Model. This is achieved by lever-
+convolution branch to capture global intensity and brightness               aging a Degradation Embedding extracted from a pre-trained
+distributions.                                                              Degradation Extractor to provide supplementary degradation-
+   To balance extraction accuracy with computational effi-                  related contextual information that the traditional SSM cannot
+ciency, we employ a re-parameterization technique during                    capture. In addition, we modulate the parameter matrices
+inference, merging the multi-branch structure into a compact                in the state-space equations to establish a degradation-aware
+representation, as shown in Fig. 3 (c). This yields two model               mechanism.
+variants: a larger capacity DPMambaIR-L utilizing the full                     This mechanism enables SSM to adapt to multi-task learn-
+multi-branch structure, and a lightweight DPMambaIR em-                     ing and handle task competition. To better recover local high-
+ploying the re-parameterized extractor (detailed in Table I).               frequency details, we design a lightweight High-frequency
+   To enable the learning of fine-grained degradation embed-                Enhancement Block (HEB). This component ensures the
+dings, we propose a reconstruction-based pre-training strategy.             preservation of high-frequency details and enhances the overall
+Unlike classification-based methods that rely on discrete la-               model performance.
+bels, this approach forces the extractor to learn a continuous              Degradation-aware Prompt Selective Scan. We revisit the
+manifold of degradation types and severities. Formally, the                 traditional SSM, whose parameter settings are shown in Eq.(2).
+extractor E maps a degraded input I D to a low-dimensional                  Matrices A, B, C, and D control the SSM output. The
+embedding E d :                                                             state transition matrix A compresses historical information,
+                         E d = E(I D ).                     (6)             while the input matrix B maps input signals to the state
+                                                                            space, determining their influence on historical states. The
+   To supervise this process, a reconstruction decoder R at-                output matrix C maps historical states to the observable space,
+tempts to recover the degraded image I D by combining E d                   reflecting their impact on the output. Matrix D provides a
+with a content embedding E c derived from the corresponding                 direct pathway from input to output, similar to a residual
+clean ground truth O:                                                       connection. In traditional SSM, these matrices and ∆ are
+                                                                            derived from:
+           E c = Restormer(O), IˆD = R(E c , E d ).                  (7)
+                                                                                A = init(), D = init(),
+This disentanglement ensures that E d captures pure degra-                                                                                       (8)
+                                                                                B = Linear(x), C = Linear(x), ∆ = Linear(x).
+dation information necessary to reconstruct the corruption,
+independent of the image content. The optimization mini-                    where init() is an initialization method that does not depend
+mizes a hybrid objective combining L1 loss and the Learned                  on the input x. However, this input-dependent design is
+Perceptual Image Patch Similarity (LPIPS) metric, defined as                agnostic to the degradation type. It processes high-frequency
+L = ∥I D − IˆD ∥1 + λLLPIPS , to ensure perceptually faithful               noise and low-frequency blur with the same initialization prior,
+reconstruction of the degradation patterns.                                 lacking the ability to structurally adapt the system dynamics
+                                                                                                                                                 6
+
+
+
+for specific restoration tasks. This motivates the introduction
+of a degradation-aware prompt mechanism, which guides the
+state-space modeling by incorporating specific degradation
+cues.
+   To integrate degradation awareness into the SSM, we first
+utilize a degradation extractor E to extract the degradation
+embedding E d from the input image ID . This embedding
+is then employed to modulate ∆, the input matrix B, and
+the output matrix C, thereby enhancing the model’s ability
+to compress historical information, process input signals, and
+capture global context, as illustrated in Fig. 4 (a). The specific
+formulation is given as follows:
+   E d = E(ID ),
+   α∆ = M∆ (E d ), αB = MB (E d ), αC = MC (E d ),            (9)
+  ∆dp = α∆ · ∆, Bdp = αB · B, Cdp = αC · C.                          Fig. 5. Distribution of the learned parameter ∆dp across different degradation
+                                                                     types in the first 20% of DPSS layers. The model adaptively assigns smaller
+Here, M∆ , MB , and MC are combinations of linear layers             step sizes for noise/jpeg and larger step sizes for blur/low-light, confirming
+used to map the degradation embedding E d into feature               physically interpretable dynamic modulation.
+spaces, forming modulation vectors α∆ , αB , and αC for ∆,
+B, and C, respectively. ∆dp , Bdp , and Cdp are the newly                                     Clear VS Degradation-specific
+modulated SSM parameters.                                                                     Clear VS AIO without HEB
+                                                                                              Clear VS AIO with HEB
+  Finally, the formulation of the Degradation-aware State
+Space Model can be expressed as follows:
+                                                                          Abs-difference
+      Adp = exp(∆dp A),
+     B dp = (∆dp A)−1 (exp(∆dp A) − I) · ∆dp Bdp ,
+                                                             (10)
+        hi = Adpi hi−1 + B dpi xi ,
+        yi = Cdp hi + Dxi .
+    The proposed modulation mechanism fundamentally alters                                 Low Frequency                      High Frequency
+the underlying system dynamics, effectively recalibrating the
+trade-off between memory inertia and input sensitivity. Central      Fig. 6. We compare frequency-domain differences between clear and restored
+to this adaptation is the step size ∆dp , whose learned distri-      images under three configurations. The All-in-One setting shows a notable
+bution shown in Fig. 5 reveals a distinct physical correspon-        high-frequency gap compared to the Degradation-specific setting, which is
+                                                                     significantly reduced by adding the High-frequency Enhancement Block
+dence to the degradation characteristics. For high-frequency         (HEB), as shown by the blue line.
+degradations such as noise and JPEG artifacts, the model
+autonomously converges to a minimal ∆dp regime. As ∆dp
+approaches zero, the discretized transition matrix Adp approx-       causal nature, where the i-th pixel can only access information
+imates the identity matrix while the input gain B dp diminishes.     from the preceding i − 1 pixels, resulting in a restricted global
+This configuration transforms the SSM into a stable low-pass         receptive field. Although existing methods attempt to alleviate
+filter, creating a high-inertia state that effectively suppresses    this via parallel multi-directional scanning, such approaches
+instantaneous pixel variance by prioritizing historical context      incur high computational costs and yield limited performance
+over the unreliable current observation. In contrast, inputs         gains in low-level vision tasks [36]. By retaining the efficient
+characterized by low-frequency or structural deficiencies, such      single-directional scanning and instead modulating matrix C
+as blur and low-light conditions, trigger a marked increase          to inject global degradation information, our method achieves
+in the learned ∆dp . This shift transitions the system into          effective global degradation awareness with significantly lower
+a high-gain regime, amplifying the magnitude of B dp to              computational overhead.
+enhance sensitivity towards weak input signals and facilitate        High-frequency Enhancement Block. All-in-One image
+the recovery of attenuated local structures. Complementing           restoration necessitates the recovery of image components
+this dynamic discretization, the concurrent modulation of B          distributed across diverse frequency bands. While our pro-
+acts as a gating mechanism for input observations, while the         posed Degradation-aware Prompt State Space Model enables
+modulation of C supplements the feature readout with global          dynamic adaptation to degradation characteristics and partially
+degradation cues.                                                    mitigates inter-task conflicts, the joint optimization of het-
+    Through this strategy, the transformation matrix A and input     erogeneous degradations inevitably induces an implicit bias
+matrix B are endowed with degradation-aware capabilities,            toward low-frequency structures. As illustrated in Fig. 6, this
+allowing them to adaptively regulate memory inertia and              spectral bias results in suboptimal performance regarding high-
+input sensitivity according to the specific degradation severity.    frequency details, such as edges and textures, compared to
+However, the standard SSM remains constrained by its strictly        degradation-specific models. To address this limitation, we
+                                                                                                                                                                                                  7
+
+
+
+                                                                 TABLE I
+ Q UANTITATIVE C OMPARISON ON S EVEN DATASETS FOR A LL - IN -O NE I MAGE R ESTORATION . T HE BEST AND SECOND - BEST RESULTS ARE SHOWN IN
+                             BOLD AND UNDERLINE , RESPECTIVELY. (F ORMAT: PSNR ↑ / SSIM ↑ / LPIPS ↓).
+
+
+ Method               Lowlight                Snow                  Rain                  Haze                  Jpeg                  Noise                 Blur                Average
+
+ MPRNet           19.71 / .659 / .122   30.94 / .938 / .029   26.27 / .912 / .068   25.63 / .947 / .023   30.51 / .938 / .024   28.03 / .897 / .057   26.07 / .869 / .077   26.74 / .880 / .057
+ MIRNet           19.81 / .668 / .123   31.04 / .941 / .028   25.77 / .907 / .073   22.26 / .882 / .058   30.54 / .939 / .024   28.14 / .900 / .057   26.32 / .873 / .070   26.27 / .873 / .062
+ NAFNet           19.49 / .650 / .117   30.33 / .935 / .030   26.04 / .906 / .068   25.63 / .946 / .023   30.20 / .936 / .025   27.80 / .895 / .051   26.13 / .870 / .075   26.52 / .877 / .056
+ Restormer        19.99 / .670 / .113   31.67 / .944 / .025   26.91 / .919 / .061   26.18 / .953 / .020   30.56 / .939 / .024   28.17 / .890 / .056   26.62 / .880 / .063   27.16 / .886 / .052
+ MambaIR          19.81 / .664 / .115   30.43 / .935 / .032   25.52 / .901 / .078   25.90 / .944 / .024   30.38 / .937 / .025   27.91 / .895 / .058   26.07 / .869 / .077   26.57 / .878 / .058
+ PromptIR         19.90 / .669 / .116   31.52 / .943 / .024   26.80 / .918 / .061   26.13 / .945 / .022   30.57 / .939 / .024   28.18 / .901 / .054   26.36 / .874 / .072   27.07 / .884 / .053
+ IDR              19.68 / .663 / .115   31.16 / .941 / .027   26.39 / .914 / .065   26.11 / .948 / .023   30.51 / .939 / .024   28.10 / .899 / .054   26.29 / .873 / .073   26.89 / .883 / .054
+ NDR-Restore      19.79 / .635 / .206   30.00 / .902 / .052   26.00 / .813 / .158   27.00 / .943 / .025   30.19 / .872 / .056   27.78 / .786 / .133   25.77 / .791 / .193   26.64 / .820 / .117
+ OneRestore       19.77 / .657 / .127   29.95 / .931 / .034   25.37 / .900 / .080   27.74 / .962 / .016   30.10 / .934 / .026   27.65 / .890 / .060   25.90 / .866 / .082   26.64 / .877 / .061
+ MoCEIR           19.92 / .674 / .109   31.22 / .943 / .025   26.56 / .920 / .051   28.06 / .963 / .014   30.51 / .939 / .023   28.13 / .900 / .053   26.34 / .874 / .069   27.25 / .888 / .049
+ AdaIR            19.99 / .672 / .102   31.94 / .923 / .023   27.01 / .922 / .056   26.61 / .952 / .019   30.53 / .939 / .024   28.19 / .900 / .055   26.61 / .879 / .065   27.26 / .887 / .049
+
+ DPMambaIR   20.04 / .680 / .109 32.36 / .949 / .022 27.07 / .926 / .055 28.13 / .963 / .016 30.57 / .939 / .024 28.25 / .902 / .051 27.43 / .894 / .048 27.69 / .893 / .047
+ DPMambaIR-L 20.06 / .677 / .108 32.31 / .950 / .022 27.11 / .925 / .056 28.39 / .963 / .016 30.55 / .939 / .024 28.21 / .902 / .051 27.45 / .895 / .045 27.73 / .893 / .046
+
+
+
+                                                                                                                     IV. E XPERIMENT AND A NALYSIS
+                                                                                                 We evaluate our method on both All-in-one image restoration
+                                                                                                 tasks and Degradation-specific image restoration tasks. In
+        Snow               JPEG                Low-light                Noise                    the All-in-One Image Restoration setting, we train a single
+                                                                                                 model on a dataset containing seven types of degradation. For
+                                                                                                 Degradation-specific image restoration, we train separately on
+                                                                                                 datasets corresponding to each type of degradation.
+
+            Fog                     Rain                            Blur                         A. Experimental Settings
+                                                                                                 Training Details. To ensure effective degradation-aware mod-
+Fig. 7. Examples of Seven Types of Image Degradations in the Dataset.                            eling, we adopt a two-stage training strategy. In the first
+                                                                                                 stage, we pre-train the Degradation Extractor using the same
+                                                                                                 mixed-degradation dataset employed for the All-in-One task.
+introduce a lightweight High-Frequency Enhancement Block                                         The training pipeline consists of the Degradation Extractor, a
+(HEB) as a complementary module to explicitly facilitate the                                     Content Extractor, and a Degradation Reconstructor. Specifi-
+restoration of local textures.                                                                   cally, we utilize the pre-trained Restormer from DegAE [45] as
+   For input features F , we first extract channel-wise low-                                     the Content Extractor with its parameters frozen, while opti-
+frequency features using global average pooling, then subtract                                   mizing only the Degradation Extractor and Reconstructor. This
+them from F to obtain high-frequency components, as illus-                                       pre-training phase is conducted for 100,000 iterations with a
+trated in Fig. 4(b). Finally, the high-frequency features are                                    batch size of 1, using input patches cropped to 256 × 256. We
+added back to enhance F , formulated as:                                                         employ the AdamW [46] optimizer (β1 = 0.9, β2 = 0.999,
+                                                                                                 weight decay 1e−4 ) with an initial learning rate of 1e−4 , which
+                                              
+              Fenhanced = F + α · F − G(F ) .            (11)
+                                                                                                 is gradually reduced to 1e−6 through cosine annealing.
+Here, α represents a learnable scalar that controls the con-                                        In the second stage, the pre-trained Degradation Extractor
+tribution of high-frequency enhancement, and G denotes the                                       is integrated into the DPMambaIR framework with its param-
+global average pooling operation. Fenhanced is the enhanced                                      eters frozen to provide stable guidance. Building on previous
+feature map.                                                                                     works [10], [36], [43], we train the main restoration network
+                                                                                                 using the same AdamW configuration for 300,000 iterations.
+E. Loss Function                                                                                 The initial learning rate is set to 3e−4 and decayed to 1e−6
+   We employ the commonly used L1 loss L1 and L2 loss                                            via cosine annealing. Following [43], we employ a progressive
+L2 in low-level vision tasks. Additionally, following previous                                   training strategy, cropping image patches of size 192 × 192.
+works [43], [44], we incorporate a frequency-domain loss Lf f t                                  Horizontal and vertical flips are applied for data augmentation.
+for training. The total loss is defined as:                                                      Our experiments are conducted on a single NVIDIA RTX
+                                                                                                 A100 GPU and implemented using the PyTorch platform.
+ Ltotal = λ1 ·L1 (O, Ô)+λ2 ·L2 (O, Ô)+λ3 ·Lf f t (O, Ô). (12)
+                                                                                                 Datasets. For All-in-One image restoration, we collect a large-
+where Ô and O denote the model output and the ground truth,                                     scale mixed dataset covering seven common degradation types:
+respectively. The parameters λ1 , λ2 , and λ3 are balancing                                      haze, rain, snow, low-light, blur, noise, and JPEG compression,
+factors, which we set to 1, 0.5 and 0.001, respectively.                                         as shown in Fig. 7. Detailed information regarding these
+                                                                                                                                                            8
+
+
+
+                                                                   TABLE II
+Q UANTITATIVE C OMPARISON ON D ERAINING , L OW- LIGHT I MAGE E NHANCEMENT (LLIE), D EBLURRING AND D EHAZING FOR D EGRADATION -S PECIFIC
+     I MAGE R ESTORATION TASK WITH S TATE - OF - THE -A RT M ETHODS . T HE B EST AND S ECOND -B EST R ESULTS A RE IN B OLD AND U NDERLINE .
+
+  Deraining        PSNR    SSIM         LLIE              PSNR      SSIM         Deblurring         PSNR      SSIM         Dehazing        PSNR     SSIM
+  JORDER           26.25   0.835        EnlightenGAN        17.61   0.653        DeepDeBlur         29.08     0.913        GCANet          26.59    0.935
+  PReNet           29.46   0.899        MIRNet              24.14   0.830        DeBlurGAN          28.70     0.858        GridDehazeNet   25.86    0.944
+  MPRNet           30.41   0.891        URetinex-Net        19.84   0.824        DeBlurGANV2        29.55     0.934        DeHazeFormer    30.29    0.964
+  MAXIM            30.81   0.903        MAXIM               23.43   0.863        MT-RNN             31.15     0.945        MAXIM           29.12    0.932
+  Restormer        31.46   0.904        IAT                 23.38   0.809        IR-SDE             30.70     0.901        DA-CLIP         30.16    0.936
+  OneRestore       29.36   0.944        OneRestore          22.97   0.835        OneRestore         28.76     0.915        OneRestore      30.16    0.974
+  MoCEIR           31.23   0.960        MoCEIR              23.64   0.818        MoCEIR             30.05     0.933        MoCEIR          30.62    0.975
+  AdaIR            31.46   0.961        AdaIR               23.47   0.831        AdaIR              30.57     0.939        AdaIR           30.87    0.975
+  DPMambaIR        32.30   0.967        DPMambaIR           24.20   0.852        DPMambaIR          31.42     0.948        DPMambaIR       30.89    0.977
+
+
+
+
+                                                                       Blur               PromptIR                      AdaIR              GT
+
+
+
+
+                              Blur                                  Restormer                 IDR                     OneRestore           Ours
+
+
+
+
+          Rain             PromptIR              AdaIR                 GT                Haze               PromptIR         AdaIR           GT
+
+
+
+
+       Restormer              IDR              OneRestore             Ours             Restormer              IDR          OneRestore        Ours
+
+Fig. 8. Qualitative comparison on Deblurring, Deraining and Dehazing for All-in-One Image Restoration Task.
+
+
+
+datasets is summarized in Table III. Additionally, degradation-                 the Learned Perceptual Image Patch Similarity (LPIPS) to
+specific evaluations are conducted using LOL [47] for low-                      assess the perceptual consistency of the restored images.
+light enhancement, GoPro [48] for deblurring, Rain100H [49]                     Comparisons with State-of-the-art Methods. For All-in-
+for deraining, and RESIDE6K [50] for dehazing.                                  One image restoration, we compare against eleven methods:
+                                                                                MIRNet [56], NAFNet [57], MPRNet [58], Restormer [43],
+                                                                                MambaIR [36], PromptIR [10], IDR [28], NDR-Restore [59],
+                              TABLE III
+               DATASETS FOR I MAGE R ESTORATION TASKS                           OneRestore [9], MoCEIR [60], and AdaIR [29]. The first four
+                                                                                are general-purpose restoration models, while the latter four
+   Degradation     Dataset                  Train Pairs       Test Pairs
+   Haze            RESIDE6K [50]               6000             1000
+                                                                                are designed specifically for All-in-One restoration: Promp-
+   Rain            Rain13K [51]               13711                -            tIR uses visual prompts, OneRestore employs a pre-trained
+                   Rain100H [49]                 -               100            degradation encoder with cross-attention, and AdaIR leverages
+   Snow            Snow100K [52]               5000             1000
+   Low Light       LOL [47], LSRW [53]         6085               65
+                                                                                frequency-domain information for adaptive restoration. For
+   Blur            GoPro [48]                  2103             1111            degradation-specific restoration, we also include representa-
+   Noise           WaterlooED [54]             4744                -            tive single-task methods such as JORDER [61] (deraining),
+                   BSD400 [55]                   -               400
+   JPEG            WaterlooED [54]             4744                -
+                                                                                MAXIM [62] (deblurring), EnlightenGAN [63] (low-light
+                   BSD400 [55]                   -               400            enhancement), DeepDeblur [64], AdaIR [29], DA-CLIP [27],
+                                                                                among others.
+Evaluation Metrics. Following previous works [36], [43], we
+employ Peak Signal-to-Noise Ratio (PSNR) and Structural                         B. Quantitative Results
+Similarity Index Measure (SSIM) to quantitatively evaluate                      All-in-one Image Restoration. We evaluated two versions of
+restoration quality on RGB channels. Additionally, we utilize                   our method for comparison: the normal version (DPMambaIR)
+                                                                                                                                      9
+
+
+
+and a large version (DPMambaIR-L). The normal version                                          TABLE IV
+adopts the degradation extractor illustrated in Fig. 3(c), while       C OMPARISON OF COMPLEXITY AND EFFICIENCY AGAINST SOTA
+                                                                       METHODS . M ETRICS : PARAMETERS (M), P EAK M EMORY (MB),
+the large version uses the architecture shown in Fig. 3(b).             GFLOP S , AND I NFERENCE T IME ( MS ) ON 256 × 256 INPUTS .
+For subsequent evaluations, we primarily adopt the normal
+version unless otherwise specified. We compare our method                            Params     Mem.      FLOPs    Inf Time   PSNR
+                                                                      Method
+against eleven state-of-the-art image restoration approaches.                         (M)       (MB)       (G)       (ms)      (dB)
+As shown in Table I, for the All-in-One image restoration task,       Restormer       26.13     676.24    154.88    84.283    27.16
+our method achieves the best PSNR and SSIM on the afore-              IDR             36.28    1433.24    270.76    81.977    26.89
+                                                                      PromptIR        35.59     720.10    172.71    90.964    27.07
+mentioned mixed datasets, outperforming existing methods.             MoCEIR          25.35     404.48     97.74    93.232    27.25
+Specifically, our method achieves a PSNR of 27.69 dB and              AdaIR           28.78     686.40    161.76   102.903    27.26
+an SSIM of 0.893, surpassing AdaIR by 0.43 dB and 0.011,              DPMambaIR       29.35     718.76    153.33    90.869    27.69
+respectively. Additionally, DPMambaIR-L achieves a PSNR of
+27.73 dB and an SSIM of 0.893, slightly outperforming the
+normal version.                                                    parison against state-of-the-art All-in-One methods. We mea-
+   We achieve the best performance across all seven sub-tasks.     sured the number of parameters, peak memory consumption,
+Experimental results indicate that multi-task learning often en-   GFLOPs, and average inference time. All evaluations were
+counters challenges in balancing performance across different      performed on a single NVIDIA RTX A100 GPU with an input
+tasks. For instance, AdaIR demonstrates strong performance         tensor size of 1×3×256×256. The statistics for DPMambaIR
+in deraining but performs poorly in dehazing. On the other         include the overhead of the Degradation Extractor.
+hand, OneRestore excels in dehazing but delivers suboptimal           As summarized in Table IV, DPMambaIR achieves the
+results in tasks such as deraining and deblurring. In contrast,    best performance while maintaining comparable computa-
+our method effectively tackles the balance issue in multi-task     tional overhead. Compared to the second-best method, AdaIR,
+learning, achieving consistently optimal performance across        our model delivers a significant performance gain of 0.43 dB
+all sub-tasks. These findings highlight the effectiveness and      with similar parameters and GFLOPs.
+superiority of our proposed method.
+Degradation-Specific Image Restoration. We evaluate our            E. Ablation Study
+method on four Degradation-specific tasks, consistently               We conduct ablation studies to evaluate our key designs: the
+achieving superior performance across multiple datasets            degradation-aware prompts and High-frequency Enhancement
+compared to state-of-the-art CNN-based, transformer-based,         Block (HEB) (Table V), degradation extraction and utilization
+and diffusion-based approaches, as shown in Table II. On           methods (Table VI), degradation embedding dimension (Ta-
+Rain100H [49], our method achieves a PSNR of 32.30 dB              ble VII) and the global information supplementation strategy
+and SSIM of 0.967, surpassing AdaIR by 0.84 dB and 0.006,          (Table VIII).
+respectively. On the LOL dataset [47], it achieves 24.20 dB           Table V demonstrates the effectiveness of our proposed core
+PSNR and 0.852 SSIM, outperforming MIRNet by 0.06 dB               modules. First, the High-frequency Enhancement Block (HEB)
+and 0.022. For deblurring on GoPro [48], it attains 31.42 dB       alone improves the baseline by 0.29 dB (Model (a)), validating
+PSNR and 0.948 SSIM, exceeding MT-RNN by 0.27 dB and               its efficacy in enhancing local details. Second, to verify the
+0.003. On RESIDE6K [50], it achieves 30.89 dB PSNR and             importance of the degradation-aware mechanism, we conduct
+0.973 SSIM, outperforming AdaIR by 0.02 dB and 0.002.              a detailed breakdown of the prompt components. Notably,
+These results highlight the versatility and effectiveness of our   employing P∆ alone (Model (c)) achieves 27.58 dB, which
+method in addressing diverse degradation restoration tasks.        slightly outperforms the combination of PB and PC (Model
+                                                                   (b), 27.56 dB). This observation underscores that dynamically
+C. Qualitative Results                                             modulating the discretization step ∆, which fundamentally
+                                                                   alters the state transition dynamics, is the most critical factor
+   Fig. 8 presents the visual results of deblurring, deraining,
+                                                                   for adapting to diverse degradation types. Furthermore, com-
+and dehazing under the All-in-One Image Restoration task
+                                                                   bining P∆ with PB or PC yields consistent improvements, and
+setting. Our method demonstrates superior visual performance
+                                                                   integrating all prompt modules (Model (f)) pushes the PSNR
+compared to other approaches. Specifically, in deblurring, our
+                                                                   to 27.67 dB. Finally, the full model (Model (g)) demonstrates
+method restores sharper edge details; in deraining, it more
+                                                                   the synergy between prompt-based modulation and frequency
+effectively removes rain streaks while recovering background
+                                                                   enhancement, achieving the best performance of 27.69 dB.
+information; and in dehazing, it focuses on regions often
+                                                                      Table VI presents the results for degradation extraction and
+overlooked by other methods, resulting in more comprehensive
+                                                                   utilization methods. For degradation extraction, we compare
+dehazing performance. Additional visual comparisons under
+                                                                   three approaches: (1) “Classes”, which provides manually
+both the All-in-One and Degradation-specific settings are
+                                                                   specified degradation types and can be regarded as a 100%
+provided in the Appendix.
+                                                                   accurate non-blind setting; (2) a pre-trained degradation clas-
+                                                                   sifier from OneRestore [9]; and (3) our fine-grained degra-
+D. Model Complexity and Efficiency Analysis                        dation representation via image reconstruction. The OneRe-
+ To accurately evaluate the practical applicability of DP-         store extractor, optimized for classification, is insensitive to
+MambaIR, we conducted a comprehensive efficiency com-              degradation strength or location, leading to poorer results. Our
+                                                                                                                                                   10
+
+
+
+                                                                                                 TABLE VI
+                                                                       A BLATION S TUDY ON D IFFERENT D EGRADATION E XTRACTION AND
+                                                                                          U TILIZATION M ETHODS .
+
+                                                                         Module                       Method                PSNR         SSIM
+                                                                                                      Classes                  27.58     0.892
+                                                                         Degradation Extraction       OneRestore*              27.56     0.891
+                                                                                                      Ours                     27.69     0.893
+                                                         blur
+                                                         fog                                          Concat                   26.96     0.882
+                                                         jpeg            Degradation Insertion        Attention                27.39     0.882
+                                                         lowlight                                     Modulation (Ours)        27.69     0.893
+                                                         noise
+                                                         rain                                         Fine-tuning              27.43     0.888
+                                                                         Training Strategy
+                                                         snow                                         Frozen (Ours)            27.69     0.893
+
+
+                                                                                                    TABLE VII
+Fig. 9. t-SNE visualization of degradation embeddings.
+                                                                       A BLATION STUDY ON THE DIMENSION OF DEGRADATION EMBEDDING
+                                                                        (Demb ). W E EVALUATE MODEL COMPLEXITY (PARAMS , GFLOP S ),
+                                                                      AUXILIARY TASK PERFORMANCE (R EC . PSNR, C LS . ACC .), AND FINAL
+                           TABLE V
+ E XTENDED ABLATION STUDIES ON THE PROPOSED CORE MODULES . W E           A LL - IN -O NE RESTORATION QUALITY (AIO PSNR). T HE DEFAULT
+                                                                                              CONFIGURATION IS GRAY.
+INVESTIGATE THE INDIVIDUAL AND COMBINED CONTRIBUTIONS OF THE
+   PROMPT COMPONENTS (P∆ , PB , PC ) AND THE H IGH - FREQUENCY
+                  E NHANCEMENT B LOCK (HEB).                                    Params       FLOPs      Rec. PSNR     Cls. Acc.        AIO. PSNR
+                                                                       Demb
+                                                                                 (M)          (G)          (dB)          (%)              (dB)
+        Method      P∆     PB     PC     HEB     PSNR     SSIM         256        28.71      153.33       21.51         72.0             27.55
+                                                                       384        29.03      153.33       24.53         84.3             27.63
+        Baseline                                 26.96    0.884        512        29.35      153.33       25.67         92.0             27.69
+        (a)                                      27.25    0.887        1024       30.62      153.33       25.78         92.6             27.69
+        (b)                                      27.56    0.891
+        (c)                                      27.58    0.892
+        (d)                                      27.60    0.892
+        (e)                                      27.61    0.892      Degradation Reconstruction PSNR (Rec. PSNR), calculated
+        (f)                                      27.67    0.893      between the reconstructed degraded image and the target
+        (g)                                      27.69    0.893      degraded input, which measures information integrity; and
+                                                                     (2) Classification Accuracy (Cls. Acc.), which assesses the
+                                                                     semantic separability of the degradation types. For the classi-
+method surpasses the non-blind ”Classes” baseline by 0.11            fication metric, we appended a simple MLP head to the frozen
+dB PSNR. Fig. 9 visualizes the t-SNE embeddings of the               degradation extractor and trained it for only 1,000 iterations
+extracted degradation features. Significant gaps exist between       to map the embeddings to the seven degradation classes. As
+different degradation types, indicating clear separability. No-      observed in Table VII, increasing Demb from 256 to 512
+tably, although JPEG and noise share the same content during         yields substantial gains: Rec. PSNR improves from 21.51 dB
+synthesis, the t-SNE visualization reveals that their separability   to 25.67 dB, and Cls. Acc. surges from 72.0% to 92.0%.
+is primarily driven by degradation information rather than           This indicates that higher-dimensional embeddings effectively
+image content.                                                       encode both the pixel-level details and the semantic categories
+   For degradation utilization, we compare concatenation and         of degradations. These improvements directly translate to the
+attention-based fusion with our prompt modulation design. Our        final restoration task, boosting AIO. PSNR to 27.69 dB.
+prompt-based modulation outperforms simple concatenation             However, expanding to 1024 yields marginal returns despite
+or attention-based fusion, showing better adaptability to local      higher costs. Thus, 512 is selected as the optimal balance.
+degradations.                                                           Table VIII presents the ablation study on global information
+                                                                     supplementation. We compare our Prompt-C with Mamba’s
+   For the training strategy, compared with jointly fine-tuning
+                                                                     bi-directional scanning scheme. Compared to Mamba’s bi-
+the degradation extractor together with the backbone network,
+                                                                     directional scan, our Prompt-C not only achieves slightly better
+freezing the parameters of the degradation extractor provides
+                                                                     performance but is also more efficient, reducing GFLOPs by
+a more stable supply of degradation information. This design
+                                                                     nearly 37%. This highlights its effectiveness as a lightweight
+choice leads to more consistent guidance during restoration
+                                                                     global information supplementation method.
+and results in a clear performance gain of 0.26 dB in PSNR,
+demonstrating the advantage of decoupling degradation repre-
+sentation learning from the restoration optimization process.        F. Generalization Capability and Failure Boundary Analysis
+   Table VII presents the ablation study on the Degradation             To investigate the robustness of DPMambaIR beyond the
+Embedding dimension (Demb ). Given that the Degradation              training distribution, we conducted Out-of-Distribution (OOD)
+Extractor serves as the sole source of degradation priors, the       evaluations on two unseen degradation types: Raindrop and
+completeness and distinctiveness of the extracted information        Pixelation. Importantly, these evaluations were performed by
+are paramount. To quantitatively evaluate the quality of the         directly applying the pre-trained model to the test images
+learned embeddings, we introduce two direct indicators: (1)          without any additional training or fine-tuning. This rigorous
+                                                                                                                                                                        11
+
+
+
+                             TABLE VIII                                                         TABLE IX
+A BLATION S TUDY ON D IFFERENT M ETHODS FOR G LOBAL I NFORMATION    Q UANTITATIVE COMPARISON ON UNSEEN DEGRADATION TYPES (OOD
+                         S UPPLEMENTATION .                        T ESTING ). T HE BEST AND SECOND - BEST RESULTS ARE HIGHLIGHTED IN
+                                                                                           BOLD AND UNDERLINE .
+
+   Method              PSNR    SSIM    Params (M)   GFLOPs
+                                                                                                       Pixelation                          Raindrop
+   Bi-direction Scan   27.66   0.893     31.43        244.3               Method
+                                                                                                  (PSNR / SSIM / LPIPS)               (PSNR / SSIM / LPIPS)
+   Prompt-C (Ours)     27.69   0.893     29.35        153.3
+                                                                          MambaIR                 20.80     /   0.7601   /   0.0568   19.29   /   0.7992   /   0.1051
+                                                                          PromptIR                19.69     /   0.7479   /   0.0582   19.26   /   0.7775   /   0.1146
+                                                                          IDR                     20.64     /   0.7567   /   0.0494   17.40   /   0.7609   /   0.1276
+setting serves to delineate the generalization boundaries of our
+                                                                          OneRestore              19.75     /   0.7415   /   0.0628   19.75   /   0.7792   /   0.1100
+Degradation-Aware Prompt mechanism.                                       AdaIR                   21.39     /   0.7676   /   0.0512   19.07   /   0.7722   /   0.1225
+   Robustness on Unseen Degradations. We evaluated the                    MoCEIR                  19.89     /   0.7355   /   0.0544   21.46   /   0.8254   /   0.0919
+model on the Raindrop dataset [65] (58 images) and a
+                                                                          DPMambaIR               23.35 / 0.8003 / 0.0551             21.63 / 0.8337 / 0.0932
+synthetically generated Pixelated BSD68 dataset [66] (block
+size 2). As summarized in Table IX, DPMambaIR exhibits
+superior generalization, securing top-tier performance across
+all metrics. Specifically, on the Pixelation task, it achieves a
+PSNR of 23.35 dB, surpassing the second-best AdaIR by a
+
+
+
+
+                                                                    (a. Success)
+significant margin of 1.96 dB. We attribute this robustness                        Pixelation + low light
+to our regression-based embedding strategy. Unlike static
+prompt approaches that risk model collapse on undefined                             Pixelation                       AdaIR                           Ours
+inputs, DPMambaIR projects unseen degradations into a con-
+tinuous latent space. This mechanism enables the model to
+approximate unknown corruption patterns within a learned
+manifold, preventing inference failure and yielding visually                       Light RainDrop
+plausible results. A notable phenomenon is further observed
+                                                                                     RainDrop                       MoCEIR                           Ours
+in a specific low-light sample from the BSD68 dataset. When
+processing the pixelated version of this image, DPMambaIR
+                                                                    (b. Failure)
+
+
+
+
+automatically performs brightness enhancement alongside de-
+pixelation, capturing and correcting the underlying low-light
+degradation. In contrast, competing methods fail to address
+                                                                                   Heavy RainDrop
+this compound issue. This capability underscores the potential
+of DPMambaIR in handling mixed degradations, suggesting                              RainDrop                       MoCEIR                           Ours
+that future work can further explore real-world restoration via
+more complex, fine-grained coupled degradation modeling.           Fig. 10. Visual analysis of generalization and failure boundaries. (a) Success
+   Failure Boundary Analysis. Despite these promising re-          Cases: The top row demonstrates restoration on unseen Pixelation, where
+sults, DPMambaIR is not without limitations. We observed           DPMambaIR concurrently removes artifacts and enhances inherent low-light
+                                                                   details. The middle row shows effective removal of Light Raindrop. (b)
+a distinct performance bottleneck when processing images           Failure Case: The bottom row illustrates the boundary on Heavy Raindrop,
+with heavy raindrops. As visually analyzed in Fig. 10, while       where the model fails to hallucinate the background behind opaque occlusions.
+the model effectively removes light raindrops, it struggles
+with large, opaque water droplets that completely occlude
+the background. We attribute this to the physical nature of        awareness. Furthermore, a lightweight High-frequency En-
+the degradation: removing heavy, opaque occlusions requires        hancement Block (HEB) is introduced to complement the main
+generative hallucination (inpainting) to synthesize missing        framework by enhancing high-frequency detail restoration
+content, whereas DPMambaIR operates on restoration cues.           with negligible computational overhead. This study under-
+Future work could explore incorporating generative priors,         scores the importance of fine-grained degradation modeling
+such as Diffusion Models, to address such severe occlusions.       and dynamic feature modulation in advancing All-in-One
+                                                                   image restoration frameworks. Extensive experiments on a
+                                                                   mixed dataset containing seven degradation types show that
+                       V. C ONCLUSION                              DPMambaIR achieves the best performance, establishing it as
+                                                                   a promising approach for unified image restoration.
+   We propose DPMambaIR, a novel All-in-One framework
+for image restoration capable of handling diverse degradation
+types. The core of our framework is a Degradation-Aware                                                         R EFERENCES
+Prompt State Space Model (DP-SSM) that leverages a fine-            [1] T. Zhang, R. Wang, Y. Niu, Z. Li, and T. Zhao, “Hugs-net: A lightweight
+grained degradation extractor. This design enables the dy-              and unified network for adverse weather image denoising,” IEEE Trans-
+namic integration of degradation features into the state-space          actions on Multimedia, pp. 1–10, 2025.
+                                                                    [2] C. Kim, T. H. Kim, and S. Baik, “Lan: Learning to adapt noise for image
+modeling process, allowing for adaptive handling of complex             denoising,” in Proceedings of the IEEE/CVF Conference on Computer
+degradation scenarios while maintaining global degradation              Vision and Pattern Recognition, 2024, pp. 25 193–25 202.
+                                                                                                                                                                12
+
+
+
+ [3] K. Zhuang, Q. Li, Y. Yuan, and Q. Wang, “Multi-domain adaptation                    conference on computer vision and pattern recognition, 2022, pp.
+     for motion deblurring,” IEEE Transactions on Multimedia, vol. 26, pp.               17 452–17 462.
+     3676–3688, 2024.                                                             [27]   Z. Luo, F. K. Gustafsson, Z. Zhao, J. Sjölund, and T. B. Schön,
+ [4] Y.-T. Peng, W.-H. Li, and Z. Chen, “Rain2avoid: Learning deraining by               “Controlling vision-language models for universal image restoration,”
+     self-supervision,” IEEE Transactions on Multimedia, vol. 27, pp. 4765–              arXiv preprint arXiv:2310.01018, 2023.
+     4779, 2025.                                                                  [28]   J. Zhang, J. Huang, M. Yao, Z. Yang, H. Yu, M. Zhou, and F. Zhao,
+ [5] Y. Su, N. Wang, Z. Cui, Y. Cai, C. He, and A. Li, “Real scene single                “Ingredient-oriented multi-degradation learning for image restoration,”
+     image dehazing network with multi-prior guidance and domain transfer,”              in Proceedings of the IEEE/CVF conference on computer vision and
+     IEEE Transactions on Multimedia, vol. 27, pp. 5492–5506, 2025.                      pattern recognition, 2023, pp. 5825–5835.
+ [6] Z. Wang, H. Zhao, J. Peng, L. Yao, and K. Zhao, “Odcr: Orthogonal            [29]   Y. Cui, S. W. Zamir, S. Khan, A. Knoll, M. Shah, and F. S. Khan,
+     decoupling contrastive regularization for unpaired image dehazing,” in              “AdaIR: Adaptive all-in-one image restoration via frequency mining and
+     Proceedings of the IEEE/CVF Conference on Computer Vision and                       modulation,” in The Thirteenth International Conference on Learning
+     Pattern Recognition, 2024, pp. 25 479–25 489.                                       Representations, 2025.
+ [7] I. Morawski, K. He, S. Dangi, and W. H. Hsu, “Leveraging content and         [30]   R. E. Kalman, “A new approach to linear filtering and prediction
+     context cues for low-light image enhancement,” IEEE Transactions on                 problems,” 1960.
+     Multimedia, vol. 27, pp. 5337–5351, 2025.                                    [31]   L. Zhu, B. Liao, Q. Zhang, X. Wang, W. Liu, and X. Wang, “Vision
+ [8] R. Zhang, Y. Luo, J. Liu, H. Yang, Z. Dong, D. Gudovskiy, T. Okuno,                 mamba: Efficient visual representation learning with bidirectional state
+     Y. Nakata, K. Keutzer, Y. Du et al., “Efficient deweahter mixture-                  space model,” arXiv preprint arXiv:2401.09417, 2024.
+     of-experts with uncertainty-aware feature-wise linear modulation,” in        [32]   A. Dosovitskiy, L. Beyer, A. Kolesnikov, D. Weissenborn, X. Zhai,
+     Proceedings of the AAAI Conference on Artificial Intelligence, vol. 38,             T. Unterthiner, M. Dehghani, M. Minderer, G. Heigold, S. Gelly et al.,
+     no. 15, 2024, pp. 16 812–16 820.                                                    “An image is worth 16x16 words: Transformers for image recognition
+ [9] Y. Guo, Y. Gao, Y. Lu, H. Zhu, R. W. Liu, and S. He, “Onerestore: A                 at scale,” arXiv preprint arXiv:2010.11929, 2020.
+     universal restoration framework for composite degradation,” in European      [33]   N. Yang, Y. Wang, Z. Liu, M. Li, Y. An, and X. Zhao, “Smamba:
+     Conference on Computer Vision. Springer, 2024, pp. 255–272.                         Sparse mamba for event-based object detection,” arXiv preprint
+[10] V. Potlapalli, S. W. Zamir, S. H. Khan, and F. Shahbaz Khan, “Promptir:             arXiv:2501.11971, 2025.
+     Prompting for all-in-one image restoration,” Advances in Neural Infor-       [34]   C. Xiao, M. Li, Z. Zhang, D. Meng, and L. Zhang, “Spatial-mamba:
+     mation Processing Systems, vol. 36, pp. 71 275–71 293, 2023.                        Effective visual state space models via structure-aware state fusion,”
+[11] K. He, J. Sun, and X. Tang, “Single image haze removal using dark                   arXiv preprint arXiv:2410.15091, 2024.
+     channel prior,” IEEE transactions on pattern analysis and machine
+                                                                                  [35]   J. Sheng, J. Zhou, J. Wang, P. Ye, and J. Fan, “Dualmamba: A
+     intelligence, vol. 33, no. 12, pp. 2341–2353, 2010.
+                                                                                         lightweight spectral-spatial mamba-convolution network for hyperspec-
+[12] R. Fattal, “Dehazing using color-lines,” ACM transactions on graphics               tral image classification,” IEEE Transactions on Geoscience and Remote
+     (TOG), vol. 34, no. 1, pp. 1–14, 2014.                                              Sensing, 2024.
+[13] Y. LeCun, Y. Bengio, and G. Hinton, “Deep learning,” nature, vol. 521,
+                                                                                  [36]   H. Guo, J. Li, T. Dai, Z. Ouyang, X. Ren, and S.-T. Xia, “Mambair:
+     no. 7553, pp. 436–444, 2015.
+                                                                                         A simple baseline for image restoration with state-space model,” in
+[14] S. Liu, D. Suzhang, M. Yang, X. Zheng, and C. Zhu, “Depth map super-                European conference on computer vision. Springer, 2024, pp. 222–
+     resolution via deep cross-modality and cross-scale guidance,” IEEE                  241.
+     Transactions on Multimedia, pp. 1–14, 2025.
+                                                                                  [37]   H. Guo, Y. Guo, Y. Zha, Y. Zhang, W. Li, T. Dai, S.-T. Xia, and
+[15] L. Peng, W. Li, R. Pei, J. Ren, J. Xu, Y. Wang, Y. Cao, and Z.-J. Zha,
+                                                                                         Y. Li, “Mambairv2: Attentive state space restoration,” arXiv preprint
+     “Towards realistic data generation for real-world super-resolution,” arXiv
+                                                                                         arXiv:2411.15269, 2024.
+     preprint arXiv:2406.07255, 2024.
+                                                                                  [38]   L. Peng, X. Di, Z. Feng, W. Li, R. Pei, Y. Wang, X. Fu, Y. Cao,
+[16] L. Peng, A. Wu, W. Li, P. Xia, X. Dai, X. Zhang, X. Di, H. Sun, R. Pei,
+                                                                                         and Z.-J. Zha, “Directing mamba to complex textures: An efficient
+     Y. Wang et al., “Pixel to gaussian: Ultra-fast continuous super-resolution
+                                                                                         texture-aware state space model for image restoration,” arXiv preprint
+     with 2d gaussian modeling,” arXiv preprint arXiv:2503.06617, 2025.
+                                                                                         arXiv:2501.16583, 2025.
+[17] K. Zhang, W. Luo, Y. Zhong, L. Ma, W. Liu, and H. Li, “Adversarial
+     spatio-temporal learning for video deblurring,” IEEE Transactions on         [39]   X. Di, L. Peng, P. Xia, W. Li, R. Pei, Y. Cao, Y. Wang, and Z.-J.
+     Image Processing, vol. 28, no. 1, pp. 291–301, 2018.                                Zha, “Qmambabsr: Burst image super-resolution with query state space
+                                                                                         model,” arXiv preprint arXiv:2408.08665, 2024.
+[18] K. Zhang, T. Wang, W. Luo, W. Ren, B. Stenger, W. Liu, H. Li, and M.-
+     H. Yang, “Mc-blur: A comprehensive benchmark for image deblurring,”          [40]   Y. Wang, L. Peng, L. Li, Y. Cao, and Z.-J. Zha, “Decoupling-and-
+     IEEE Transactions on Circuits and Systems for Video Technology,                     aggregating for image exposure correction,” in Proceedings of the
+     vol. 34, no. 5, pp. 3755–3767, 2023.                                                IEEE/CVF conference on computer vision and pattern recognition, 2023,
+[19] K. Zhang, D. Li, W. Luo, W. Ren, and W. Liu, “Enhanced spatio-                      pp. 18 115–18 124.
+     temporal interaction learning for video deraining: faster and better,”       [41]   L. Peng, Y. Cao, R. Pei, W. Li, J. Guo, X. Fu, Y. Wang, and Z.-J.
+     IEEE Transactions on Pattern Analysis and Machine Intelligence,                     Zha, “Efficient real-world image super-resolution via adaptive directional
+     vol. 45, no. 1, pp. 1287–1293, 2022.                                                gradient convolution,” arXiv preprint arXiv:2405.07023, 2024.
+[20] Z. Jin, Y. Qiu, K. Zhang, H. Li, and W. Luo, “Mb-taylorformer v2:            [42]   L. Peng, Y. Cao, Y. Sun, and Y. Wang, “Lightweight adaptive feature
+     improved multi-branch linear transformer expanded by taylor formula                 de-drifting for compressed image classification,” IEEE Transactions on
+     for image restoration,” IEEE Transactions on Pattern Analysis and                   Multimedia, vol. 26, pp. 6424–6436, 2024.
+     Machine Intelligence, 2025.                                                  [43]   S. W. Zamir, A. Arora, S. Khan, M. Hayat, F. S. Khan, and M.-H. Yang,
+[21] X. Guo, X. Wang, X. Fu, and Z.-J. Zha, “Deep unfolding network for                  “Restormer: Efficient transformer for high-resolution image restoration,”
+     image desnowing with snow shape prior,” IEEE Transactions on Circuits               in Proceedings of the IEEE/CVF conference on computer vision and
+     and Systems for Video Technology, 2025.                                             pattern recognition, 2022, pp. 5728–5739.
+[22] K. Zhang, R. Li, Y. Yu, W. Luo, and C. Li, “Deep dense multi-scale           [44]   Y. Cui, W. Ren, X. Cao, and A. Knoll, “Focal network for image
+     network for snow removal using semantic and depth priors,” IEEE                     restoration,” in Proceedings of the IEEE/CVF international conference
+     Transactions on Image Processing, vol. 30, pp. 7419–7431, 2021.                     on computer vision, 2023, pp. 13 001–13 011.
+[23] Y. LeCun, B. Boser, J. Denker, D. Henderson, R. Howard, W. Hubbard,          [45]   Y. Liu, J. He, J. Gu, X. Kong, Y. Qiao, and C. Dong, “Degae: A
+     and L. Jackel, “Handwritten digit recognition with a back-propagation               new pretraining paradigm for low-level vision,” in Proceedings of the
+     network,” Advances in neural information processing systems, vol. 2,                IEEE/CVF Conference on Computer Vision and Pattern Recognition,
+     1989.                                                                               2023, pp. 23 292–23 303.
+[24] A. Vaswani, N. Shazeer, N. Parmar, J. Uszkoreit, L. Jones, A. N. Gomez,      [46]   D. P. Kingma and J. Ba, “Adam: A method for stochastic optimization,”
+     Ł. Kaiser, and I. Polosukhin, “Attention is all you need,” Advances in              arXiv preprint arXiv:1412.6980, 2014.
+     neural information processing systems, vol. 30, 2017.                        [47]   C. Wei, W. Wang, W. Yang, and J. Liu, “Deep retinex decomposition
+[25] J. Ho, A. Jain, and P. Abbeel, “Denoising diffusion probabilistic models,”          for low-light enhancement,” arXiv preprint arXiv:1808.04560, 2018.
+     Advances in neural information processing systems, vol. 33, pp. 6840–        [48]   S. Nah, T. Hyun Kim, and K. Mu Lee, “Deep multi-scale convolutional
+     6851, 2020.                                                                         neural network for dynamic scene deblurring,” in Proceedings of the
+[26] B. Li, X. Liu, P. Hu, Z. Wu, J. Lv, and X. Peng, “All-in-one image                  IEEE conference on computer vision and pattern recognition, 2017, pp.
+     restoration for unknown corruption,” in Proceedings of the IEEE/CVF                 3883–3891.
+                                                                                 13
+
+
+
+[49] W. Yang, R. T. Tan, J. Feng, J. Liu, Z. Guo, and S. Yan, “Deep joint
+     rain detection and removal from a single image,” in Proceedings of the
+     IEEE conference on computer vision and pattern recognition, 2017, pp.
+     1357–1366.
+[50] X. Qin, Z. Wang, Y. Bai, X. Xie, and H. Jia, “Ffa-net: Feature fusion
+     attention network for single image dehazing,” in Proceedings of the
+     AAAI conference on artificial intelligence, vol. 34, no. 07, 2020, pp.
+     11 908–11 915.
+[51] K. Jiang, Z. Wang, P. Yi, C. Chen, B. Huang, Y. Luo, J. Ma, and J. Jiang,
+     “Multi-scale progressive fusion network for single image deraining,”
+     in Proceedings of the IEEE/CVF conference on computer vision and
+     pattern recognition, 2020, pp. 8346–8355.
+[52] Y.-F. Liu, D.-W. Jaw, S.-C. Huang, and J.-N. Hwang, “Desnownet:
+     Context-aware deep network for snow removal,” IEEE Transactions on
+     Image Processing, vol. 27, no. 6, pp. 3064–3073, 2018.
+[53] J. Hai, Z. Xuan, R. Yang, Y. Hao, F. Zou, F. Lin, and S. Han, “R2rnet:
+     Low-light image enhancement via real-low to real-normal network,”
+     Journal of Visual Communication and Image Representation, vol. 90,
+     p. 103712, 2023.
+[54] K. Ma, Z. Duanmu, Q. Wu, Z. Wang, H. Yong, H. Li, and L. Zhang,
+     “Waterloo exploration database: New challenges for image quality
+     assessment models,” IEEE Transactions on Image Processing, vol. 26,
+     no. 2, pp. 1004–1016, 2016.
+[55] P. Arbelaez, M. Maire, C. Fowlkes, and J. Malik, “Contour detection and
+     hierarchical image segmentation,” IEEE transactions on pattern analysis
+     and machine intelligence, vol. 33, no. 5, pp. 898–916, 2010.
+[56] S. W. Zamir, A. Arora, S. Khan, M. Hayat, F. S. Khan, M.-H. Yang,
+     and L. Shao, “Learning enriched features for real image restoration
+     and enhancement,” in Computer Vision–ECCV 2020: 16th European
+     Conference, Glasgow, UK, August 23–28, 2020, Proceedings, Part XXV
+     16. Springer, 2020, pp. 492–511.
+[57] L. Chen, X. Chu, X. Zhang, and J. Sun, “Simple baselines for image
+     restoration,” arXiv preprint arXiv:2204.04676, 2022.
+[58] S. W. Zamir, A. Arora, S. Khan, M. Hayat, F. S. Khan, M.-H. Yang, and
+     L. Shao, “Multi-stage progressive image restoration,” in CVPR, 2021.
+[59] M. Yao, R. Xu, Y. Guan, J. Huang, and Z. Xiong, “Neural degradation
+     representation learning for all-in-one image restoration,” IEEE Transac-
+     tions on Image Processing, 2024.
+[60] E. Zamfir, Z. Wu, N. Mehta, Y. Tan, D. P. Paudel, Y. Zhang, and
+     R. Timofte, “Complexity experts are task-discriminative learners for any
+     image restoration,” 2024.
+[61] W. Yang, R. T. Tan, J. Feng, Z. Guo, S. Yan, and J. Liu, “Joint
+     rain detection and removal from a single image with contextualized
+     deep networks,” IEEE transactions on pattern analysis and machine
+     intelligence, vol. 42, no. 6, pp. 1377–1393, 2019.
+[62] Z. Tu, H. Talebi, H. Zhang, F. Yang, P. Milanfar, A. Bovik, and Y. Li,
+     “Maxim: Multi-axis mlp for image processing,” CVPR, 2022.
+[63] Y. Jiang, X. Gong, D. Liu, Y. Cheng, C. Fang, X. Shen, J. Yang,
+     P. Zhou, and Z. Wang, “Enlightengan: Deep light enhancement without
+     paired supervision,” IEEE Transactions on Image Processing, vol. 30,
+     pp. 2340–2349, 2021.
+[64] S. Nah, T. H. Kim, and K. M. Lee, “Deep multi-scale convolutional
+     neural network for dynamic scene deblurring,” in The IEEE Conference
+     on Computer Vision and Pattern Recognition (CVPR), July 2017.
+[65] R. Qian, R. T. Tan, W. Yang, J. Su, and J. Liu, “Attentive generative
+     adversarial network for raindrop removal from a single image,” in
+     Proceedings of the IEEE conference on computer vision and pattern
+     recognition, 2018, pp. 2482–2491.
+[66] D. Martin, C. Fowlkes, D. Tal, and J. Malik, “A database of human
+     segmented natural images and its application to evaluating segmentation
+     algorithms and measuring ecological statistics,” in Proceedings eighth
+     IEEE international conference on computer vision. ICCV 2001, vol. 2.
+     IEEE, 2001, pp. 416–423.
+

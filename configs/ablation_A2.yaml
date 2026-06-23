@@ -1,0 +1,50 @@
+seed: 42
+output_dir: outputs/sdsd_ablation_A2
+dataset:
+  train_input_root: /home/a1005/yzy/dataset/SDSD/indoor/input
+  train_target_root: /home/a1005/yzy/dataset/SDSD/indoor/GT
+  val_input_root: /home/a1005/yzy/dataset/SDSD/test/low-light
+  val_target_root: /home/a1005/yzy/dataset/SDSD/test/GT
+  window_size: 5
+  crop_size: 224
+  num_workers: 8
+model:
+  type: TFSNet
+  in_channels: 3
+  level_channels: [32, 64, 96]
+  fused_channels: 64
+  # 只保留 P0-1(LN,代码内置) + P1-6(IH,代码内置)，关闭所有其他架构改动
+  use_soft_clamp: false
+  sace_offset_use_norm: false
+  sace_offset_kaiming_init: false
+  use_soft_median: false
+  use_nafblock: false
+train:
+  batch_size: 3
+  epochs: 30
+  lr: 0.001
+  weight_decay: 0.0001
+  amp: false
+  log_interval: 50
+  val_interval: 5
+  warmup_epochs: 10
+  grad_clip: 0.5
+loss:
+  type: TFSNetLoss
+  use_freq_loss: true
+  perceptual_pretrained: true
+  lambda_perc: 0.2
+  lambda_freq: 0.1
+  lambda_illum: 0.01
+  lambda_ssim: 0.1
+  lambda_inter: 0.3
+  fused_channels: 64
+  # 关闭所有损失改进
+  lambda_illum_sup: 0.0
+  lambda_noise_sup: 0.0
+  perc_multilayer: false
+  freq_with_phase: false
+eval:
+  tile_size: 224
+  tile_overlap: 32
+  amp: false

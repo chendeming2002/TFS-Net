@@ -2,9 +2,12 @@
 <project version="4">
   <component name="VcsDirectoryMappings">
     <mapping directory="$PROJECT_DIR$" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/Experience/SDSD-Trid/CED" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/reference_repos/BasicSR" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/reference_repos/Condformer" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/reference_repos/DAT" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/reference_repos/FRBNet" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/reference_repos/MINS-Net" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/reference_repos/NAFNet" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/reference_repos/Retinexformer" vcs="Git" />
   </component>
