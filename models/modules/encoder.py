@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .blocks import ConvBlock, ResBlock
+from .blocks import ConvBlock, ResBlock, LayerNorm2d
 
 
 class EncoderStage(nn.Module):
@@ -61,6 +61,10 @@ class PyramidEncoder(nn.Module):
         self.lateral3 = nn.Conv2d(c3, fused_channels, 1, 1, 0)
         self.lateral2 = nn.Conv2d(c2, fused_channels, 1, 1, 0)
         self.lateral1 = nn.Conv2d(c1, fused_channels, 1, 1, 0)
+        # v5.9.1: fuse 前加 LayerNorm2d 控制值域
+        # 根因: lateral 累加导致 p1 值域 ±1800 → fuse conv 输出 ±12000 → GELU(全负)=0 → 特征死亡
+        # LayerNorm2d 把 p1 归一化到均值 0 方差 1 → fuse conv 正常工作 → GELU 不饱和
+        self.fuse_norm = LayerNorm2d(fused_channels)
         self.fuse = nn.Sequential(
             ConvBlock(fused_channels, fused_channels, 3, 1, 1, act=True),
             ConvBlock(fused_channels, fused_channels, 3, 1, 1, act=True),
@@ -98,7 +102,9 @@ class PyramidEncoder(nn.Module):
 
         p2 = self.lateral2(l2) + F.interpolate(p3, size=l2.shape[-2:], mode="bilinear", align_corners=False)
         p1 = self.lateral1(l1) + F.interpolate(p2, size=l1.shape[-2:], mode="bilinear", align_corners=False)
-        fused = self.fuse(p1)     # (B, C_f, H, W)
+        # v5.9.1: fuse 前归一化, 防止 lateral 累加值域爆炸导致 GELU 饱和
+        p1_normed = self.fuse_norm(p1)
+        fused = self.fuse(p1_normed)     # (B, C_f, H, W)
 
         if return_coarse:
             coarse = l4 if self.has_stage4 else l3
