@@ -26,6 +26,7 @@ from models.modules.ifpn import IFPN
 from models.modules.ndpn import NDPN
 from models.modules.mrpn import MRPN
 from models.modules.igrf import IGRF
+from models.modules.amp_enhance import AmpEnhance
 
 
 class TFSNet(nn.Module):
@@ -55,6 +56,9 @@ class TFSNet(nn.Module):
         sace_offset_kaiming_init: bool = True,
         use_soft_median: bool = True,
         use_nafblock: bool = False,
+        num_bottleneck_blocks: int = 0,
+        num_igrf_res_blocks: int = 2,
+        use_amp_enhance: bool = False,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -63,11 +67,19 @@ class TFSNet(nn.Module):
         # v5.5: 默认 3 级编码器, coarse_channels=96
         coarse_channels = level_channels[-1]  # 最粗层通道数
 
+        # v5.9: AmpEnhance — 图像级频域幅度增强 (Encoder 前处理)
+        self.use_amp_enhance = use_amp_enhance
+        if use_amp_enhance:
+            self.amp_enhance = AmpEnhance(in_channels=in_channels, hidden=16, min_amps=0.1)
+        else:
+            self.amp_enhance = None
+
         # Stage 0: PyramidEncoder
         self.encoder = PyramidEncoder(
             in_channels=in_channels,
             level_channels=level_channels,
             fused_channels=fused_channels,
+            num_bottleneck_blocks=num_bottleneck_blocks,
         )
 
         # Stage 1: TFSI (M1: TFSI 频域分支始终相位保留)
@@ -104,7 +116,8 @@ class TFSNet(nn.Module):
 
         # Stage 4: IGRF
         self.igrf = IGRF(channels=fused_channels, out_channels=in_channels,
-                         use_soft_clamp=use_soft_clamp, use_nafblock=use_nafblock)
+                         use_soft_clamp=use_soft_clamp, use_nafblock=use_nafblock,
+                         num_res_blocks=num_igrf_res_blocks)
 
         # 逐帧特征缓存 (推理时滑动窗口复用)
         self.frame_cache: Dict[int, Dict[str, torch.Tensor]] = {}
@@ -127,6 +140,24 @@ class TFSNet(nn.Module):
         """
         B, T, C_in, H, W = x.shape
         center_idx = T // 2
+
+        # v5.9: AmpEnhance — 图像级频域幅度增强 (Encoder 前处理)
+        # 全帧共用 center frame 的 curve_amps，保证 SACE 对齐一致性
+        if self.amp_enhance is not None:
+            # 对 center frame 估计 curve_amps
+            img_center = x[:, center_idx]  # (B, 3, H, W)
+            with torch.no_grad():
+                curve_amps = self.amp_enhance.amp_net(img_center).clamp(min=0.1, max=1.0)
+            # 对每帧用同一 curve_amps 做幅度增强
+            x_enhanced = torch.empty_like(x)
+            for i in range(T):
+                y_i = x[:, i]  # (B, 3, H, W)
+                F_i = torch.fft.fft2(y_i, dim=(-2, -1), norm='ortho')
+                mag_i = torch.abs(F_i) / curve_amps
+                pha_i = torch.angle(F_i)
+                F_new = torch.polar(mag_i, pha_i)
+                x_enhanced[:, i] = torch.fft.ifft2(F_new, dim=(-2, -1), norm='ortho').real
+            x = x_enhanced
 
         # Stage 0: 编码（支持逐帧缓存）
         feats_list: List[torch.Tensor] = []

@@ -52,15 +52,17 @@ class StageBlock(nn.Module):
     """
 
     def __init__(self, channels: int, img_channels: int = 3, use_intensity: bool = False,
-                 use_soft_clamp: bool = False, use_nafblock: bool = False):
+                 use_soft_clamp: bool = False, use_nafblock: bool = False,
+                 num_res_blocks: int = 2):
         super().__init__()
         self.use_intensity = use_intensity
         self.use_soft_clamp = use_soft_clamp
         self.img_proj = nn.Conv2d(img_channels, channels, 3, 1, 1)
+        Block = NAFBlock if use_nafblock else ResBlock
         self.fuse = nn.Sequential(
             nn.Conv2d(channels * 2, channels, 1, 1, 0),
             nn.GELU(),
-            _make_res_blocks(channels, 2, use_nafblock),
+            *[Block(channels) for _ in range(num_res_blocks)],
             nn.Conv2d(channels, img_channels, 3, 1, 1),
         )
         if use_intensity:
@@ -87,22 +89,19 @@ class StageBlock(nn.Module):
 
 class BrightenStage(nn.Module):
     """
-    v5.7: s_illum 门控提亮 — 消除功能冗余, 解决 s_illum 塌缩。
+    Hybrid brightening stage (v5.5, restored from v5.7 gating experiment).
 
-    旧 v5.5 (加法修正, 已废弃):
-        res_t = img_dark * lit_up_map + s_illum * corr_mag
-        问题: lit_up_map 独立完成提亮, s_illum 可旁路为 0
+    v5.7 gating (lit_up_map = 1 + s_illum * (lit_up_map_full - 1)) solved s_illum collapse
+    but reduced PSNR by 0.6 dB (constrains per-channel freedom). Reverted to v5.5 additive.
 
-    新 v5.7 (乘法门控):
-        lit_up_map_full = lit_up_map_raw * (1 + tanh(delta) * max_delta)   # "提亮什么" (空间模式)
-        lit_up_map = 1 + s_illum * (lit_up_map_full - 1)                   # "提亮多少" (强度门控)
-        res_t = clamp(img_dark * lit_up_map, 0, 1)
+    Multiplicative base (Retinex):
+        lit_up_map = lit_up_map_raw * (1 + tanh(delta) * max_delta)
+        brighten_base = img_dark * lit_up_map
 
-    关键性质:
-        - s_illum=0 → lit_up_map=1 → 无提亮 → 高重建损失 → 模型被迫让 s_illum>0
-        - s_illum=1 → lit_up_map=lit_up_map_full → 完全提亮
-        - d(res_t)/d(s_illum) = img_dark * (lit_up_map_full - 1)  (非零, 无衰减)
-        - lit_up_map_raw 提供"提亮什么"(内容感知), s_illum 提供"提亮多少"(诊断驱动)
+    Additive s_illum correction:
+        corr_mag = illum_corr(f_illum_feat)           # 64->3, zero-init
+        illum_residual = s_illum * corr_mag
+        res_t = clamp(brighten_base + illum_residual, 0, 1)
     """
 
     def __init__(self, channels: int, img_channels: int = 3, max_delta: float = 0.5,
@@ -118,7 +117,10 @@ class BrightenStage(nn.Module):
             Block(img_channels),
             nn.Conv2d(img_channels, img_channels, 3, 1, 1),
         )
-        # v5.7: 移除 illum_corr (加法修正路径), 改用乘法门控
+        # v5.5: s_illum additive correction — zero-init so initial behavior = v4.3
+        self.illum_corr = nn.Conv2d(channels, img_channels, kernel_size=1, bias=True)
+        nn.init.zeros_(self.illum_corr.weight)
+        nn.init.zeros_(self.illum_corr.bias)
 
     def forward(self, lit_up_map_raw: torch.Tensor, f_illum_feat: torch.Tensor,
                 img_dark: torch.Tensor, s_illum: torch.Tensor = None):
@@ -126,18 +128,21 @@ class BrightenStage(nn.Module):
         img_cond = self.img_proj(img_dark)
         delta = self.delta_refine(torch.cat([feat_cond, img_cond], dim=1))
 
-        # lit_up_map_full: 内容感知的提亮模式 (1 ~ 5, bounded)
-        lit_up_map_full = lit_up_map_raw * (1.0 + torch.tanh(delta) * self.max_delta)
-        lit_up_map_full = lit_up_map_full.clamp(min=0.5)
+        # Bounded delta: adjustment limited to +/- max_delta (default +/-50%)
+        lit_up_map = lit_up_map_raw * (1.0 + torch.tanh(delta) * self.max_delta)
+        lit_up_map = lit_up_map.clamp(min=0.5)
 
-        # v5.7: s_illum 门控 — 消除功能冗余
+        # Multiplicative base (Retinex)
+        brighten_base = img_dark * lit_up_map
+
+        # v5.5: additive s_illum correction (zero-init -> initial res_t = brighten_base)
         if s_illum is not None:
-            # s_illum 控制"提亮多少": s_illum=0→无提亮, s_illum=1→完全提亮
-            lit_up_map = 1.0 + s_illum * (lit_up_map_full - 1.0)
+            corr_mag = self.illum_corr(f_illum_feat)
+            illum_residual = s_illum * corr_mag
+            res_t = torch.clamp(brighten_base + illum_residual, 0.0, 1.0)
         else:
-            lit_up_map = lit_up_map_full
+            res_t = torch.clamp(brighten_base, 0.0, 1.0)
 
-        res_t = torch.clamp(img_dark * lit_up_map, 0.0, 1.0)
         return res_t, lit_up_map
 
 
@@ -156,17 +161,19 @@ class IGRF(nn.Module):
     """
 
     def __init__(self, channels: int = 64, out_channels: int = 3, use_soft_clamp: bool = False,
-                 use_nafblock: bool = False):
+                 use_nafblock: bool = False, num_res_blocks: int = 2):
         super().__init__()
         self.channels = channels
         self.out_channels = out_channels
 
         self.stage_noise = StageBlock(channels, out_channels, use_intensity=True,
                                        use_soft_clamp=use_soft_clamp,
-                                       use_nafblock=use_nafblock)   # denoise + s_noise
+                                       use_nafblock=use_nafblock,
+                                       num_res_blocks=num_res_blocks)
         self.stage_motion = StageBlock(channels, out_channels, use_intensity=False,
                                        use_soft_clamp=use_soft_clamp,
-                                       use_nafblock=use_nafblock)  # motion (no intensity)
+                                       use_nafblock=use_nafblock,
+                                       num_res_blocks=num_res_blocks)
         self.brighten = BrightenStage(channels, out_channels,
                                       use_nafblock=use_nafblock)    # hybrid brighten + s_illum (final hard clamp)
 

@@ -108,6 +108,9 @@ def build_model(cfg, device):
         sace_offset_kaiming_init=model_cfg.get("sace_offset_kaiming_init", False),
         use_soft_median=model_cfg.get("use_soft_median", True),
         use_nafblock=model_cfg.get("use_nafblock", False),
+        num_bottleneck_blocks=model_cfg.get("num_bottleneck_blocks", 0),
+        num_igrf_res_blocks=model_cfg.get("num_igrf_res_blocks", 2),
+        use_amp_enhance=model_cfg.get("use_amp_enhance", False),
     )
     return model.to(device)
 
@@ -276,9 +279,28 @@ def main():
 
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        scheduler.load_state_dict(ckpt["scheduler"])
+        sd = ckpt["model"]
+        # Remap: 旧 checkpoint 用 Sequential 包裹 ResBlock (fuse.N.0.conv1 → fuse.N.conv1)
+        remapped = {}
+        for k, v in sd.items():
+            parts = k.split(".")
+            remapped_key = k
+            for i in range(len(parts) - 2):
+                if parts[i] == "fuse" and parts[i + 2] == "0":
+                    remapped_key = ".".join(parts[:i + 2] + parts[i + 3:])
+                    break
+            remapped[remapped_key] = v
+        model.load_state_dict(remapped, strict=False)
+        if "optimizer" in ckpt:
+            try:
+                optimizer.load_state_dict(ckpt["optimizer"])
+            except Exception:
+                logger.warning("Optimizer state load failed, starting fresh optimizer")
+        if "scheduler" in ckpt:
+            try:
+                scheduler.load_state_dict(ckpt["scheduler"])
+            except Exception:
+                logger.warning("Scheduler state load failed, starting fresh scheduler")
         start_epoch = ckpt["epoch"]
         best_psnr = ckpt.get("best_psnr", -1.0)
         logger.info("Resumed from %s (epoch %d, best_psnr=%.4f)", args.resume, start_epoch, best_psnr)

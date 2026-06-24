@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .blocks import ConvBlock
+from .blocks import ConvBlock, ResBlock
 
 
 class EncoderStage(nn.Module):
@@ -31,7 +31,8 @@ class EncoderStage(nn.Module):
 
 
 class PyramidEncoder(nn.Module):
-    def __init__(self, in_channels=3, level_channels=(32, 64, 96), fused_channels=64):
+    def __init__(self, in_channels=3, level_channels=(32, 64, 96), fused_channels=64,
+                 num_bottleneck_blocks: int = 0):
         super().__init__()
         if len(level_channels) == 4:
             c1, c2, c3, c4 = level_channels
@@ -46,6 +47,16 @@ class PyramidEncoder(nn.Module):
         if self.has_stage4:
             self.stage4 = EncoderStage(c3, c4, stride=2)
             self.lateral4 = nn.Conv2d(c4, fused_channels, 1, 1, 0)
+
+        # v5.8: 瓶颈块 — 在最粗层 (c3, H/4) 增加深度, 最省显存
+        self.num_bottleneck_blocks = num_bottleneck_blocks
+        if num_bottleneck_blocks > 0:
+            bottleneck_ch = c4 if c4 is not None else c3
+            self.bottleneck = nn.Sequential(
+                *[ResBlock(bottleneck_ch) for _ in range(num_bottleneck_blocks)]
+            )
+        else:
+            self.bottleneck = None
 
         self.lateral3 = nn.Conv2d(c3, fused_channels, 1, 1, 0)
         self.lateral2 = nn.Conv2d(c2, fused_channels, 1, 1, 0)
@@ -73,10 +84,16 @@ class PyramidEncoder(nn.Module):
 
         if self.has_stage4:
             l4 = self.stage4(l3)  # (B, c4, H/8, W/8)
+            # v5.8: 瓶颈块在最粗层
+            if self.bottleneck is not None:
+                l4 = self.bottleneck(l4)
             p4 = self.lateral4(l4)
             p3 = self.lateral3(l3) + F.interpolate(p4, size=l3.shape[-2:], mode="bilinear", align_corners=False)
         else:
             l4 = None
+            # v5.8: 瓶颈块在最粗层 (3级编码器时在 l3)
+            if self.bottleneck is not None:
+                l3 = self.bottleneck(l3)
             p3 = self.lateral3(l3)
 
         p2 = self.lateral2(l2) + F.interpolate(p3, size=l2.shape[-2:], mode="bilinear", align_corners=False)

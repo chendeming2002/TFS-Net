@@ -19,6 +19,9 @@ from .mrpn import MRPN
 # v5.6 新增 block
 from .blocks import ConvBlock, ResBlock, NAFBlock, LayerNorm2d
 
+# v5.9 新增
+from .amp_enhance import AmpEnhance, AmpNet
+
 __all__ = [
     # v1
     "PyramidEncoder", "MINSBlock", "ISPN", "MSPN", "FinalReconstruction",
@@ -30,5 +33,7 @@ __all__ = [
     "NDPN", "MRPN",
     # v5.6
     "ConvBlock", "ResBlock", "NAFBlock", "LayerNorm2d",
+    # v5.9
+    "AmpEnhance", "AmpNet",
 ]
 
