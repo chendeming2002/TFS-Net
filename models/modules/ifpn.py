@@ -127,6 +127,14 @@ class IFPN(nn.Module):
         # v4.3: hybrid estimation - feature space delta projected to image space
         self.lit_up_proj = nn.Conv2d(fused_channels, img_channels, kernel_size=1, bias=True)
 
+        # v5.9.2: side_head 用于中间感知监督 (DarkIR EnhanceLoss 风格)
+        # 把 f_illum_feat 投影为低分辨率图像, 监督 GT 下采样, 强制光照特征有意义
+        self.side_head = nn.Sequential(
+            nn.Conv2d(fused_channels, 32, 3, 1, 1, bias=True),
+            nn.GELU(),
+            nn.Conv2d(32, img_channels, 3, 1, 1, bias=True),
+        )
+
     def forward(
         self,
         I_t_down: torch.Tensor,
@@ -197,10 +205,14 @@ class IFPN(nn.Module):
         lit_up_feat = L_ratio + lit_up_delta                        # physical anchor + feature correction
         lit_up_map_raw = 1.0 + self.max_bright * torch.sigmoid(lit_up_feat)  # bounded [1, 1+max_bright]
 
+        # v5.9.2: 中间监督输出 — 把 f_illum_feat 投影为图像, 供增强损失用
+        ifpn_side = self.side_head(f_illum_feat)
+
         return {
             "lit_up_map_raw": lit_up_map_raw,
             "f_illum_feat":  f_illum_feat,
             "L_t":           L_t,
             "L_ref":         L_ref,
             "L_ratio":       L_ratio,
+            "ifpn_side":     ifpn_side,
         }

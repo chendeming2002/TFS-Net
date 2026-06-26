@@ -187,7 +187,7 @@ class TFSNetLoss(nn.Module):
               + lambda_illum_sup * L_illum_sup        # v5.6 P0-2: s_illum 显式监督
               + lambda_noise_sup * L_noise_sup        # v5.6 P0-2: s_noise 显式监督
               + lambda_inter * L_inter                # 中间监督: img_s2 * lit_up_map (乘法路径)
-              + lambda_recon * L_recon                # v5.6 P0-3: 最终输出监督 (含 s_illum 加法路径)
+              + lambda_ifpn_sup * L_ifpn_sup          # v5.9.2: IFPN 中间感知监督 (DarkIR 风格)
 
         L_pix          = Charbonnier(pred, target)
         L_freq         = L1(|FFT(pred)|, |FFT(target)|)
@@ -222,6 +222,8 @@ class TFSNetLoss(nn.Module):
         perc_multilayer: bool = True,
         freq_with_phase: bool = True,
         freq_phase_weight: float = 0.5,
+        # v5.9.2 新增
+        lambda_ifpn_sup: float = 0.0,
     ):
         super().__init__()
         self.use_temporal = use_temporal
@@ -231,13 +233,15 @@ class TFSNetLoss(nn.Module):
         self.lambda_illum = lambda_illum
         self.lambda_ssim = lambda_ssim
         self.lambda_inter = lambda_inter
+        self.lambda_recon = lambda_recon  # kept for backward compat, not used
         # v5.6
         self.lambda_illum_sup = lambda_illum_sup
         self.lambda_noise_sup = lambda_noise_sup
-        self.lambda_recon = lambda_recon
         self.noise_tau_high = noise_tau_high
         self.freq_with_phase = freq_with_phase
         self.freq_phase_weight = freq_phase_weight
+        # v5.9.2
+        self.lambda_ifpn_sup = lambda_ifpn_sup
 
         self.perceptual = PerceptualLoss(pretrained=perceptual_pretrained, multilayer=perc_multilayer)
 
@@ -329,8 +333,13 @@ class TFSNetLoss(nn.Module):
             img_s2_lit = torch.clamp(outputs["img_s2"] * outputs["lit_up_map"], 0.0, 1.0)
             L_inter = charbonnier_loss(img_s2_lit, target)
 
-        # (7) v5.6 P0-3: L_recon 已移除 — 与 L_pix 完全相同 (都是 Charb(res_t, GT))，冗余。
-        # L_pix 已监督 res_t (含 s_illum 加法路径), 无需额外 L_recon。
+        # (7) v5.9.2: IFPN 中间感知监督 (DarkIR EnhanceLoss 风格)
+        # 把 f_illum_feat 投影为图像 → 与 GT 下采样对齐 → 强制光照特征有意义
+        L_ifpn_sup = pred.new_tensor(0.0)
+        if self.lambda_ifpn_sup > 0 and "ifpn_side" in outputs:
+            ifpn_side = outputs["ifpn_side"]  # (B, 3, H, W) IFPN 侧输出
+            tgt_down = F.interpolate(target, size=ifpn_side.shape[-2:], mode='bilinear', align_corners=False)
+            L_ifpn_sup = charbonnier_loss(ifpn_side, tgt_down)
 
         # 总损失
         L_total = (
@@ -341,6 +350,7 @@ class TFSNetLoss(nn.Module):
             + self.lambda_illum_sup * L_illum_sup
             + self.lambda_noise_sup * L_noise_sup
             + self.lambda_inter * L_inter
+            + self.lambda_ifpn_sup * L_ifpn_sup
         )
 
         loss_dict = {
@@ -353,6 +363,7 @@ class TFSNetLoss(nn.Module):
             "loss_illum_sup":  L_illum_sup.detach(),
             "loss_noise_sup":  L_noise_sup.detach(),
             "loss_inter":      L_inter.detach(),
+            "loss_ifpn_sup":   L_ifpn_sup.detach(),
         }
         return L_total, loss_dict
 

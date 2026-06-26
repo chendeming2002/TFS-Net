@@ -263,6 +263,7 @@ class TFSNet(nn.Module):
             "L_t":            ifpn_out["L_t"],
             "L_ref":          ifpn_out["L_ref"],
             "L_ratio":        ifpn_out["L_ratio"],
+            "ifpn_side":      ifpn_out.get("ifpn_side"),
             "attn_maps":      attn_maps,
             "mu_t_clean":     mu_t_clean,
             "s_snr":          ndpn_out["s_snr"],

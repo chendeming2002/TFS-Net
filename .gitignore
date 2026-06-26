@@ -3,3 +3,5 @@ Experience/
 *.pth
 __pycache__/
 reference_repos/
+node_modules/
+package-lock.json

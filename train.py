@@ -38,6 +38,7 @@ def parse_args():
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--resume", type=str, default=None, help="checkpoint path to resume from")
+    parser.add_argument("--pretrained", type=str, default=None, help="pretrained weights to init model only")
     return parser.parse_args()
 
 
@@ -135,6 +136,8 @@ def build_loss(cfg, device):
         perc_multilayer=loss_cfg.get("perc_multilayer", True),
         freq_with_phase=loss_cfg.get("freq_with_phase", True),
         freq_phase_weight=loss_cfg.get("freq_phase_weight", 0.5),
+        # v5.9.2
+        lambda_ifpn_sup=loss_cfg.get("lambda_ifpn_sup", 0.0),
     )
     return criterion.to(device)
 
@@ -150,6 +153,7 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
     meter_illum_sup = AverageMeter()
     meter_noise_sup = AverageMeter()
     meter_inter = AverageMeter()
+    meter_ifpn = AverageMeter()
 
     progress = tqdm(enumerate(loader), total=len(loader), desc="train", leave=False)
     for step, (clip, target, _) in progress:
@@ -182,12 +186,13 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
         meter_illum_sup.update(loss_dict["loss_illum_sup"].item(), clip.size(0))
         meter_noise_sup.update(loss_dict["loss_noise_sup"].item(), clip.size(0))
         meter_inter.update(loss_dict["loss_inter"].item(), clip.size(0))
+        meter_ifpn.update(loss_dict["loss_ifpn_sup"].item(), clip.size(0))
 
         progress.set_postfix(loss=meter_total.avg, pix=meter_pix.avg, ssim=meter_ssim.avg,
                              i_sup=meter_illum_sup.avg, n_sup=meter_noise_sup.avg)
         if (step + 1) % log_interval == 0:
             logger.info(
-                "step %d/%d loss=%.4f pix=%.4f freq=%.4f ssim=%.4f perc=%.4f illum=%.4f i_sup=%.4f n_sup=%.4f inter=%.4f",
+                "step %d/%d loss=%.4f pix=%.4f freq=%.4f ssim=%.4f perc=%.4f illum=%.4f i_sup=%.4f n_sup=%.4f inter=%.4f ifpn=%.4f",
                 step + 1,
                 len(loader),
                 meter_total.avg,
@@ -199,6 +204,7 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
                 meter_illum_sup.avg,
                 meter_noise_sup.avg,
                 meter_inter.avg,
+                meter_ifpn.avg,
             )
 
     return {
@@ -211,6 +217,7 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
         "loss_illum_sup": meter_illum_sup.avg,
         "loss_noise_sup": meter_noise_sup.avg,
         "loss_inter": meter_inter.avg,
+        "loss_ifpn_sup": meter_ifpn.avg,
     }
 
 
@@ -304,6 +311,21 @@ def main():
         start_epoch = ckpt["epoch"]
         best_psnr = ckpt.get("best_psnr", -1.0)
         logger.info("Resumed from %s (epoch %d, best_psnr=%.4f)", args.resume, start_epoch, best_psnr)
+
+    if args.pretrained:
+        ckpt = torch.load(args.pretrained, map_location=device, weights_only=False)
+        sd = ckpt["model"]
+        remapped = {}
+        for k, v in sd.items():
+            parts = k.split(".")
+            remapped_key = k
+            for i in range(len(parts) - 2):
+                if parts[i] == "fuse" and parts[i + 2] == "0":
+                    remapped_key = ".".join(parts[:i + 2] + parts[i + 3:])
+                    break
+            remapped[remapped_key] = v
+        missing_keys, unexpected = model.load_state_dict(remapped, strict=False)
+        logger.info("Loaded pretrained weights from %s (missing=%d, unexpected=%d)", args.pretrained, len(missing_keys), len(unexpected))
 
     for epoch in range(start_epoch, total_epochs):
         logger.info("Epoch %d / %d", epoch + 1, total_epochs)

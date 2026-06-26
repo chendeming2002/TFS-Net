@@ -1,5 +1,5 @@
 seed: 42
-output_dir: outputs/sdsd_v591_fusefix
+output_dir: outputs/sdsd_v592_light
 dataset:
   train_input_root: /home/a1005/yzy/dataset/SDSD/indoor/input
   train_target_root: /home/a1005/yzy/dataset/SDSD/indoor/GT
@@ -23,13 +23,13 @@ model:
   use_amp_enhance: false
 train:
   batch_size: 3
-  epochs: 150
+  epochs: 50
   lr: 0.001
   weight_decay: 0.0001
   amp: false
   log_interval: 50
   val_interval: 5
-  warmup_epochs: 10
+  warmup_epochs: 0
   grad_clip: 0.5
 loss:
   type: TFSNetLoss
@@ -37,14 +37,15 @@ loss:
   perceptual_pretrained: true
   lambda_perc: 0.2
   lambda_freq: 0.1
-  lambda_illum: 0.01
+  lambda_illum: 0.001
   lambda_ssim: 0.1
   lambda_inter: 0.3
   fused_channels: 64
-  lambda_illum_sup: 0.0
+  lambda_illum_sup: 0.02
   lambda_noise_sup: 0.0
   perc_multilayer: false
   freq_with_phase: false
+  lambda_ifpn_sup: 0.1
 eval:
   tile_size: 256
   tile_overlap: 32
