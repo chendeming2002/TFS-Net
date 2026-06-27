@@ -27,7 +27,7 @@ from models.modules.ndpn import NDPN
 from models.modules.mrpn import MRPN
 from models.modules.igrf import IGRF
 from models.modules.amp_enhance import AmpEnhance
-from models.modules.dwt_lff import DWTLFFAdapter
+from models.modules.dwt_lff import SpatialDWTLFFAdapter
 
 
 class TFSNet(nn.Module):
@@ -87,7 +87,7 @@ class TFSNet(nn.Module):
 
         # v6.2: DWT-LFF — 小波多频段解耦, 解决 TFSI/SACE 共享 LFF 矛盾
         self.use_dwt_lff = use_dwt_lff
-        dwt_lff_module = DWTLFFAdapter(channels=fused_channels) if use_dwt_lff else None
+        dwt_lff_module = SpatialDWTLFFAdapter(in_channels=fused_channels) if use_dwt_lff else None
 
         # Stage 1: TFSI (支持 DWT-LFF 或传统 LFF)
         self.tfsi = TFSI(
@@ -101,7 +101,7 @@ class TFSNet(nn.Module):
         # Stage 2: SACE
         # share_lff=True: 共享 TFSI 的 DWT-LFF 或传统 LFF
         if use_dwt_lff:
-            shared_lff = dwt_lff_module  # DWTLFFAdapter 共享
+            shared_lff = dwt_lff_module  # SpatialDWTLFFAdapter 共享
         else:
             shared_lff = self.tfsi.freq_branch.lff if share_lff else None  # LFFFeatureAdapter 共享
         self.sace = SACE(

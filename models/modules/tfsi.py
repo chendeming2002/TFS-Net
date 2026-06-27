@@ -19,8 +19,8 @@ import torch.nn.functional as F
 
 from .blocks import ConvBlock, LayerNorm2d
 from .lff import LFFFeatureAdapter
-from .dwt_lff import DWTLFFAdapter
-from .dwt_lff import DWTLFFAdapter
+from .dwt_lff import SpatialDWTLFFAdapter
+from .dwt_lff import SpatialDWTLFFAdapter
 
 
 class SpatialBranch(nn.Module):
@@ -119,7 +119,7 @@ class FrequencyBranch(nn.Module):
         n_ang_freq: int = 1,
         per_channel_rbf: bool = False,
         phase_preserving: bool = True,
-        dwt_lff: DWTLFFAdapter = None,
+        dwt_lff: SpatialDWTLFFAdapter = None,
     ):
         super().__init__()
         self.channels = channels
@@ -136,7 +136,7 @@ class FrequencyBranch(nn.Module):
             lff_channels = fused_channels
 
         if dwt_lff is not None:
-            # v6.2: DWT-LFF 模式 — 不创建传统 LFF, 使用外部 DWTLFFAdapter
+            # v6.2: DWT-LFF 模式 — 不创建传统 LFF, 使用外部 SpatialDWTLFFAdapter
             self.lff = None
         else:
             self.lff = LFFFeatureAdapter(
@@ -238,7 +238,7 @@ class TFSI(nn.Module):
     """
 
     def __init__(self, channels: int = 64, fused_channels: int = 64, eps: float = 1e-6,
-                 use_soft_median: bool = True, dwt_lff: DWTLFFAdapter = None):
+                 use_soft_median: bool = True, dwt_lff: SpatialDWTLFFAdapter = None):
         super().__init__()
         self.channels = channels
         self.fused_channels = fused_channels

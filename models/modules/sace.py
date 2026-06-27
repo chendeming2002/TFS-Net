@@ -25,7 +25,7 @@ import torch.nn.functional as F
 
 from models.modules.blocks import ConvBlock, LayerNorm2d
 from models.modules.lff import LFFFeatureAdapter
-from models.modules.dwt_lff import DWTLFFAdapter
+from models.modules.dwt_lff import SpatialDWTLFFAdapter
 from models.modules.cross_rwkv import CrossRWKVGate
 
 
@@ -218,8 +218,8 @@ class SACE(nn.Module):
         n_groups      : 可变形注意力分组数
         kernel_size   : 可变形采样核大小
         use_optimized : 采样器是否使用优化版
-        lff_module    : 外部传入的 LFFFeatureAdapter 或 DWTLFFAdapter (None 则内部新建)
-                         v6.2: 支持 DWTLFFAdapter — 取 feat_sace 输出 (相位差+高频结构)
+        lff_module    : 外部传入的 LFFFeatureAdapter 或 SpatialDWTLFFAdapter (None 则内部新建)
+                         v6.2: 支持 SpatialDWTLFFAdapter — 取 feat_sace 输出 (相位差+高频结构)
         K, n_ang_freq : 内部 LFF 的参数
     """
 
@@ -303,7 +303,7 @@ class SACE(nn.Module):
                 lff_feats.append(cached_lff[t])
             else:
                 lff_out = self.lff(feats[:, t])
-                # v6.2: DWTLFFAdapter 返回 dict, SACE 取 feat_sace
+                # v6.2: SpatialDWTLFFAdapter 返回 dict, SACE 取 feat_sace
                 if isinstance(lff_out, dict):
                     lff_feats.append(lff_out["feat_sace"])
                 else:

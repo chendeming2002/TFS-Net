@@ -1,147 +1,120 @@
 """
-DWT-LFF Adapter — v6.3 小波-频域特征适配器 (2026-06-27)
-==========================================================
-基于 DWT (Haar 小波) 将特征分为低频子带和三个高频子带。
+Spatial-Domain DWT-LFF Adapter (v6.4 — 综合修正版)
+====================================================
+基于 v6-Alpha.md 和 v6-Alpha-corr.md 的综合修正：
 
-设计 (v6.3 严格版):
-  低频子带 LL → Conv (可学习光照幅度提取器)
-  feat_sace = DWT_HF + DWT_LF_phase + Conv(LL)_amplitude
-    → SACE 对齐: 高频结构 + 低频相位(对齐信息) + 卷积提取的"光照参考幅度"
-  feat_tfsi = DWT_HF + DWT_LF_phase + (LL_original - Conv(LL))_amplitude
-    → TFSI 诊断: 高频 + 低频相位 + 被移除了多少光照(= 退化诊断)
+修正 v6-Alpha.md:
+  1. α = sigmoid(Conv3×3(LL)) soft 分配 → 非负, LL_ref+LL_deg=LL
+  2. 空间域 Conv3×3 (非 FFT 域) → 保留局部性
+  3. feat_sace 加 LayerNorm → 适配 Cross-RWKV Q-Shift
 
-物理意义:
-  - Conv 学习提取"正常光照应有的幅度"→ SACE 的归一化参考
-  - LL - Conv = "光照退化幅度"(γ_t 的影响)→ TFSI 诊断 s_illum/s_noise
-  - 两者共享低频相位(= 结构/噪声指纹)和高频(= 纹理/运动)
-  - 互补设计: SACE 拿"光照参考", TFSI 拿"光照残差"
+修正 v6-Alpha-corr.md:
+  4. IDWT 重构 (非 bilinear 上采样) → 保留完整高频
+  5. HF 0.5× 平均分配 → feat_sace+feat_tfsi 完美重构输入
+  6. α init=0.5 → 初始兼容 v5.9.2 预训练权重
 """
-
-from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.fft as fft
+import torch.nn.functional as F
 
 
 class HaarDWT2D(nn.Module):
-    """2D Haar 小波变换。"""
+    """Haar 小波 2D 正逆变换（无参数）"""
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x):
+        """x: (B, C, H, W) → LL, LH, HL, HH: (B, C, H/2, W/2)"""
         B, C, H, W = x.shape
-        lo = (x[:, :, 0::2, :] + x[:, :, 1::2, :]) / 2.0
-        hi = (x[:, :, 0::2, :] - x[:, :, 1::2, :]) / 2.0
-        LL = (lo[:, :, :, 0::2] + lo[:, :, :, 1::2]) / 2.0
-        LH = (lo[:, :, :, 0::2] - lo[:, :, :, 1::2]) / 2.0
-        HL = (hi[:, :, :, 0::2] + hi[:, :, :, 1::2]) / 2.0
-        HH = (hi[:, :, :, 0::2] - hi[:, :, :, 1::2]) / 2.0
+        x01, x02 = x[:, :, 0::2, :], x[:, :, 1::2, :]
+        L = (x01 + x02) * 0.5
+        H_ = (x01 - x02) * 0.5
+        LL = (L[:, :, :, 0::2] + L[:, :, :, 1::2]) * 0.5
+        LH = (L[:, :, :, 0::2] - L[:, :, :, 1::2]) * 0.5
+        HL = (H_[:, :, :, 0::2] + H_[:, :, :, 1::2]) * 0.5
+        HH = (H_[:, :, :, 0::2] - H_[:, :, :, 1::2]) * 0.5
         return LL, LH, HL, HH
 
-
-class HaarIDWT2D(nn.Module):
-    """2D Haar 逆小波变换。"""
-
-    def forward(self, LL, LH, HL, HH):
-        B, C, h2, w2 = LL.shape
-        lo_up = torch.zeros(B, C, h2, w2 * 2, device=LL.device, dtype=LL.dtype)
-        hi_up = torch.zeros_like(lo_up)
-        lo_up[:, :, :, 0::2] = LL + LH
-        lo_up[:, :, :, 1::2] = LL - LH
-        hi_up[:, :, :, 0::2] = HL + HH
-        hi_up[:, :, :, 1::2] = HL - HH
-        x_up = torch.zeros(B, C, h2 * 2, w2 * 2, device=LL.device, dtype=LL.dtype)
-        x_up[:, :, 0::2, :] = lo_up + hi_up
-        x_up[:, :, 1::2, :] = lo_up - hi_up
-        return x_up
+    def inverse(self, LL, LH, HL, HH):
+        """逆变换: (B, C, H/2, W/2) × 4 → (B, C, H, W)"""
+        B, C, H2, W2 = LL.shape
+        L = torch.zeros(B, C, H2, W2 * 2, device=LL.device, dtype=LL.dtype)
+        H_ = torch.zeros(B, C, H2, W2 * 2, device=LL.device, dtype=LL.dtype)
+        L[:, :, :, 0::2] = (LL + LH) * 2
+        L[:, :, :, 1::2] = (LL - LH) * 2
+        H_[:, :, :, 0::2] = (HL + HH) * 2
+        H_[:, :, :, 1::2] = (HL - HH) * 2
+        x = torch.zeros(B, C, H2 * 2, W2 * 2, device=LL.device, dtype=LL.dtype)
+        x[:, :, 0::2, :] = (L + H_) * 0.5
+        x[:, :, 1::2, :] = (L - H_) * 0.5
+        return x
 
 
-class DWTLFFAdapter(nn.Module):
-    """DWT-FFT 特征适配器 — v6.3 严格版: SACE/TFSI 互补低频幅度设计。
+class SpatialDWTLFFAdapter(nn.Module):
+    """空间域 DWT-LFF 适配器 (v6.4 综合修正版)
 
-    Args:
-        channels: 特征通道数
+    关键设计:
+      1. 空间域 Conv3×3(LL) → α ∈ [0,1] soft 分配 (非 FFT 域, 非减法)
+      2. IDWT(LL_ref/LL_deg, 0.5·LH/HL/HH) → 保留完整高频, 完美重构
+      3. α init=0.5 → 训练初期 feat_sace≈feat_tfsi≈x/2, 兼容 v5.9.2
+      4. LayerNorm → 适配 Cross-RWKV Q-Shift 通道分布
     """
 
-    def __init__(self, channels: int):
+    def __init__(self, in_channels: int):
         super().__init__()
-        self.channels = channels
+        self.in_channels = in_channels
         self.dwt = HaarDWT2D()
-        self.idwt = HaarIDWT2D()
 
-        # 低频卷积: 提取"正常光照"的幅度参考 (3×3 conv, 保持尺寸)
-        self.illum_conv = nn.Sequential(
-            nn.Conv2d(channels, channels, 3, 1, 1, groups=channels, bias=True),
+        # 低频光照分离 α → 空间域 depthwise + pointwise (保留局部性)
+        self.illum_alpha = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, 3, 1, 1, groups=in_channels, bias=False),
             nn.GELU(),
-            nn.Conv2d(channels, channels, 1, 1, 0, bias=True),
+            nn.Conv2d(in_channels, in_channels, 1, 1, 0),
+            nn.Sigmoid(),
         )
 
-        # 高频融合 (LH/HL/HH → C)
-        self.high_fusion = nn.Sequential(
-            nn.Conv2d(channels * 3, channels, 1, 1, 0, bias=False),
-        )
-        nn.init.zeros_(self.high_fusion[0].weight)
+        # LayerNorm 适配 Cross-RWKV Q-Shift
+        self.norm_sace = nn.LayerNorm(in_channels)
+        self.norm_tfsi = nn.LayerNorm(in_channels)
+
+        # α init=0.5
+        for m in self.illum_alpha.modules():
+            if isinstance(m, nn.Conv2d) and m.kernel_size == (1, 1):
+                nn.init.constant_(m.weight, 0.0)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
 
     def forward(self, x: torch.Tensor):
         """
+        Args:
+            x: (B, C, H, W) 输入特征
         Returns:
-            x_out: (B, C, H, W) IDWT 重建
-            feat_tfsi: (B, C, H, W) TFSI 诊断特征
-            feat_sace: (B, C, H, W) SACE 对齐特征
+            feat_sace: (B, C, H, W) 归一化光照 + 高频 → SACE 对齐
+            feat_tfsi: (B, C, H, W) 退化残差 + 高频 → TFSI 诊断
+            alpha: (B, C, H/2, W/2) 光照分配图 (用于可视化/正则)
         """
         B, C, H, W = x.shape
-        device, dtype = x.device, x.dtype
 
-        # --- Step 1: DWT 分解 ---
-        LL, LH, HL, HH = self.dwt(x)  # 各 (B, C, H/2, W/2)
+        # Step 1: Haar DWT 分解
+        LL, LH, HL, HH = self.dwt(x)
 
-        # --- Step 2: LL 子带 FFT 提取相位 ---
-        F = fft.fft2(LL, dim=(-2, -1), norm='ortho')
-        mag_original = torch.abs(F)    # (B, C, H/2, W/2) — 原始幅度
-        pha = torch.angle(F)           # (B, C, H/2, W/2) — 低频相位
+        # Step 2: 空间域低频光照分离
+        alpha = self.illum_alpha(LL)       # ∈ [0, 1]
+        LL_ref = alpha * LL                # 归一化光照参考 (SACE)
+        LL_deg = (1.0 - alpha) * LL        # 光照退化残差 (TFSI)
 
-        # --- Step 3: Conv 提取"正常光照幅度" ---
-        # Conv 学习从 LL 中提取光照参考幅度
-        conv_out = self.illum_conv(LL)  # (B, C, H/2, W/2) — 正常光照参考
-        mag_conv = torch.abs(conv_out)  # Conv 输出幅度
+        # Step 3: HF 平均分配 → 保证 feat_sace+feat_tfsi = x (渐变约束)
+        LH_half, HL_half, HH_half = LH * 0.5, HL * 0.5, HH * 0.5
 
-        # --- Step 4: 低频相位基座 ---
-        # 相位携带结构和噪声指纹, TFSI/SACE 各需
-        # 用单位幅度 + 低频相位 → IFFT → 上采样
-        F_phase_base = torch.polar(torch.ones_like(mag_original), pha)
-        phase_base = fft.ifft2(F_phase_base, dim=(-2, -1), norm='ortho').real
-        phase_base_up = torch.nn.functional.interpolate(
-            phase_base, size=(H, W), mode='nearest')
+        # Step 4: IDWT 重构 (保留完整高频, 非 bilinear 上采样)
+        feat_sace = self.dwt.inverse(LL_ref, LH_half, HL_half, HH_half)
+        feat_tfsi = self.dwt.inverse(LL_deg, LH_half, HL_half, HH_half)
 
-        # --- Step 5: 高频子带上采样 + 融合 ---
-        LH_up = torch.nn.functional.interpolate(LH, size=(H, W), mode='nearest')
-        HL_up = torch.nn.functional.interpolate(HL, size=(H, W), mode='nearest')
-        HH_up = torch.nn.functional.interpolate(HH, size=(H, W), mode='nearest')
-        high_feat = self.high_fusion(torch.cat([LH_up, HL_up, HH_up], dim=1))  # (B, C, H, W)
-
-        # --- Step 6: SACE 特征 = HF + LF_phase + Conv(LF)_amplitude ---
-        # Conv(LF) 幅度 → IFFT(用原始相位) → 上采样
-        F_sace_amp = torch.polar(mag_conv, pha)
-        sace_amp = fft.ifft2(F_sace_amp, dim=(-2, -1), norm='ortho').real
-        sace_amp_up = torch.nn.functional.interpolate(
-            sace_amp, size=(H, W), mode='nearest')
-
-        feat_sace = phase_base_up + high_feat + sace_amp_up  # LF_phase + HF + Conv_amp
-
-        # --- Step 7: TFSI 特征 = HF + LF_phase + (LL_original - Conv(LL))_amplitude ---
-        # 残差幅度 = 原始幅度 - Conv幅度 = 被移除的光照退化信息
-        mag_residual = mag_original - mag_conv  # 光照退化残差
-        F_tfsi_amp = torch.polar(mag_residual, pha)
-        tfsi_amp = fft.ifft2(F_tfsi_amp, dim=(-2, -1), norm='ortho').real
-        tfsi_amp_up = torch.nn.functional.interpolate(
-            tfsi_amp, size=(H, W), mode='nearest')
-
-        feat_tfsi = phase_base_up + high_feat + tfsi_amp_up  # LF_phase + HF + residual_amp
-
-        # --- Step 8: 逆 DWT 重建 (Conv(LL) 作为低频重建) ---
-        x_out = self.idwt(conv_out, LH, HL, HH)
+        # Step 5: LayerNorm → 适配 Cross-RWKV Q-Shift
+        feat_sace = self.norm_sace(feat_sace.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        feat_tfsi = self.norm_tfsi(feat_tfsi.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
 
         return {
-            "x_out": x_out,
+            "x_out": feat_sace,     # 兼容旧接口: x_out = feat_sace
             "feat_tfsi": feat_tfsi,
             "feat_sace": feat_sace,
         }
