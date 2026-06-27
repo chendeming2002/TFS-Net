@@ -47,10 +47,10 @@ class MRPN(nn.Module):
     def _aggregate_neighbors(self, f_t, f_omega):
         """窗口 dot-product 相关聚合相邻帧（不含中心帧）。"""
         b, t, c, h, w = f_omega.shape
-        feat = f_omega.view(b * t, c, h, w)
+        feat = f_omega.reshape(b * t, c, h, w)
         feat, pad_hw = pad_to_window(feat, self.window_size)
         hp, wp = feat.shape[-2:]
-        feat = feat.view(b, t, c, hp, wp)
+        feat = feat.reshape(b, t, c, hp, wp)
 
         # center frame: pad + window partition
         f_t_padded, _ = pad_to_window(f_t, self.window_size)

@@ -155,12 +155,12 @@ class IFPN(nn.Module):
 
         # v5.3: 从 SACE 对齐特征生成粗特征（通道投影 + 空间下采样）
         BT = B * T
-        aligned_flat = aligned_feats.view(BT, *aligned_feats.shape[2:])
+        aligned_flat = aligned_feats.reshape(BT, *aligned_feats.shape[2:])
         projected = self.coarse_adapter(aligned_flat)
         # 目标空间尺寸：从 I_t_down 推断
         h, w = I_t_down.shape[-2:]
         coarse_flat = F.adaptive_avg_pool2d(projected, (h, w))
-        coarse_feats = coarse_flat.view(B, T, self.coarse_channels, h, w)
+        coarse_feats = coarse_flat.reshape(B, T, self.coarse_channels, h, w)
 
         # F_t_L: 中心帧粗特征（内部生成）
         F_t_L = coarse_feats[:, center_idx]
@@ -185,7 +185,7 @@ class IFPN(nn.Module):
         neighbors = coarse_feats[:, neighbor_indices]
         sim_logits = pairwise_cosine_logits(f_t_coarse, neighbors)
         weights = F.softmax(sim_logits / self.sim_temperature, dim=-1)
-        weights = weights.view(B, T - 1, 1, 1, 1)
+        weights = weights.reshape(B, T - 1, 1, 1, 1)
 
         # Step 4: 邻帧光照加权
         L_neighbors = torch.stack([L_list[i] for i in neighbor_indices], dim=1)

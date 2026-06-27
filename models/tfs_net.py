@@ -27,6 +27,7 @@ from models.modules.ndpn import NDPN
 from models.modules.mrpn import MRPN
 from models.modules.igrf import IGRF
 from models.modules.amp_enhance import AmpEnhance
+from models.modules.dwt_lff import DWTLFFAdapter
 
 
 class TFSNet(nn.Module):
@@ -55,6 +56,8 @@ class TFSNet(nn.Module):
         sace_offset_use_norm: bool = True,
         sace_offset_kaiming_init: bool = True,
         use_soft_median: bool = True,
+        use_cross_rwkv: bool = False,
+        use_dwt_lff: bool = False,
         use_nafblock: bool = False,
         num_bottleneck_blocks: int = 0,
         num_igrf_res_blocks: int = 2,
@@ -82,18 +85,25 @@ class TFSNet(nn.Module):
             num_bottleneck_blocks=num_bottleneck_blocks,
         )
 
-        # Stage 1: TFSI (M1: TFSI 频域分支始终相位保留)
+        # v6.2: DWT-LFF — 小波多频段解耦, 解决 TFSI/SACE 共享 LFF 矛盾
+        self.use_dwt_lff = use_dwt_lff
+        dwt_lff_module = DWTLFFAdapter(channels=fused_channels, K=10) if use_dwt_lff else None
+
+        # Stage 1: TFSI (支持 DWT-LFF 或传统 LFF)
         self.tfsi = TFSI(
             channels=fused_channels,
             fused_channels=fused_channels,
             eps=eps,
             use_soft_median=use_soft_median,
+            dwt_lff=dwt_lff_module,
         )
 
         # Stage 2: SACE
-        # share_lff=True: 共享 TFSI 的相位保留 LFF (M1-M3 baseline)
-        # share_lff=False: SACE 内部独立创建 LFF, phase_preserving 由 sace_phase_preserving 决定 (M4 消融)
-        shared_lff = self.tfsi.freq_branch.lff if share_lff else None
+        # share_lff=True: 共享 TFSI 的 DWT-LFF 或传统 LFF
+        if use_dwt_lff:
+            shared_lff = dwt_lff_module  # DWTLFFAdapter 共享
+        else:
+            shared_lff = self.tfsi.freq_branch.lff if share_lff else None  # LFFFeatureAdapter 共享
         self.sace = SACE(
             channels=fused_channels,
             n_groups=n_groups,
@@ -103,6 +113,7 @@ class TFSNet(nn.Module):
             phase_preserving=sace_phase_preserving,
             offset_use_norm=sace_offset_use_norm,
             offset_kaiming_init=sace_offset_kaiming_init,
+            use_cross_rwkv=use_cross_rwkv,
         )
 
         # Stage 3: 三源恢复分支

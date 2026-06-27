@@ -25,6 +25,8 @@ import torch.nn.functional as F
 
 from models.modules.blocks import ConvBlock, LayerNorm2d
 from models.modules.lff import LFFFeatureAdapter
+from models.modules.dwt_lff import DWTLFFAdapter
+from models.modules.cross_rwkv import CrossRWKVGate
 
 
 class DeformableCrossAttention(nn.Module):
@@ -216,7 +218,8 @@ class SACE(nn.Module):
         n_groups      : 可变形注意力分组数
         kernel_size   : 可变形采样核大小
         use_optimized : 采样器是否使用优化版
-        lff_module    : 外部传入的 LFFFeatureAdapter (None 则内部新建)
+        lff_module    : 外部传入的 LFFFeatureAdapter 或 DWTLFFAdapter (None 则内部新建)
+                         v6.2: 支持 DWTLFFAdapter — 取 feat_sace 输出 (相位差+高频结构)
         K, n_ang_freq : 内部 LFF 的参数
     """
 
@@ -232,6 +235,7 @@ class SACE(nn.Module):
         phase_preserving: bool = True,
         offset_use_norm: bool = False,
         offset_kaiming_init: bool = False,
+        use_cross_rwkv: bool = False,
     ):
         super().__init__()
         self.channels = channels
@@ -264,6 +268,13 @@ class SACE(nn.Module):
         self.norm_q = LayerNorm2d(channels)
         self.norm_kv = LayerNorm2d(channels)
 
+        # v6: Cross-RWKV Gate — deformable 对齐后做多帧长程聚合
+        self.use_cross_rwkv = use_cross_rwkv
+        if use_cross_rwkv:
+            self.cross_rwkv = CrossRWKVGate(channels=channels, num_frames=5)
+        else:
+            self.cross_rwkv = None
+
     @staticmethod
     def _soft_median(x: torch.Tensor, dim: int = 1, tau: float = 0.1) -> torch.Tensor:
         """
@@ -291,12 +302,19 @@ class SACE(nn.Module):
             if cached_lff and t in cached_lff:
                 lff_feats.append(cached_lff[t])
             else:
-                lff_feats.append(self.lff(feats[:, t]))
+                lff_out = self.lff(feats[:, t])
+                # v6.2: DWTLFFAdapter 返回 dict, SACE 取 feat_sace
+                if isinstance(lff_out, dict):
+                    lff_feats.append(lff_out["feat_sace"])
+                else:
+                    lff_feats.append(lff_out)
         lff_stack = torch.stack(lff_feats, dim=1)
 
-        # Step 2: 时域 soft-median → 参考帧 (梯度友好)
-        mu_t_clean = self._soft_median(lff_stack, dim=1)
-        # M2: LFF 域时域标准差 — 与 mu_t_clean 同域, 供 NDPN 计算物理一致的 SNR
+        # Step 2: 中心帧直接作参考（v6.2: soft-median 移除）
+        # soft-median 与 DAT 风格注意力绑定, RWKV 不需要参考帧引导
+        # 改用中心帧 LFF 特征直接作为对齐 query
+        mu_t_clean = lff_stack[:, T // 2]  # (B, C, H, W) — 中心帧 LFF
+        # 时域标准差 — 供 NDPN 计算 SNR
         sigma_t_clean = lff_stack.std(dim=1, unbiased=False)
 
         # M3: 从 TFSI 输出提取 s_noise, 用于噪声感知残差门控
@@ -322,6 +340,14 @@ class SACE(nn.Module):
 
             attn_maps.append((offset, mask))
             F_aligned_list.append(f_aligned)
+
+        # v6: Cross-RWKV Gate — deformable 对齐后做多帧长程聚合
+        if self.cross_rwkv is not None:
+            F_aligned_list = self.cross_rwkv(
+                query=mu_t_clean,
+                frames=F_aligned_list,
+                s_noise=s_noise,
+            )
 
         return {
             "attn_maps":       attn_maps,

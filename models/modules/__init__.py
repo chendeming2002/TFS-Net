@@ -22,6 +22,9 @@ from .blocks import ConvBlock, ResBlock, NAFBlock, LayerNorm2d
 # v5.9 新增
 from .amp_enhance import AmpEnhance, AmpNet
 
+# v6 新增
+from .cross_rwkv import CrossRWKVGate
+
 __all__ = [
     # v1
     "PyramidEncoder", "MINSBlock", "ISPN", "MSPN", "FinalReconstruction",
