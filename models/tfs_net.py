@@ -87,7 +87,7 @@ class TFSNet(nn.Module):
 
         # v6.2: DWT-LFF — 小波多频段解耦, 解决 TFSI/SACE 共享 LFF 矛盾
         self.use_dwt_lff = use_dwt_lff
-        dwt_lff_module = DWTLFFAdapter(channels=fused_channels, K=10) if use_dwt_lff else None
+        dwt_lff_module = DWTLFFAdapter(channels=fused_channels) if use_dwt_lff else None
 
         # Stage 1: TFSI (支持 DWT-LFF 或传统 LFF)
         self.tfsi = TFSI(

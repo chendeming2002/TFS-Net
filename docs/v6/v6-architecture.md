@@ -25,11 +25,11 @@ v6 在 v5.9.2 基础上引入三个核心改造：
     │
     ├─ [TFSI] 时频诊断 → s_illum, s_noise : (B, 1, H, W)
     │     ├─ SpatialBranch: soft-中位值 → μ_t, σ_t, SNR → Conv → F_s
-    │     └─ FrequencyBranch: DWT-LFF(中心帧) → feat_tfsi(低频幅度+噪声) → F_f
+    │     └─ FrequencyBranch: DWT-LFF(中心帧) → feat_tfsi(HF+LF_phase+光照残差幅度) → F_f
     │     └─ ConcatFusion(F_s, F_f) → IntensityHead → s_illum, s_noise
     │
     ├─ [SACE] 跨帧对齐增强 → F_aligned_list, μ_t_clean, σ_t_clean
-    │     ├─ DWT-LFF: 共享 TFSI 的适配器 → per-frame feat_sace(相位差+高频)
+    │     ├─ DWT-LFF: 共享 TFSI 的适配器 → per-frame feat_sace(HF+LF_phase+光照参考幅度)
     │     ├─ 中心帧参考: lff_stack[center_idx] → μ_t_clean (v6.2: 移除 soft-median)
     │     ├─ DeformableCrossAttention: OffsetMaskHead → offset+mask → grid_sample
     │     ├─ Cross-RWKV Gate: Bi-WKV 跨帧扫描 + EntropyGate 聚合
@@ -53,7 +53,7 @@ v6 在 v5.9.2 基础上引入三个核心改造：
 | TFSI | ~100K | 含 LFF RBF + SpatialBranch + IntensityHead |
 | SACE (DeformAttn) | ~130K | OffsetMaskHead + DeformableCrossAttention |
 | SACE (Cross-RWKV) | ~110K | VRWKVStyleSpatialMix + EntropyGate |
-| DWT-LFF | ~30K | HaarDWT + RBF + high_fusion |
+| DWT-LFF | ~30K | HaarDWT + illum_conv + high_fusion |
 | IFPN | ~150K | IllumExtract + Refine + side_head |
 | NDPN | ~70K | alpha_conv + Refine |
 | MRPN | ~50K | gate + ResBlock |
@@ -118,11 +118,11 @@ v6.2 核心改造：① DWT-LFF 替代传统 LFF；② soft-median 移除，中�
 #### 2.3.1 DWT-LFF 逐帧归一化
 
 ```
-feats (B, T, 64, H, W) → per-frame DWT-LFF → feat_sace (相位差+高频)
+feats (B, T, 64, H, W) → per-frame DWT-LFF → feat_sace (HF + LF_phase + 光照参考幅度)
 所有帧共享同一 DWTLFFAdapter 实例（与 TFSI 共享）。
 ```
 
-DWT-LFF 输出的 `feat_sace` = 低频相位差（∠原始−∠处理后）+ 高频原始子带（LH/HL/HH），用于 SACE 对齐。
+DWT-LFF 输出的 `feat_sace` = 高频子带(HF) + 低频相位 + Conv(LF)光照参考幅度——提供 SACE 对齐所需的归一化光照参考 + 高频结构 + 相位约束。`feat_tfsi`（TFSI 使用）与此互补——拿光照残差幅度。
 
 详见 §3.1。
 
@@ -240,13 +240,13 @@ Stage 3 (混合提亮):
 
 ### 3.1 DWT-LFF 适配器
 
-**文件**: `models/modules/dwt_lff.py`（160 行）
+**文件**: `models/modules/dwt_lff.py`（v6.3 严格版）
 
 **设计动机**: 传统 LFF 被 TFSI 和 SACE 共享同一 RBF 系数，存在矛盾：
 - TFSI 需要低频信息（光照在幅度谱低频段，噪声全频段含低频）
 - SACE 需要抑制低频（光照差异是"对齐噪声"），保留相位高频结构
 
-**解决方案**: Haar 小波分解为 4 子带，低频子带（LL）做 RBF 幅度整形，TFSI 和 SACE 拿到不同信息。
+**核心设计**: Haar 小波分解后，低频子带（LL）经可学习 Conv 提取"正常光照参考幅度"，SACE 和 TFSI 互补地拿到光照参考和光照残差。
 
 **数据流**:
 ```
@@ -254,21 +254,37 @@ x (B, C, H, W)
   → HaarDWT2D → LL, LH, HL, HH  (各 B, C, H/2, W/2)
 
 LL 子带:
-  → FFT2 → mag, pha
-  → RBF幅度整形: mag_processed = mag · (1 + diff_mag)
-  → 相位保留: pha不变
-  → IFFT2 → LL_processed
+  → FFT2 → mag_original, pha
+  → Conv(LL) → conv_out → mag_conv = |conv_out|  (可学习光照幅度提取器)
 
-TFSI 输出 feat_tfsi:
-  → 处理后的低频幅度 + 原始相位 → IFFT2 → 上采样 (H,W)
-  → 含光照幅度 + 噪声相位指纹 → 供 TFSI 诊断 s_illum/s_noise
+低频相位基座: phase_base = IFFT2(1, pha)  → 上采样
+高频融合: high_feat = Conv1×1([LH↑, HL↑, HH↑])
 
-SACE 输出 feat_sace:
-  → 相位差: ∠原始 − ∠处理后 → IFFT2 → 上采样
-  → + 高频子带 LH/HL/HH concat → 1×1 Conv
-  → 含相位对齐信息 + 高频结构 → 供 SACE 对齐
+feat_sace = phase_base + high_feat + sace_amp
+  sace_amp = IFFT2(mag_conv, pha) → 上采样
+  = 低频相位 + 高频结构 + Conv提取的"正常光照幅度"
+  → 供 SACE 对齐（光照归一化参考）
 
-IDWT: LL_processed + LH + HL + HH → x_out
+feat_tfsi = phase_base + high_feat + tfsi_amp
+  tfsi_amp = IFFT2(mag_original − mag_conv, pha) → 上采样
+  = 低频相位 + 高频结构 + "被移除的光照退化幅度"
+  → 供 TFSI 诊断 s_illum/s_noise (正是 γ_t 的贡献)
+
+IDWT: conv_out(低频) + LH + HL + HH → x_out
+```
+
+**物理意义**:
+- Conv 学习提取"正常光照应有的幅度"——SACE 的归一化参考
+- LL - Conv = 光照退化幅度（γ_t 的影响）——TFSI 诊断 s_illum 的输入
+- 两者共享低频相位（结构/噪声指纹）和高频（纹理/运动）
+- 互补设计: SACE 拿"光照参考"做对齐，TFSI 拿"光照残差"做诊断
+
+**关键公式**:
+```
+feat_sace = phase_base + high_feat + IFFT2(|Conv(LL)|, pha)
+feat_tfsi = phase_base + high_feat + IFFT2(|LL| − |Conv(LL)|, pha)
+         = phase_base + high_feat + IFFT2(|LL|, pha) − IFFT2(|Conv(LL)|, pha)
+         = feat_sace + IFFT2(|LL| − 2·|Conv(LL)|, pha)   (注: 非精确等式)
 ```
 
 ### 3.2 Cross-RWKV Gate 详细设计
