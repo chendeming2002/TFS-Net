@@ -40,7 +40,6 @@ loss:
   lambda_illum_sup: 0.02
   lambda_noise_sup: 0.0
   lambda_pix: 0.3
-  lambda_focal: 0.2
   perc_multilayer: false
   freq_with_phase: true
   freq_phase_weight: 0.5

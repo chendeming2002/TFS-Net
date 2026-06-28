@@ -1,8 +1,12 @@
 """
-VRWKVStyleSpatialMix — Vision-RWKV (ICLR 2025) Bi-WKV + Q-Shift
+VRWKVStyleSpatialMix — RWKV-Bravo 帧间扫描核心
+===============================================
+严格参照 Vision-RWKV (ICLR 2025) VRWKV_SpatialMix 实现:
+  - Q-Shift: 通道空间位移 + time mix 混合
+  - Bi-WKV: 含 spatial_first 当前帧加权, 严格匹配官方公式
+  - fancy init: 指数衰减分布 + 层级相关
 
-PureRWKVSACE 使用的跨帧扫描核心.
-严格参照 VRWKV_SpatialMix: Q-Shift → Time Mix → Bi-WKV → Gate.
+Bravo: 移除 CrossRWKVGate（由 PureRWKVSACE 直接调用本模块）
 """
 
 from __future__ import annotations
@@ -11,7 +15,6 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List
 
 
 class VRWKVStyleSpatialMix(nn.Module):
@@ -46,14 +49,19 @@ class VRWKVStyleSpatialMix(nn.Module):
         self.receptance = nn.Linear(channels, channels, bias=False)
         self.output = nn.Linear(channels, channels, bias=False)
 
-        for m in [self.output, self.key, self.value, self.receptance]:
-            nn.init.zeros_(m.weight)
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.key.weight)
+        nn.init.zeros_(self.value.weight)
+        nn.init.zeros_(self.receptance.weight)
+        for mod in [self.output, self.key, self.value, self.receptance]:
+            if mod.bias is not None:
+                nn.init.zeros_(mod.bias)
 
     @staticmethod
-    def q_shift_2d(x: torch.Tensor, shift_pixel: int = 1, gamma: float = 0.25) -> torch.Tensor:
+    def q_shift_2d(x: torch.Tensor, shift_pixel: int = 1,
+                   gamma: float = 0.25) -> torch.Tensor:
         B, C, H, W = x.shape
+        assert C >= 4
         g = int(C * gamma)
         out = x.clone()
         if g > 0:
@@ -69,16 +77,15 @@ class VRWKVStyleSpatialMix(nn.Module):
     def _bi_wkv_scan(self, w: torch.Tensor, u: torch.Tensor,
                      k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         B, T, L, C = k.shape
+        device, dtype = k.device, k.dtype
         ew = torch.exp(w).view(1, 1, 1, C)
         u_coeff = u.view(1, 1, 1, C)
-
         k_weighted = k * ew
         kv_all = (k_weighted * v).sum(dim=1)
         boost = u_coeff * k * v
         k_all = k_weighted.sum(dim=1)
         k_boost = u_coeff * k
-
-        out = torch.zeros(B, T, L, C, device=k.device, dtype=k.dtype)
+        out = torch.zeros(B, T, L, C, device=device, dtype=dtype)
         for t in range(T):
             num_t = kv_all + boost[:, t]
             den_t = k_all + k_boost[:, t]
@@ -87,7 +94,9 @@ class VRWKVStyleSpatialMix(nn.Module):
 
     def forward(self, x_flat: torch.Tensor, feat_2d_shape: tuple) -> torch.Tensor:
         B, T, L, C = x_flat.shape
+        device = x_flat.device
         H, W = feat_2d_shape
+        assert L == H * W
 
         x_2d = x_flat.reshape(B * T, H, W, C).permute(0, 3, 1, 2)
         x_shifted_2d = self.q_shift_2d(x_2d, self.shift_pixel, self.channel_gamma)

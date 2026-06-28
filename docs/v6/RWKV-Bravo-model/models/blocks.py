@@ -1,7 +1,6 @@
-"""
-LayerNorm2d, ConvBlock, ResBlock, NAFBlock, and window utilities.
-Shared across all TFS-Net modules.
-"""
+"""Bravo: 通用模块组件 — ConvBlock, ResBlock, NAFBlock, LayerNorm2d, 窗口相关辅助函数"""
+
+import math
 
 import torch
 import torch.nn as nn
@@ -128,9 +127,7 @@ def window_partition_2d(x, window_size):
 
 def window_reverse_2d(windows, window_size, h, w):
     b, nw, tokens, c = windows.shape
-    num_h = h // window_size
-    num_w = w // window_size
-    x = windows.view(b, num_h, num_w, window_size, window_size, c)
+    x = windows.view(b, h // window_size, w // window_size, window_size, window_size, c)
     x = x.permute(0, 5, 1, 3, 2, 4).contiguous()
     return x.view(b, c, h, w)
 
@@ -140,6 +137,17 @@ def window_partition_video(x, window_size):
     x = x.view(b, t, c, h // window_size, window_size, w // window_size, window_size)
     x = x.permute(0, 3, 5, 1, 4, 6, 2).contiguous()
     return x.view(b, -1, t * window_size * window_size, c)
+
+
+def window_reverse_video(windows, window_size, t, h, w):
+    b, nw, tokens, c = windows.shape
+    x = windows.view(b, h // window_size, w // window_size, t, window_size, window_size, c)
+    x = x.permute(0, 3, 6, 1, 4, 2, 5).contiguous()
+    return x.view(b, t, c, h, w)
+
+
+def safe_divide(x, y, eps=1e-6):
+    return x / (y + eps)
 
 
 def pairwise_cosine_logits(center, neighbors):

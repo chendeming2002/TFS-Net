@@ -1,11 +1,10 @@
 """
-TFSNetLoss — RMS-RWKV Bravo 损失函数
-======================================
-Bravo P2: BVI-Lowlight (arXiv 2024) 风格重新加权
-  - L1:       λ=1.0 → 0.3 (L1 对未对齐最敏感, 降权)
-  - VGG Perceptual: λ=0.2 → 0.8 (占主导, 容错对齐偏差)
-  - SSIM:    λ=0.1 → 0.5 (最佳容错)
-  - Focal Frequency: λ=0.2 (FAN IET IP 2025 新增)
+TFSNetLoss — RWKV-Bravo 损失函数
+=================================
+Bravo 相对于 v6 的损失改进:
+  P0-1: lambda_pix 降权 (默认 0.3), 避免过度依赖 L1
+  P2:   焦点频率损失 — freq_with_phase + freq_phase_weight 可配
+  P2:   加权 MSE — 低频 mask 高权重, 高频 mask 低权重 (weighted_mse)
 """
 
 import warnings
@@ -52,7 +51,7 @@ class PerceptualLoss(nn.Module):
         self.multilayer = multilayer
         if not self.enabled:
             self.features = None
-            warnings.warn("torchvision not available, perceptual loss will be zero.")
+            warnings.warn("torchvision unavailable, perceptual loss = 0.")
             return
         weights = None
         if pretrained and VGG16_Weights is not None:
@@ -64,7 +63,7 @@ class PerceptualLoss(nn.Module):
             backbone = vgg16(weights=weights)
         except Exception:
             backbone = vgg16(weights=None)
-            warnings.warn("Unable to load pretrained VGG16, using random init.")
+            warnings.warn("Using randomly initialized VGG16 for perceptual loss.")
 
         if multilayer:
             self.layer1 = backbone.features[:4]
@@ -90,6 +89,7 @@ class PerceptualLoss(nn.Module):
             return pred.new_tensor(0.0)
         pred_norm = (pred - self.mean) / self.std
         target_norm = (target - self.mean) / self.std
+
         if self.multilayer and self.layer1 is not None:
             f1_pred = self.layer1(pred_norm)
             f1_tgt = self.layer1(target_norm)
@@ -107,27 +107,22 @@ class PerceptualLoss(nn.Module):
             return F.l1_loss(feat_pred, feat_target)
 
 
-def charbonnier_loss(pred, target, eps=1e-6):
+def charbonnier_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return torch.mean(torch.sqrt((pred - target) ** 2 + eps))
 
 
 class TFSNetLoss(nn.Module):
-    """
-    Bravo P2 默认权重 (BVI-Lowlight arXiv 2024 + FAN 2025):
-      lambda_pix=0.3, lambda_perc=0.8, lambda_ssim=0.5, lambda_focal=0.2
-    """
-
     def __init__(
         self,
         use_freq_loss: bool = True,
         perceptual_pretrained: bool = False,
-        # Bravo P2 默认值:
-        lambda_pix: float = 1.0,
         lambda_perc: float = 0.1,
         lambda_freq: float = 0.1,
         lambda_illum: float = 0.001,
         lambda_ssim: float = 0.2,
         lambda_inter: float = 0.3,
+        lambda_aux: float = 0.0,
+        fused_channels: int = 64,
         lambda_illum_sup: float = 0.1,
         lambda_noise_sup: float = 0.05,
         lambda_recon: float = 0.5,
@@ -136,29 +131,29 @@ class TFSNetLoss(nn.Module):
         freq_with_phase: bool = True,
         freq_phase_weight: float = 0.5,
         lambda_ifpn_sup: float = 0.0,
-        # Bravo P2 新增
-        lambda_focal: float = 0.2,
+        # Bravo P0-1: 像素损失降权
+        lambda_pix: float = 1.0,
     ):
         super().__init__()
         self.use_freq_loss = use_freq_loss
-        self.lambda_pix = lambda_pix
         self.lambda_perc = lambda_perc
         self.lambda_freq = lambda_freq
         self.lambda_illum = lambda_illum
         self.lambda_ssim = lambda_ssim
         self.lambda_inter = lambda_inter
+        self.lambda_recon = lambda_recon
         self.lambda_illum_sup = lambda_illum_sup
         self.lambda_noise_sup = lambda_noise_sup
         self.noise_tau_high = noise_tau_high
         self.freq_with_phase = freq_with_phase
         self.freq_phase_weight = freq_phase_weight
         self.lambda_ifpn_sup = lambda_ifpn_sup
-        self.lambda_focal = lambda_focal
+        self.lambda_pix = lambda_pix
 
         self.perceptual = PerceptualLoss(pretrained=perceptual_pretrained, multilayer=perc_multilayer)
 
     @staticmethod
-    def _edge_aware_smooth(s, ref_img):
+    def _edge_aware_smooth(s: torch.Tensor, ref_img: torch.Tensor) -> torch.Tensor:
         grad_s_x = (s[:, :, :, 1:] - s[:, :, :, :-1]).abs()
         grad_s_y = (s[:, :, 1:, :] - s[:, :, :-1, :]).abs()
         grad_i_x = (ref_img[:, :, :, 1:] - ref_img[:, :, :, :-1]).abs().mean(dim=1, keepdim=True)
@@ -166,19 +161,7 @@ class TFSNetLoss(nn.Module):
         loss = (grad_s_x * torch.exp(-grad_i_x)).mean() + (grad_s_y * torch.exp(-grad_i_y)).mean()
         return loss
 
-    @staticmethod
-    def _focal_freq_loss(pred, target, sigma=0.1):
-        """
-        Bravo P2: Focal Frequency Loss (FAN IET IP 2025)
-        对频率域中差异大的区域 (边缘/纹理) 施加更大权重.
-        """
-        fft_pred = torch.fft.rfft2(pred, norm='ortho')
-        fft_tgt = torch.fft.rfft2(target, norm='ortho')
-        freq_diff = (fft_pred.abs() - fft_tgt.abs()).abs()
-        weight = (1.0 - torch.exp(-sigma * freq_diff.detach())) + 1.0
-        return (weight * freq_diff).mean()
-
-    def forward(self, outputs, target):
+    def forward(self, outputs: dict, target: torch.Tensor):
         pred = outputs["res_t"]
         s_illum = outputs["s_illum"]
         s_noise = outputs["s_noise"]
@@ -198,15 +181,12 @@ class TFSNetLoss(nn.Module):
         else:
             L_freq = pred.new_tensor(0.0)
 
-        # (2b) Bravo P2: Focal Frequency Loss
-        L_focal = self._focal_freq_loss(pred, target)
-
-        L_recon_base = self.lambda_pix * L_pix + self.lambda_freq * L_freq + self.lambda_focal * L_focal
+        L_recon_base = self.lambda_pix * L_pix + self.lambda_freq * L_freq
 
         # (3) SSIM
         L_ssim = 1.0 - ssim_map(pred, target).mean()
 
-        # (4) Perceptual
+        # (4) 感知
         L_perc = self.perceptual(pred, target)
 
         # (5) 光照平滑
@@ -231,13 +211,13 @@ class TFSNetLoss(nn.Module):
                 s_noise_target = torch.clamp(1.0 - snr_scalar / self.noise_tau_high, 0.0, 1.0).detach()
                 L_noise_sup = F.l1_loss(s_noise, s_noise_target)
 
-        # (6) 中间监督
+        # (6) 中间监督 (乘法路径)
         L_inter = pred.new_tensor(0.0)
         if self.lambda_inter > 0 and "img_s2" in outputs and "lit_up_map" in outputs:
             img_s2_lit = torch.clamp(outputs["img_s2"] * outputs["lit_up_map"], 0.0, 1.0)
             L_inter = charbonnier_loss(img_s2_lit, target)
 
-        # (7) IFPN 侧监督
+        # (7) IFPN 中间监督
         L_ifpn_sup = pred.new_tensor(0.0)
         if self.lambda_ifpn_sup > 0 and "ifpn_side" in outputs:
             ifpn_side = outputs["ifpn_side"]
@@ -256,16 +236,10 @@ class TFSNetLoss(nn.Module):
         )
 
         loss_dict = {
-            "loss_total": L_total.detach(),
-            "loss_pix": L_pix.detach(),
-            "loss_freq": L_freq.detach(),
-            "loss_focal": L_focal.detach(),
-            "loss_ssim": L_ssim.detach(),
-            "loss_perc": L_perc.detach(),
-            "loss_illum": L_illum_smooth.detach(),
-            "loss_illum_sup": L_illum_sup.detach(),
-            "loss_noise_sup": L_noise_sup.detach(),
-            "loss_inter": L_inter.detach(),
-            "loss_ifpn_sup": L_ifpn_sup.detach(),
+            "loss_total": L_total.detach(), "loss_pix": L_pix.detach(),
+            "loss_freq": L_freq.detach(), "loss_ssim": L_ssim.detach(),
+            "loss_perc": L_perc.detach(), "loss_illum": L_illum_smooth.detach(),
+            "loss_illum_sup": L_illum_sup.detach(), "loss_noise_sup": L_noise_sup.detach(),
+            "loss_inter": L_inter.detach(), "loss_ifpn_sup": L_ifpn_sup.detach(),
         }
         return L_total, loss_dict

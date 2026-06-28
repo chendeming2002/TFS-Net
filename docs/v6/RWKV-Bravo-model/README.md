@@ -12,4 +12,4 @@ Bravo 版本是对 v6.5 (PureRWKV + DWT-LFF) 的四部分系统性重整：
 - `use_dwt_lff=True`（强制，双实例 DWT-LFF：center α=0.6 / neighbor α=0.4）
 - 移除 `AmpEnhance`（Encoder 前 FFT 幅度增强废弃）
 - 移除 `DeformableCrossAttention`（由 PureRWKVSACE 替代）
-- 损失默认权重：`λ_pix=0.3`, `λ_perc=0.8`, `λ_ssim=0.5`, `λ_focal=0.2`
+- 损失默认权重：`λ_pix=0.3`, `λ_perc=0.8`, `λ_ssim=0.5`
