@@ -28,6 +28,7 @@ from models.modules.mrpn import MRPN
 from models.modules.igrf import IGRF
 from models.modules.amp_enhance import AmpEnhance
 from models.modules.dwt_lff import SpatialDWTLFFAdapter
+from models.modules.pure_rwkv_sace import PureRWKVSACE
 
 
 class TFSNet(nn.Module):
@@ -58,6 +59,7 @@ class TFSNet(nn.Module):
         use_soft_median: bool = True,
         use_cross_rwkv: bool = False,
         use_dwt_lff: bool = False,
+        use_pure_rwkv: bool = False,
         use_nafblock: bool = False,
         num_bottleneck_blocks: int = 0,
         num_igrf_res_blocks: int = 2,
@@ -98,23 +100,31 @@ class TFSNet(nn.Module):
             dwt_lff=dwt_lff_module,
         )
 
-        # Stage 2: SACE
-        # share_lff=True: 共享 TFSI 的 DWT-LFF 或传统 LFF
+        # Stage 2: SACE / PureRWKVSACE
         if use_dwt_lff:
-            shared_lff = dwt_lff_module  # SpatialDWTLFFAdapter 共享
+            shared_lff = dwt_lff_module
         else:
-            shared_lff = self.tfsi.freq_branch.lff if share_lff else None  # LFFFeatureAdapter 共享
-        self.sace = SACE(
-            channels=fused_channels,
-            n_groups=n_groups,
-            kernel_size=kernel_size,
-            use_optimized=True,
-            lff_module=shared_lff,
-            phase_preserving=sace_phase_preserving,
-            offset_use_norm=sace_offset_use_norm,
-            offset_kaiming_init=sace_offset_kaiming_init,
-            use_cross_rwkv=use_cross_rwkv,
-        )
+            shared_lff = self.tfsi.freq_branch.lff if share_lff else None
+
+        if use_pure_rwkv:
+            # v6.5: 纯 RWKV 多尺度帧间注意力 (移除 DAT)
+            self.sace = PureRWKVSACE(
+                channels=fused_channels,
+                lff_module=shared_lff,
+                n_layer=1,
+            )
+        else:
+            self.sace = SACE(
+                channels=fused_channels,
+                n_groups=n_groups,
+                kernel_size=kernel_size,
+                use_optimized=True,
+                lff_module=shared_lff,
+                phase_preserving=sace_phase_preserving,
+                offset_use_norm=sace_offset_use_norm,
+                offset_kaiming_init=sace_offset_kaiming_init,
+                use_cross_rwkv=use_cross_rwkv,
+            )
 
         # Stage 3: 三源恢复分支
         self.ifpn = IFPN(

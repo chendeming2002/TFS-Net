@@ -447,7 +447,8 @@ L_total = L_pix + λ_freq·L_freq + λ_ssim·L_ssim + λ_perc·L_perc
 | v6.1 | Cross-RWKV 初版：Python for-loop Bi-WKV + concat Q-Shift | 1.22M | ❌ 随机权重破坏预训练特征 |
 | v6.2 | VRWKVStyleSpatialMix 严格版 + soft-median移除 + DWT-LFF初版 | 1.18M | ❌ FFT域 + RBF存在问题 |
 | v6.3 | DWT-LFF 互补幅度设计（v6-Alpha 初诊） | 1.18M | ❌ 减法可负 + bilinear上采样破坏HF |
-| **v6.4** | **空间域 α 软分配 + IDWT 重建** | **1.17M** | ✅ 训练中 |
+| **v6.4** | **空间域 α 软分配 + IDWT 重建** | **1.17M** | ✅ 训练完成 | ep5 PSNR=19.56, SSIM=0.767, illum=0.017 |
+| **v6.5** | **纯 RWKV 多尺度帧间注意力 (移除 DAT)** | **1.17M** | ✅ 训练完成 | ep30 PSNR=20.355, SSIM=0.768, 追平 v5.9.2 |
 
 ### v6.4 vs v6.3 修正点
 
@@ -457,6 +458,73 @@ L_total = L_pix + λ_freq·L_freq + λ_ssim·L_ssim + λ_perc·L_perc
 | FFT 域 Conv 破坏局部性 | 🔴 TFSI 无法诊断 per-pixel | — | Conv3×3 空间域 |
 | bilinear 上采样丢失 HF | — | 🔴 下游模块无真实高频 | IDWT 重构 |
 | feat_sace 缺 LN | 🟡 Q-Shift 通道分布不稳定 | — | LayerNorm |
+
+### v6.5：纯 RWKV 多尺度帧间注意力（移除 DAT）
+
+设计参考：`docs/v6/pureRWKV.md`（基于 9 篇 CCF A/B 论文的系统分析）
+
+**核心改动**：完全移除 DeformableCrossAttention (130K 参数)，用 `PureRWKVSACE` 替代原始 `SACE`。
+
+**文件**: `models/modules/pure_rwkv_sace.py`
+
+**架构**:
+```
+feats (B,T,C,H,W)
+  → DWT-LFF 逐帧 → lff_stack
+  → 展平为 token: (B,T,H×W,C)
+  → 多尺度双向 RWKV (ABMamba AHBS: M=3, stride=2):
+      full:     VRWKVStyleSpatialMix(5帧, H×W)    ×2 (双向)
+      half:     avg_pool3d(LFF) → RWKV(5帧, H/2×W/2) ×2 → 上采样
+      quarter:  avg_pool3d(LFF) → RWKV(5帧, H/4×W/4) ×2 → 上采样
+  → 跨尺度平均聚合: out = (full + half + quarter) / 3
+  → 边缘门控残差 (Video RWKV LCR):
+      edge_weight = sigmoid(depthwise Conv(LFF_center))
+      F_aligned[t] = out[t] + (1-edge_weight)·LFF[t] + (1-s_noise)·LFF[t]
+```
+
+**设计模式对照**:
+
+| 范式 | 论文来源 | v6.5 实现 |
+|---|---|---|
+| 双向扫描 | ABMamba / Otter TRM | `_bidirectional_scan()`: 前向 + 反向 → 平均 |
+| 多尺度时序 | ABMamba AHBS (M=3, stride=2) | 3 个 VRWKVStyleSpatialMix (full/half/quarter) |
+| 帧间门控 | Video RWKV LCR edge prompt | `self.edge_prompt`: depthwise Conv → sigmoid 门控 |
+| 预处理对齐 | 自有 (DWT-LFF) | SpatialDWTLFFAdapter 光照归一化 |
+
+### v6.5 实验结果
+
+**SDSD 验证曲线**:
+
+| Ep | PSNR | SSIM | 说明 |
+|---|---|---|---|
+| 5 | 19.74 | 0.7620 | 纯 RWKV 起步即优于 v6.4 ep5 (19.56) |
+| 10 | 19.54 | 0.7631 | — |
+| 15 | 19.06 | 0.7592 | 适应低谷 (RWKV 学习多尺度对齐) |
+| 20 | 20.07 | 0.7676 | **突破 20 dB** |
+| 25 | 20.32 | 0.7689 | — |
+| **30** | **20.36** | 0.7684 | **★ PEAK** |
+
+**全实验对比**:
+
+| 实验 | 最佳 PSNR | SSIM | 参数量 | 注意力 | 说明 |
+|---|---|---|---|---|---|
+| v5.5 | 19.23 | 0.7590 | 1.12M | DAT | fuse 死亡基线 |
+| v5.9.1 | 20.11 | 0.7714 | 1.12M | DAT | fuse 修复 |
+| v5.9.2 | 20.39 | 0.7752 | 1.14M | DAT | s_illum 复生 |
+| v6.5 | **20.36** | 0.7684 | 1.17M | **纯 RWKV** | 移除 DAT |
+| v6.4 | 19.56 | 0.7673 | 1.17M | DAT+RWKV | ep5 仅 |
+
+**关键结论**: v6.5 的 PSNR=20.36 仅比 v5.9.2 (DAT) 差 0.03 dB，基本追平。证明 **多尺度双向 RWKV 可等效替代可变形采样对齐**，且参数量仅增加 2.6%。
+
+### 待消融测试
+
+| 消融项 | 方法 | 预期收益 |
+|---|---|---|
+| **多尺度有效性** | 去掉 half/quarter (只保留 full) | 验证多尺度的贡献 |
+| **双向扫描有效性** | 去掉反向扫描 (只保留单向) | 验证双向的必要性 |
+| **边缘门控有效性** | 去掉 edge_prompt | 验证门控的贡献 |
+| **v6.5 续训** | 训练到 50-100 epoch | 与 v5.9.2 同训练量比较 |
+| **v6.5 + s_illum 监督增强** | λ_illum_sup 提升到 0.05 | s_illum 复生后可加大监督力度 |
 
 ---
 
@@ -479,3 +547,62 @@ L_total = L_pix + λ_freq·L_freq + λ_ssim·L_ssim + λ_perc·L_perc
 | Vision-RWKV | `reference_repos/Vision-RWKV/` | Q-Shift, SpatialMix, fancy init |
 | MINS-Net | `reference_repos/MINS-Net/` | EntropyGate |
 | DarkIR | `reference_repos/DarkIR/` | EnhanceLoss, FreMLP |
+
+---
+
+## 8. 实验记录
+
+### 8.1 v6.4 ep5 验证
+
+| 指标 | v6.4 ep5 | v5.9.2 ep5 | 对比 |
+|---|---|---|---|
+| **PSNR** | **19.562** | 19.610 | -0.05 dB |
+| **SSIM** | **0.7673** | 0.7595 | **+0.008** |
+| s_illum mean | 0.820 | 0.0001 | 极活跃 |
+| s_noise mean | 0.946 | 0.0000 | 极活跃 |
+| illum (edge smoothness) | 0.017 | 0.016 | 持平 |
+| loss | 0.248 | 0.237 | +0.011 |
+
+**关键发现**：v6.4 ep5 PSNR 接近 v5.9.2（仅差 0.05 dB），SSIM 反而更高（+0.008）。空间域 DWT-LFF 改善了结构保持。s_illum/s_noise 极度活跃（0.82/0.95），说明 DWT-LFF 的 α 残差给 TFSI 提供了丰富的退化诊断信号。模型仍处适应期（ep5≈v5.9.2 的 26% — 30 epoch vs 50 epoch），预期继续改善。
+
+### 8.2 SACE 三路贡献诊断（ep5 best.pth）
+
+| 路径 | L2 norm | 占比 |
+|---|---|---|
+| **DeformAttn** (可变形采样对齐) | 812.53 | **77%** |
+| F_residual (kv skip, F_lff 路径) | 236.10 | 23% |
+| Total (pre-RWKV) | 1048.63 | 100% |
+| **RWKV relative change** | — | **40.87%** |
+
+**结论**：DeformAttn 仍是 SACE 对齐的主力（77%），F_lff 残差占 23%。RWKV 产生了 40.87% 的相对变化——显著活跃，正在学习多帧长程关系。alpha 零初始化后 epoch 5 能达到 41% 说明 RWKV 学习速度快。
+
+---
+
+## 9. 纯 RWKV 替代 DAT 可行性评估
+
+**参考文档**: `docs/v6/pureRWKV.md`（基于 9 篇 CCF A/B 论文的系统分析）
+
+### 9.1 文档设计方案
+
+pureRWKV.md 提出 v6.5 **纯 RWKV 架构**：移除 DeformableCrossAttention（130K 参数），用多尺度双向 RWKV + 边缘门控替代。
+
+核心改动：
+```
+旧：feats → DWT-LFF → DeformAttn → CrossRWKV → F_aligned
+新：feats → DWT-LFF → 多尺度 Bi-RWKV(3 路) + 边缘门控 → F_aligned
+```
+
+### 9.2 文档自身的判据
+
+| 判据 | v6.4 实测 | 阈值 | 结论 |
+|---|---|---|---|
+| DAT 能量占比 | **77%** | < 60% | ❌ 不满足 |
+| DAT offset 范数 | — | < 2px | 待测 |
+
+> 文档 §3 诊断标准原文：**"如果 DAT 能量占比 > 60%，则 ❌ DAT 是关键模块，保留"**
+
+### 9.3 结论：暂不实施 v6.5
+
+根据 v6.4 ep5 实测数据，DAT 占比 77% 远超 60% 阈值。**按文档自身标准，DAT 不可移除**。v6.4 的"DeformAttn + RWKV"混合架构是正确的选择。
+
+建议：等 v6.4 跑完 30 epoch 后重新评估。若 DAT 占比随训练下降（RWKV 逐步接管），则 v6.5 仍有意义。

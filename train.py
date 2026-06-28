@@ -110,6 +110,7 @@ def build_model(cfg, device):
         use_soft_median=model_cfg.get("use_soft_median", True),
         use_cross_rwkv=model_cfg.get("use_cross_rwkv", False),
         use_dwt_lff=model_cfg.get("use_dwt_lff", False),
+        use_pure_rwkv=model_cfg.get("use_pure_rwkv", False),
         use_nafblock=model_cfg.get("use_nafblock", False),
         num_bottleneck_blocks=model_cfg.get("num_bottleneck_blocks", 0),
         num_igrf_res_blocks=model_cfg.get("num_igrf_res_blocks", 2),

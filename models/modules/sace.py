@@ -323,6 +323,8 @@ class SACE(nn.Module):
         # Step 3: 逐帧可变形对齐
         attn_maps: List[Tuple[torch.Tensor, torch.Tensor]] = []
         F_aligned_list: List[torch.Tensor] = []
+        F_deform_only: List[torch.Tensor] = []  # v6.4 诊断: deform 单独输出
+        F_residual_kv: List[torch.Tensor] = []  # v6.4 诊断: kv 残差
 
         q_norm = self.norm_q(mu_t_clean)
 
@@ -331,28 +333,45 @@ class SACE(nn.Module):
             kv_norm = self.norm_kv(kv)
 
             offset, mask = self.offset_mask_head(q_norm, kv_norm)
-            f_aligned = self.deform_attn(q_norm, kv_norm, offset, mask)
-            # M3: 噪声感知残差门控 — 高噪区抑制残差(噪声), 低噪区保留信息流
+            f_deform = self.deform_attn(q_norm, kv_norm, offset, mask)
+            F_deform_only.append(f_deform.detach())
+            # M3: 噪声感知残差门控
             if s_noise is not None:
-                f_aligned = f_aligned + (1.0 - s_noise) * kv
+                f_residual = (1.0 - s_noise) * kv
             else:
-                f_aligned = f_aligned + kv  # 残差 (向后兼容: tfsi_out 未提供时)
+                f_residual = kv
+            F_residual_kv.append(f_residual.detach())
+            f_aligned = f_deform + f_residual
 
             attn_maps.append((offset, mask))
             F_aligned_list.append(f_aligned)
 
-        # v6: Cross-RWKV Gate — deformable 对齐后做多帧长程聚合
+        # v6.4 诊断: 记录 deform/RWKV/residual 三路 L2 norm
+        deform_norms = torch.stack([f.norm() for f in F_deform_only])  # (T,)
+        resid_norms = torch.stack([f.norm() for f in F_residual_kv])   # (T,)
+
+        # v6: Cross-RWKV Gate
+        F_before_rwkv = [f.clone() for f in F_aligned_list]  # snapshot before RWKV
         if self.cross_rwkv is not None:
             F_aligned_list = self.cross_rwkv(
                 query=mu_t_clean,
                 frames=F_aligned_list,
                 s_noise=s_noise,
             )
+        # v6.4 诊断: RWKV relative contribution = ||after - before|| / ||after||
+        rwkv_diff = torch.stack([
+            (F_aligned_list[i] - F_before_rwkv[i]).norm() / (F_aligned_list[i].norm() + 1e-8)
+            for i in range(T)
+        ])  # (T,) — RWKV relative change
 
         return {
-            "attn_maps":       attn_maps,
-            "mu_t_clean":      mu_t_clean,
-            "sigma_t_clean":   sigma_t_clean,
-            "F_aligned_list":  F_aligned_list,
-            "lff_feats":       lff_feats,
+            "attn_maps":        attn_maps,
+            "mu_t_clean":       mu_t_clean,
+            "sigma_t_clean":    sigma_t_clean,
+            "F_aligned_list":   F_aligned_list,
+            "lff_feats":        lff_feats,
+            # v6.4 诊断
+            "diag_deform_norm":  deform_norms.mean(),
+            "diag_resid_norm":   resid_norms.mean(),
+            "diag_rwkv_change":  rwkv_diff.mean(),
         }
