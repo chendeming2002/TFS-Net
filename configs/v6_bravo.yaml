@@ -25,13 +25,13 @@ model:
   use_pure_rwkv: true
 train:
   batch_size: 2
-  epochs: 30
-  lr: 0.0008
+  epochs: 50
+  lr: 0.001
   weight_decay: 0.0001
   amp: false
   log_interval: 50
   val_interval: 5
-  warmup_epochs: 0
+  warmup_epochs: 5
   grad_clip: 0.5
 loss:
   type: TFSNetLoss
