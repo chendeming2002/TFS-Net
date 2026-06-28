@@ -1,0 +1,51 @@
+seed: 42
+output_dir: outputs/sdsd_v6_bravo
+dataset:
+  train_input_root: /data/SDSD/indoor/input
+  train_target_root: /data/SDSD/indoor/GT
+  val_input_root: /data/SDSD/test/low-light
+  val_target_root: /data/SDSD/test/GT
+  window_size: 5
+  crop_size: 256
+  num_workers: 4
+model:
+  type: TFSNet
+  in_channels: 3
+  level_channels: [32, 64, 96]
+  fused_channels: 64
+  use_soft_clamp: false
+  use_soft_median: true
+  use_nafblock: false
+  num_bottleneck_blocks: 0
+  num_igrf_res_blocks: 2
+train:
+  batch_size: 2
+  epochs: 30
+  lr: 0.0008
+  weight_decay: 0.0001
+  amp: false
+  log_interval: 50
+  val_interval: 5
+  warmup_epochs: 0
+  grad_clip: 0.5
+loss:
+  type: TFSNetLoss
+  use_freq_loss: true
+  perceptual_pretrained: true
+  lambda_perc: 0.8
+  lambda_freq: 0.05
+  lambda_illum: 0.001
+  lambda_ssim: 0.5
+  lambda_inter: 0.2
+  lambda_illum_sup: 0.02
+  lambda_noise_sup: 0.0
+  lambda_pix: 0.3
+  lambda_focal: 0.2
+  perc_multilayer: false
+  freq_with_phase: true
+  freq_phase_weight: 0.5
+  lambda_ifpn_sup: 0.0
+eval:
+  tile_size: 256
+  tile_overlap: 32
+  amp: false
