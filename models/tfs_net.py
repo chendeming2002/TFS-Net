@@ -87,32 +87,31 @@ class TFSNet(nn.Module):
             num_bottleneck_blocks=num_bottleneck_blocks,
         )
 
-        # v6.2: DWT-LFF — 小波多频段解耦, 解决 TFSI/SACE 共享 LFF 矛盾
+        # v6 Bravo: DWT-LFF — TFSI 用 center (α=0.6 锚定), SACE 自建双实例
         self.use_dwt_lff = use_dwt_lff
-        dwt_lff_module = SpatialDWTLFFAdapter(in_channels=fused_channels) if use_dwt_lff else None
+        if use_dwt_lff:
+            dwt_lff_tfsi = SpatialDWTLFFAdapter(in_channels=fused_channels, alpha_init=0.6)
+        else:
+            dwt_lff_tfsi = None
 
-        # Stage 1: TFSI (支持 DWT-LFF 或传统 LFF)
+        # Stage 1: TFSI
         self.tfsi = TFSI(
             channels=fused_channels,
             fused_channels=fused_channels,
             eps=eps,
             use_soft_median=use_soft_median,
-            dwt_lff=dwt_lff_module,
+            dwt_lff=dwt_lff_tfsi,
         )
 
         # Stage 2: SACE / PureRWKVSACE
-        if use_dwt_lff:
-            shared_lff = dwt_lff_module
+        if use_dwt_lff and not use_pure_rwkv:
+            shared_lff = dwt_lff_tfsi
         else:
             shared_lff = self.tfsi.freq_branch.lff if share_lff else None
 
         if use_pure_rwkv:
-            # v6.5: 纯 RWKV 多尺度帧间注意力 (移除 DAT)
-            self.sace = PureRWKVSACE(
-                channels=fused_channels,
-                lff_module=shared_lff,
-                n_layer=1,
-            )
+            # v6.5: 纯 RWKV (内部自建双 DWT-LFF 实例 + Bravo V raw)
+            self.sace = PureRWKVSACE(channels=fused_channels, n_layer=1)
         else:
             self.sace = SACE(
                 channels=fused_channels,

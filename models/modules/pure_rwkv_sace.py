@@ -44,12 +44,17 @@ class PureRWKVSACE(nn.Module):
         super().__init__()
         self.channels = channels
 
-        # DWT-LFF (共享, 传入)
+        # v6 Bravo P1-2: DWT-LFF 拆为中心/邻居双实例 (VSRELL + STCD)
+        # 中心帧 α=0.6 (偏 LL_ref → 干净锚定)
+        # 邻居帧 α=0.4 (偏 LL_deg → 退化诊断)
+        self.lff_center = SpatialDWTLFFAdapter(in_channels=channels, alpha_init=0.6)
+        self.lff_neighbor = SpatialDWTLFFAdapter(in_channels=channels, alpha_init=0.4)
+
+        # 兼容旧接口: lff_module 传入时仍可用
+        self._lff_external = lff_module is not None
         if lff_module is not None:
-            self.lff = lff_module
-        else:
-            self.lff = LFFFeatureAdapter(channels=channels, K=10, n_ang_freq=1,
-                                         per_channel_rbf=False, phase_preserving=True)
+            self.lff_center = lff_module
+            self.lff_neighbor = lff_module
 
         # 1️⃣ 多尺度 RWKV (ABMamba AHBS: M=3, stride=2)
         self.rwkv_full = VRWKVStyleSpatialMix(channels, num_frames=5,
@@ -87,13 +92,18 @@ class PureRWKVSACE(nn.Module):
         B, T, C, H, W = feats.shape
         device = feats.device
 
-        # === Step 1: 逐帧 DWT-LFF ===
+        # === Step 1: 逐帧 DWT-LFF (中心/邻居分支分离) ===
         lff_feats: List[torch.Tensor] = []
+        center_idx = T // 2
         for t in range(T):
             if cached_lff and t in cached_lff:
                 lff_feats.append(cached_lff[t])
             else:
-                lff_out = self.lff(feats[:, t])
+                # v6 Bravo P1-2: 中心帧走 lff_center, 邻居帧走 lff_neighbor
+                if t == center_idx:
+                    lff_out = self.lff_center(feats[:, t])
+                else:
+                    lff_out = self.lff_neighbor(feats[:, t])
                 if isinstance(lff_out, dict):
                     lff_feats.append(lff_out["feat_sace"])
                 else:
@@ -101,7 +111,7 @@ class PureRWKVSACE(nn.Module):
         lff_stack = torch.stack(lff_feats, dim=1)  # (B, T, C, H, W)
 
         # 中心帧参考
-        mu_t_clean = lff_stack[:, T // 2]
+        mu_t_clean = lff_stack[:, center_idx]
         sigma_t_clean = lff_stack.std(dim=1, unbiased=False)
         s_noise = tfsi_out.get("s_noise") if tfsi_out else None
 

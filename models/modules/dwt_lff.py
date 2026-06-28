@@ -59,12 +59,13 @@ class SpatialDWTLFFAdapter(nn.Module):
       4. LayerNorm → 适配 Cross-RWKV Q-Shift 通道分布
     """
 
-    def __init__(self, in_channels: int):
+    def __init__(self, in_channels: int, alpha_init: float = 0.5):
         super().__init__()
         self.in_channels = in_channels
+        self.alpha_init = alpha_init
         self.dwt = HaarDWT2D()
 
-        # 低频光照分离 α → 空间域 depthwise + pointwise (保留局部性)
+        # 低频光照分离 α
         self.illum_alpha = nn.Sequential(
             nn.Conv2d(in_channels, in_channels, 3, 1, 1, groups=in_channels, bias=False),
             nn.GELU(),
@@ -72,16 +73,18 @@ class SpatialDWTLFFAdapter(nn.Module):
             nn.Sigmoid(),
         )
 
-        # LayerNorm 适配 Cross-RWKV Q-Shift
+        # LayerNorm
         self.norm_sace = nn.LayerNorm(in_channels)
         self.norm_tfsi = nn.LayerNorm(in_channels)
 
-        # α init=0.5
+        # α init — bias = log(alpha_init / (1-alpha_init)) → sigmoid = alpha_init
         for m in self.illum_alpha.modules():
             if isinstance(m, nn.Conv2d) and m.kernel_size == (1, 1):
                 nn.init.constant_(m.weight, 0.0)
+                import math
+                init_val = math.log(max(alpha_init / max(1.0 - alpha_init, 1e-8), 1e-8))
                 if m.bias is not None:
-                    nn.init.constant_(m.bias, 0.0)
+                    nn.init.constant_(m.bias, init_val)
 
     def forward(self, x: torch.Tensor):
         """
