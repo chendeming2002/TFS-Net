@@ -141,6 +141,8 @@ def build_loss(cfg, device):
         freq_phase_weight=loss_cfg.get("freq_phase_weight", 0.5),
         # v5.9.2
         lambda_ifpn_sup=loss_cfg.get("lambda_ifpn_sup", 0.0),
+        # v6 Bravo P0-1
+        lambda_pix=loss_cfg.get("lambda_pix", 1.0),
     )
     return criterion.to(device)
 
@@ -300,7 +302,16 @@ def main():
                     remapped_key = ".".join(parts[:i + 2] + parts[i + 3:])
                     break
             remapped[remapped_key] = v
-        model.load_state_dict(remapped, strict=False)
+        # Filter size-mismatched keys (for architecture changes like phase_conf)
+        filtered = {}
+        for k, v in remapped.items():
+            if k in model.state_dict():
+                if model.state_dict()[k].shape != v.shape:
+                    logger.warning("Skipping size-mismatched key: %s (ckpt %s != model %s)", 
+                                   k, list(v.shape), list(model.state_dict()[k].shape))
+                    continue
+            filtered[k] = v
+        model.load_state_dict(filtered, strict=False)
         if "optimizer" in ckpt:
             try:
                 optimizer.load_state_dict(ckpt["optimizer"])
@@ -327,7 +338,15 @@ def main():
                     remapped_key = ".".join(parts[:i + 2] + parts[i + 3:])
                     break
             remapped[remapped_key] = v
-        missing_keys, unexpected = model.load_state_dict(remapped, strict=False)
+        # Filter size-mismatched keys
+        filtered = {}
+        for k, v in remapped.items():
+            if k in model.state_dict():
+                if model.state_dict()[k].shape != v.shape:
+                    logger.warning("Skipping size-mismatched key: %s", k)
+                    continue
+            filtered[k] = v
+        missing_keys, unexpected = model.load_state_dict(filtered, strict=False)
         logger.info("Loaded pretrained weights from %s (missing=%d, unexpected=%d)", args.pretrained, len(missing_keys), len(unexpected))
 
     for epoch in range(start_epoch, total_epochs):

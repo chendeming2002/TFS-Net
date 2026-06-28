@@ -224,6 +224,8 @@ class TFSNetLoss(nn.Module):
         freq_phase_weight: float = 0.5,
         # v5.9.2 新增
         lambda_ifpn_sup: float = 0.0,
+        # v6 Bravo P0-1 新增
+        lambda_pix: float = 1.0,
     ):
         super().__init__()
         self.use_temporal = use_temporal
@@ -233,7 +235,7 @@ class TFSNetLoss(nn.Module):
         self.lambda_illum = lambda_illum
         self.lambda_ssim = lambda_ssim
         self.lambda_inter = lambda_inter
-        self.lambda_recon = lambda_recon  # kept for backward compat, not used
+        self.lambda_recon = lambda_recon
         # v5.6
         self.lambda_illum_sup = lambda_illum_sup
         self.lambda_noise_sup = lambda_noise_sup
@@ -242,6 +244,8 @@ class TFSNetLoss(nn.Module):
         self.freq_phase_weight = freq_phase_weight
         # v5.9.2
         self.lambda_ifpn_sup = lambda_ifpn_sup
+        # v6 Bravo
+        self.lambda_pix = lambda_pix
 
         self.perceptual = PerceptualLoss(pretrained=perceptual_pretrained, multilayer=perc_multilayer)
 
@@ -292,7 +296,7 @@ class TFSNetLoss(nn.Module):
         else:
             L_freq = pred.new_tensor(0.0)
 
-        L_recon_base = L_pix + self.lambda_freq * L_freq
+        L_recon_base = self.lambda_pix * L_pix + self.lambda_freq * L_freq
 
         # (3) SSIM 损失
         L_ssim = 1.0 - ssim_map(pred, target).mean()

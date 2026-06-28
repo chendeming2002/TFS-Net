@@ -197,27 +197,30 @@ class IntensityHead(nn.Module):
     """
     TFSI 双源独立强度输出头 (v5: 移除 s_motion)
 
-    v5.6: 回退到 v5.5 单层 Conv1x1 + Sigmoid。P1-6 加深版（Conv→LN→GELU→Conv）
-    在实证中未阻止 s_illum 塌缩, 反而增加过拟合风险。
-
-    公式：
-        [s_illum, s_noise] = σ(Conv1x1(F_fused))
-        每个 s_* ∈ [0,1]，独立 Sigmoid，允许多源叠加（物理正确）
+    v6 Bravo: 新增 phase_conf 通道 — 相位置信度估计
+      低光视频相位 = 结构 + 运动模糊 + 噪声扭曲 (FDN 2025 + FAN 2025 + FourierDiff 2024)
+      相位置信度低 → s_noise 应提高 (不可靠区域增加去噪力度)
     """
 
     def __init__(self, fused_channels: int, hidden_channels: int = 32):
         super().__init__()
-        self.conv = nn.Conv2d(fused_channels, 2, 1, 1, 0)
+        self.conv = nn.Conv2d(fused_channels + 1, 2, 1, 1, 0)  # +1 for phase_conf
 
-    def forward(self, f_fused: torch.Tensor) -> dict:
-        raw = self.conv(f_fused)
+    def forward(self, f_fused: torch.Tensor, phase_conf: torch.Tensor = None) -> dict:
+        if phase_conf is not None:
+            f_input = torch.cat([f_fused, phase_conf], dim=1)
+        else:
+            # 向后兼容: phase_conf=None → 用零填充
+            f_input = torch.cat([f_fused, torch.zeros_like(f_fused[:, :1])], dim=1)
+        raw = self.conv(f_input)
         intensities = torch.sigmoid(raw)
         s_illum = intensities[:, 0:1]
         s_noise = intensities[:, 1:2]
-        return {
-            "s_illum": s_illum,
-            "s_noise": s_noise,
-        }
+        # Bravo: phase_conf 调制 s_noise — 相位不可靠 → 加强去噪
+        if phase_conf is not None:
+            s_noise = s_noise * (1.0 + 0.5 * (1.0 - phase_conf))
+            s_noise = s_noise.clamp(0.0, 1.0)
+        return {"s_illum": s_illum, "s_noise": s_noise}
 
 
 class TFSI(nn.Module):
@@ -258,6 +261,13 @@ class TFSI(nn.Module):
         )
         self.concat_fusion = ConcatFusion(fused_channels)
         self.intensity_head = IntensityHead(fused_channels)
+        # v6 Bravo: 相位置信度估计
+        self.phase_conf_head = nn.Sequential(
+            nn.Conv2d(fused_channels, fused_channels // 2, 3, 1, 1),
+            nn.GELU(),
+            nn.Conv2d(fused_channels // 2, 1, 1),
+            nn.Sigmoid(),
+        )
 
     def forward(self, feats: torch.Tensor) -> dict:
         """
@@ -292,8 +302,11 @@ class TFSI(nn.Module):
         # 拼接融合
         f_fused = self.concat_fusion(f_s, f_f)
 
-        # 强度输出
-        intensities = self.intensity_head(f_fused)
+        # v6 Bravo: 相位置信度 — 从频域特征估计相位可靠度
+        phase_conf = self.phase_conf_head(f_f)
+
+        # 强度输出 (phase_conf 调制 s_noise)
+        intensities = self.intensity_head(f_fused, phase_conf=phase_conf)
 
         return {
             "F_fused": f_fused,

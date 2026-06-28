@@ -135,17 +135,20 @@ class PureRWKVSACE(nn.Module):
         out = out_flat.reshape(B, T, H, W, C).permute(0, 1, 4, 2, 3)  # (B, T, C, H, W)
 
         # === Step 5: 边缘门控残差 (Video RWKV LCR) ===
-        edge_weight = self.edge_prompt(lff_stack[:, T // 2])  # (B, C, H, W)
+        # v6 Bravo P1: V 使用 Encoder 原始中心帧 (而非 DWT-LFF 归一化后)
+        # STCD: 对齐用归一化空间, 内容融合用原始空间
+        f_raw_center = feats[:, T // 2]  # (B, C, H, W) Encoder 原始中心帧
+        edge_weight = self.edge_prompt(f_raw_center)  # ★ 在原始特征上做边缘检测
 
         F_aligned_list: List[torch.Tensor] = []
         for t in range(T):
-            # 边缘门控: 高边缘区信任 RWKV 输出, 低边缘区回退到原始特征
-            f_t = out[:, t] + (1.0 - edge_weight) * lff_stack[:, t]
-            # 噪声感知残差
+            # RWKV 对齐输出 + 原始内容残差 (V source = encoder raw)
+            f_t = out[:, t] + (1.0 - edge_weight) * f_raw_center
+            # 噪声感知残差: 也在原始空间
             if s_noise is not None:
-                f_t = f_t + (1.0 - s_noise) * lff_stack[:, t]
+                f_t = f_t + (1.0 - s_noise) * f_raw_center
             else:
-                f_t = f_t + lff_stack[:, t]
+                f_t = f_t + f_raw_center
             f_t = self.norm_out(f_t)
             F_aligned_list.append(f_t)
 
