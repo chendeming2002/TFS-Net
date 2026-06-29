@@ -1,6 +1,6 @@
 """
-TFS-Net v3 — Three-source Fusion & Synthesis Network
-======================================================
+TFS-Net v3 / v6 Charlie — Three-source Fusion & Synthesis Network
+==================================================================
 端到端多帧低光增强网络。
 
 整体结构 (5 stages):
@@ -9,6 +9,13 @@ TFS-Net v3 — Three-source Fusion & Synthesis Network
     Stage 2: SACE                  可变形跨帧对齐 (与 TFSI 共享 LFF)
     Stage 3: IFPN/NDPN/MRPN        三源恢复分支 (光照/噪声/运动)
     Stage 4: IGRF                  强度引导残差融合 → 输出
+
+v6 Charlie 数据流 (charlie_mode=True):
+    TFSI → s_noise → NDNP (条件输入, Charlie P0)
+    TFSI → s_illum → IGRF Stage3 (保留)
+    SACE → sigma_t_clean → MRPN (Charlie P1: σ→MRPN)
+    SACE → sigma_sace → s_noise 调制 (Charlie P2: 噪声图来源)
+    IGRF ≠ s_noise (Charlie P0: IGRF 仅接收 s_illum)
 """
 
 from __future__ import annotations
@@ -64,6 +71,7 @@ class TFSNet(nn.Module):
         num_bottleneck_blocks: int = 0,
         num_igrf_res_blocks: int = 2,
         use_amp_enhance: bool = False,
+        charlie_mode: bool = False,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -71,6 +79,9 @@ class TFSNet(nn.Module):
         self.share_lff = share_lff
         # v5.5: 默认 3 级编码器, coarse_channels=96
         coarse_channels = level_channels[-1]  # 最粗层通道数
+
+        # v6 Charlie: 数据流路径重改 (Charlie-plan P0)
+        self.charlie_mode = charlie_mode
 
         # v5.9: AmpEnhance — 图像级频域幅度增强 (Encoder 前处理)
         self.use_amp_enhance = use_amp_enhance
@@ -252,13 +263,21 @@ class TFSNet(nn.Module):
             center_idx=center_idx,
         )
 
+        # Charlie P2: sigma_sace 调制 s_noise (TFSI 主 + SACE σ 辅)
+        # 高帧间方差 → 可能是运动而非噪声 → 降低 s_noise 置信度
+        if self.charlie_mode and s_noise is not None:
+            sigma_sace = sace_out["sigma_t_clean"].mean(dim=1, keepdim=True)  # (B, 1, H, W)
+            scale_sigma = torch.sigmoid(-sigma_sace * 2.0)  # 高σ → 低调制
+            s_noise = s_noise * scale_sigma  # Charlie P2: 噪声图来源调制
+
         mrpn_out = self.mrpn(
             F_aligned_list=F_aligned_list,
             center_idx=center_idx,
+            sigma_t_clean=sace_out["sigma_t_clean"] if self.charlie_mode else None,
         )
 
         # Stage 4: IGRF v5.5 - Denoise -> Motion -> Hybrid Brighten
-        # v5.5: s_illum/s_noise directly injected into IGRF (no channel dilution)
+        # Charlie P0: s_noise 移出 IGRF, 仅 NDNP 接收
         igrf_out = self.igrf(
             f_illum_feat=ifpn_out["f_illum_feat"],
             f_noise_out=ndpn_out["f_noise_out"],
@@ -266,7 +285,7 @@ class TFSNet(nn.Module):
             lit_up_map_raw=ifpn_out["lit_up_map_raw"],
             image_center=image_center,
             s_illum=s_illum,
-            s_noise=s_noise,
+            s_noise=None if self.charlie_mode else s_noise,
         )
 
         return {

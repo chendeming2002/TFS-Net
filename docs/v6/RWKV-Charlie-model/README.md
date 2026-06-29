@@ -13,8 +13,20 @@
 ```
 输入低光视频 → [Encoder] → [DWT-LFF 三源分离] → ┬─ TFSI (频域/噪声路径)
                                                     ├─ SACE (空域/结构路径, 3头并行)
-                                                    └→ Fusion → Cross-RWKV → Decoder → 增强输出
+                                                    └→ IFPN/NDPN/MRPN (三源并行处理)
+                                                       → IGRF (修正去噪) → 增强输出
 ```
+
+### Charlie 数据流改动 (已实施)
+
+| 优先级 | 改动 | 数据流 | 文件 |
+|--------|------|--------|------|
+| P0-1 | 多帧 FrequencyBranch | TFSI.temporal_fuse Conv3d | `models/modules/tfsi.py` |
+| P0-2 | s_noise → NDPN | IGRF 移除 s_noise; NDPN noise_proj | `models/tfs_net.py`, `models/modules/ndpn.py` |
+| P1-1 | concat+channel_mix | SACE 可学习融合替代 /3 | `models/modules/pure_rwkv_sace.py` |
+| P1-2 | σ→MRPN | σ_t_clean → MRPN.blur_estimator | `models/tfs_net.py`, `models/modules/mrpn.py` |
+| P2-1 | blur_mask | σ + 帧间差异 → blur_estimator 门控 | `models/modules/mrpn.py` |
+| P2-2 | 噪声图调制 | sigma_sace → sigmoid 调制 s_noise | `models/tfs_net.py` |
 
 > 详见: [`v6-charlie-diagrams.md`](v6-charlie-diagrams.md) — 最简架构图 + 带细节架构图 (Mermaid)
 

@@ -1,16 +1,12 @@
 """
-NDPN (Noise-Denoising Pyramid Network) — TFS-Net v3
-=====================================================
+NDPN (Noise-Denoising Pyramid Network) — TFS-Net v3 → v6 Charlie
+==================================================================
 基于 SNR 自适应聚合的多帧降噪。
 
-实现状态: ✅ 完整实现 (M2: sigma_t_clean 尺度一致化)
-
-数据流:
-    1. SNR 估计: s_SNR = sigmoid((SNR_hat - τ_mid) / τ_scale)
-       SNR_hat = |μ_t_clean| / (σ_t_clean + ε)   (M2: 二者同处 LFF 域)
-    2. 双因素权重: α_i = sigmoid(Conv(残差)) * (1 - s_SNR), α_t = s_SNR
-    3. 加权聚合: F_denoised = Σ w_i * F_i^aligned
-    4. 强度门控: f_noise_out = s_noise * F_denoised + (1-s_noise) * F_t
+Charlie P0-2: s_noise 条件输入 (已实施)
+    通过 noise_proj (Conv2d) 投影 s_noise 到特征空间,
+    以加法方式注入去噪特征, 替代 IGRF 中的直接注入.
+    IGRF Stage1 在 charlie_mode 下不再接收 s_noise.
 """
 
 from __future__ import annotations

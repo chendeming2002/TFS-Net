@@ -1,24 +1,26 @@
-# TFS-Net v6 Bravo 模型架构设计文档
+# TFS-Net v6 Charlie 模型架构设计文档
 
-> 日期：2026-06-28
-> 版本：v6 Bravo（P0-1 损失重调 + P0-2 TFSI phase_conf + P1-2 DWT-LFF 分裂 + V raw）
-> 训练配置：`configs/v6_bravo.yaml`，batch=2, lr=0.001, epochs=50, warmup=5
-> 参数量：1.198M
+> 日期：2026-06-29 (更新: Charlie P0/P1/P2 实施)
+> 版本：v6 Charlie（Charlie-plan P0+P1+P2 完整实施）
+> 训练配置：`configs/v6_charlie.yaml`，batch=2, lr=2e-4, epochs=50, warmup=5
+> 参数量：1.25M
 
 ---
 
 ## 1. 概述
 
-v6 Bravo 在 v6.5 PureRWKV 基础上引入 Bravo Plan 的 P0+P1 改动：
+v6 Charlie 在 v6 Bravo 基础上实施 Charlie Plan 的全部 P0+P1+P2 改动：
 
-| 改造 | 动机 | 来源 |
-|---|---|---|
-| **损失权重重调** | BVI-Lowlight 实证：L1 对错位敏感，VGG/SSIM 容忍度高 | BVI-Lowlight / TCE-Net / LAN |
-| **TFSI phase_conf** | 低光相位 = 结构+运动+噪声，不能假设相位一致 | FDN / FourierDiff / FAN |
-| **DWT-LFF 分裂** | VSRELL 中心帧锚定 + STCD 视角分解：Q/K 归一化空间对齐，V 原始空间融合 | VSRELL (CVPR 2026) / STCD (IJCAI 2025) |
-| **PureRWKV 多尺度** | 移除 DAT 后纯 RWKV 替代 | pureRWKV.md (9 篇论文) |
+| 优先级 | 改动 | 说明 | 状态 |
+|--------|------|------|------|
+| **P0-1** | **FrequencyBranch 多帧** | temporal_fuse Conv3d 融合邻帧时域信息 | ✅ 已实施 |
+| **P0-2** | **s_noise → NDPN** | s_noise 从 IGRF 移除, 注入 NDPN 条件输入 (noise_proj) | ✅ 已实施 |
+| **P1-1** | **多尺度 concat 融合** | SACE 用 concat+channel_mix 替代 /3 等权平均 | ✅ 已实施 |
+| **P1-2** | **σ→MRPN** | σ_t_clean 输入 MRPN (blur_estimator 运动感知) | ✅ 已实施 |
+| **P2-1** | **MRPN blur_mask** | σ_t_clean + 帧间差异 → blur_estimator 门控 | ✅ 已实施 |
+| **P2-2** | **噪声图来源调制** | SACE sigma_sace → sigmoid 调制 s_noise 置信度 | ✅ 已实施 |
 
-### 完整数据流
+### 完整数据流 (Charlie)
 
 ```
 输入 y (B, T, 3, H, W)
@@ -27,73 +29,86 @@ v6 Bravo 在 v6.5 PureRWKV 基础上引入 Bravo Plan 的 P0+P1 改动：
   │     ├─ F_t = F_stack[:, T//2] 中心帧 (用于 SACE V 源 + TFSI 输入)
   │     └─ F_Ω = F_stack[:, ≠T//2] 邻居帧
   │
-  ├─ [DWT-LFF 分裂] (Bravo P1-2)
-  │     ├─ lff_center(F_t) → F_lff_t, feat_tfsi    α init=0.6
-  │     └─ lff_neighbor(F_Ω per-frame) → F_lff_Ω     α init=0.4
+  ├─ [DWT-LFF 分裂]
+  │     ├─ lff_center(F_t) → feat_sace, feat_tfsi   α init=0.6
+  │     └─ lff_neighbor(F_Ω per-frame) → feat_sace_Ω  α init=0.4
   │
-  ├─ [TFSI] (Bravo P0-2: phase_conf)
-  │     ├─ SpatialBranch: soft-中位值 → μ_t,σ_t,SNR → F_s
-  │     ├─ FrequencyBranch: lff_center(中心帧) → feat_tfsi → F_f
-  │     ├─ phase_conf_head(F_f) → phase_conf (相位置信度)
+  ├─ [TFSI] (Charlie P0-1: 多帧 FrequencyBranch)
+  │     ├─ SpatialBranch: soft-median → μ_t,σ_t,SNR → F_s
+  │     ├─ FrequencyBranch: temporal_fuse(中心+邻帧均值) → F_f
+  │     ├─ phase_conf_head(F_f) → phase_conf
   │     └─ IntensityHead(F_s∥F_f∥phase_conf) → s_illum, s_noise
+  │           └─ s_noise *= (1 - 0.3·(1-phase_conf))
   │
-  ├─ [SACE] PureRWKVSACE (v6.5)
+  ├─ [SACE] PureRWKVSACE
   │     ├─ DWT-LFF: center→lff_center, neighbor→lff_neighbor
-  │     ├─ 中心帧参考: lff_stack[center_idx] → μ_t_clean
-  │     ├─ 多尺度双向 RWKV (full/half/quarter ×2)
-  │     ├─ 边缘门控 (on encoder raw f_raw_center)
-  │     └─ V source = encoder raw center (Bravo P1)
+  │     ├─ μ_t_clean = lff_stack[center], σ_t_clean = lff_stack.std
+  │     ├─ 多尺度双向 RWKV → channel_mix (Charlie P1-1)
+  │     ├─ 边缘门控 + s_noise 残差 (V = Encoder 原始中心帧)
+  │     └─ 输出: F_aligned_list, μ_t_clean, σ_t_clean
   │
-  ├─ [IFPN] → lit_up_map, f_illum_feat, ifpn_side
-  ├─ [NDPN] → f_noise_out
-  ├─ [MRPN] → f_motion_out
+  ├─ [Charlie P2: σ 调制 s_noise]
+  │     └─ sigma_sace = σ_t_clean.mean(dim=1)
+  │        s_noise *= sigmoid(-sigma_sace × 2)  # 高运动 → 低噪声置信
   │
-  └─ [IGRF] 逆序修复 → res_t
+  ├─ [三源恢复] (SACE 对齐特征 → 三分支)
+  │     ├─ IFPN(img_center↓, aligned_feats) → lit_up_map, f_illum_feat
+  │     ├─ NDPN(aligned, μ_t_clean, σ_t_clean, s_noise) → f_noise_out
+  │     │     └─ Charlie P0-2: noise_proj(s_noise) 条件注入
+  │     └─ MRPN(aligned, σ_t_clean) → f_motion_out
+  │           └─ Charlie P1+P2: blur_estimator(σ, frame_diff) 运动感知
+  │
+  └─ [IGRF] 修正去噪
+        ├─ Stage1: f_noise + img_center → img_s1   ★ s_noise 已移除
+        ├─ Stage2: f_motion + img_s1 → img_s2
+        └─ Stage3: img_s2 × lit_up_map + s_illum·corr → res_t
 ```
 
-### 损失函数 (Bravo P0-1)
+### 损失函数 (Bravo2 P0)
 
 ```
-L_total = 0.3·Charbonnier(res, GT)    # ↓ 1.0→0.3
-        + 0.8·VGG(relu3_3)           # ↑ 0.2→0.8 ★主导
-        + 0.5·(1-SSIM)               # ↑ 0.1→0.5
-        + 0.05·L_freq                # ↓ 0.1→0.05
+L_total = 1.0·Charbonnier(res, GT)    # Charlie: 主导 (P0)
+        + 0.04·VGG(relu3_3)           # ★ 0.04 (vs Bravo 0.8)
+        + 0.2·(1-SSIM)               # ★ 0.2 (vs Bravo 0.5)
+        + 0.05·L_freq
         + 0.001·L_illum_smooth + 0.02·L_illum_sup
         + 0.2·L_inter + 0.1·L_ifpn_sup
 ```
 
-### 训练超参
+### 训练超参 (Charlie)
 
 | 参数 | 值 | 说明 |
-|---|---|---|
+|------|-----|------|
 | batch_size | 2 | 24GB 约束 |
-| epochs | 50 | 多尺度 RWKV 需要更长训练 |
-| lr | 0.001 | 匹配 v5.9.2 成功值 |
-| warmup | 5 | lff_neighbor 全新初始化 |
-| weight_decay | 1e-4 | 标准 |
-| grad_clip | 0.5 | 标准 |
+| epochs | 50 | |
+| lr | 2e-4 | ★ Charlie: 降低学习率 (blur_estimator 零初始化) |
+| warmup | 5 | |
+| weight_decay | 1e-4 | |
+| grad_clip | 0.5 | |
+| charlie_mode | true | ★ 激活 Charlie 数据流路径 |
 
 ### 参数分布
 
-| 模块 | 参数量 |
-|---|---|
-| Encoder | ~320K |
-| TFSI (含 phase_conf) | ~108K |
-| PureRWKVSACE (3×RWKV+双DWT-LFF+edge_prompt) | ~320K |
-| IFPN | ~150K |
-| NDPN | ~70K |
-| MRPN | ~50K |
-| IGRF | ~130K |
-| 其他 | ~50K |
-| **总计** | **1.198M** |
+| 模块 | 参数量 | 新增 (vs Bravo) |
+|------|--------|----------------|
+| Encoder | ~320K | — |
+| TFSI (含 temporal_fuse) | ~120K | +12K (Conv3d) |
+| PureRWKVSACE (含 channel_mix) | ~325K | +5K (Linear 3C→C) |
+| IFPN | ~150K | — |
+| NDPN (含 noise_proj) | ~75K | +5K (Conv2d 1→64) |
+| MRPN (含 blur_estimator) | ~60K | +10K (blur_est) |
+| IGRF | ~130K | — |
+| 其他 | ~70K | — |
+| **总计** | **~1.25M** | **+32K vs Bravo 1.20M** |
 
 ### 设计原则
 
-1. **中心帧锚定** (VSRELL CVPR 2026)：F_t 全局贯穿 Q/V/TFSI
-2. **归一化-原始双空间分离** (STCD IJCAI 2025)：DWT-LFF 做对齐，Encoder 原始做内容融合
-3. **相位不一致建模** (FDN/FourierDiff/FAN)：phase_conf 贯穿 s_noise
-4. **对齐容忍损失主导** (BVI-Lowlight)：VGG/SSIM 主导，L1 降权
-5. **纯 RWKV 对齐** (pureRWKV.md)：去 DAT 省 130K
+1. **中心帧锚定** (VSRELL CVPR 2026): F_t 全局贯穿 Q/V/TFSI
+2. **归一化-原始双空间分离** (STCD IJCAI 2025): DWT-LFF 做对齐，Encoder 原始做内容融合
+3. **相位不一致建模** (FDN/FourierDiff/FAN): phase_conf 贯穿 s_noise
+4. **Charbonnier 主导损失** (Charlie P0): L1 1.0 主导，VGG 0.04 + SSIM 0.2 辅助
+5. **纯 RWKV 对齐** (pureRWKV.md): 去 DAT 省 130K
+6. **模块化数据流** (Charlie P0): s_noise→NDPN; s_illum→IGRF; σ→MRPN; 各司其职
 
 ---
 
@@ -103,40 +118,87 @@ L_total = 0.3·Charbonnier(res, GT)    # ↓ 1.0→0.3
 
 **文件**: `models/modules/pure_rwkv_sace.py`
 
-移除 DeformableCrossAttention，用 3 尺度双向 RWKV 替代。
-
-**DWT-LFF 分裂** (Bravo P1-2):
+**DWT-LFF 分裂**:
 ```
 中心帧 → lff_center (α init=0.6, 偏 LL_ref) → 干净锚定特征
 邻居帧 → lff_neighbor (α init=0.4, 偏 LL_deg) → 退化诊断特征
 ```
 
-**多尺度双向 RWKV**:
+**多尺度双向 RWKV + Charlie P1-1 fusion**:
 ```
 full:     VRWKVStyleSpatialMix(5帧, H×W)     ×2 (双向)
 half:     avg_pool3d(LFF, (1,2,2)) → RWKV ×2 → bilinear 上采样
 quarter:  avg_pool3d(LFF, (1,4,4)) → RWKV ×2 → bilinear 上采样
-out = (full + half + quarter) / 3
+out = channel_mix(concat[full, half, quarter])  ← Charlie: 可学习融合
 ```
 
-**V 源 = Encoder 原始中心帧** (Bravo P1):
+**V 源 = Encoder 原始中心帧**:
 ```
-f_raw_center = feats[:, T//2]            # Encoder 原始, 非 DWT-LFF
-edge_weight = edge_prompt(f_raw_center)   # 在原始特征上做边缘检测
+f_raw_center = feats[:, T//2]
+edge_weight = edge_prompt(f_raw_center)
 F_aligned[t] = out[t] + (1-edge_weight)·f_raw_center + (1-s_noise)·f_raw_center
 ```
 
-### 2.2 TFSI（Bravo P0-2: phase_conf）
+**输出 σ_t_clean → MRPN (Charlie P1)**:
+```
+σ_t_clean = lff_stack.std(dim=1, unbiased=False)
+→ blur_estimator(σ_t_clean, frame_diff)  # 运动感知门控
+```
+
+### 2.2 TFSI (Charlie P0-1: 多帧 FrequencyBranch)
 
 **文件**: `models/modules/tfsi.py`
 
 ```
 SpatialBranch(feats) → F_s
-FrequencyBranch(中心帧) → lff_center → feat_tfsi → F_f
-phase_conf = phase_conf_head(F_f)     # Conv→GELU→Conv→Sigmoid, (B,1,H,W)
+FrequencyBranch: temporal_fuse(中心+邻帧均值) → F_f  ★ Charlie 多帧
+phase_conf = phase_conf_head(F_f)
 F_fused = ConcatFusion(F_s, F_f)
 s_illum, s_noise = IntensityHead(F_fused ∥ phase_conf)
-s_noise *= (1 + 0.5·(1-phase_conf))   # 相位不可靠 → 增强去噪
+s_noise *= (1 - 0.3·(1-phase_conf))
+```
+
+### 2.3 NDPN (Charlie P0-2: s_noise 条件输入)
+
+**文件**: `models/modules/ndpn.py`
+
+```
+SNR = |μ_t_clean| / (σ_t_clean + ε)
+α_i = sigmoid(Conv(residual)) × (1 - s_SNR)  # 邻帧权重
+α_t = s_SNR                                    # 中心帧权重
+F_denoised = Σ w_i × F_i^aligned
+
+★ Charlie P0-2:
+noise_cond = noise_proj(s_noise)  # Conv2d(1→64), 零初始化
+f_noise_out = F_denoised + noise_cond
+```
+
+### 2.4 MRPN (Charlie P1+P2: σ→MRPN + blur_mask)
+
+**文件**: `models/modules/mrpn.py`
+
+```
+f_omega_aligned = window_corr(f_t, f_neighbors)
+
+★ Charlie P1+P2:
+sigma_1ch = σ_t_clean.mean(dim=1)              # (B,1,H,W)
+frame_diff = |f_omega_aligned - f_t_aligned|   # 帧间差异
+blur_mask = blur_estimator([sigma_1ch, frame_diff])  # 零初始化
+
+g_t = sigmoid(gate([f_t, f_omega]))
+g_t = g_t × (1-blur_mask) + blur_mask × 0.3  # 模糊区→邻帧补偿
+f_fuse = g_t×f_t + (1-g_t)×f_omega
+f_motion = Refine(f_fuse) + f_t
+```
+
+### 2.5 IGRF (Charlie P0: s_noise 已移除)
+
+**文件**: `models/modules/igrf.py`
+
+```
+Stage1: img_s1 = clamp(img_center + δ(f_noise))     ★ s_noise 不再注入
+Stage2: img_s2 = clamp(img_s1 + δ(f_motion))
+Stage3: res_t = clamp(img_s2 × lit_up_map + s_illum × corr_mag)
 ```
 
 ---
@@ -144,9 +206,9 @@ s_noise *= (1 + 0.5·(1-phase_conf))   # 相位不可靠 → 增强去噪
 ## 3. 版本演进
 
 | 版本 | 关键改动 | 参数量 | 最佳 PSNR |
-|---|---|---|---|
+|------|---------|--------|-----------|
 | v5.5 | 基线 | 1.12M | 19.23 |
-| v5.9.1 | fuse 修复 | 1.12M | 20.11 |
 | v5.9.2 | s_illum 复生 + IFPN 监督 | 1.14M | 20.39 |
 | v6.5 | PureRWKV 移除 DAT | 1.17M | 20.36 |
-| **v6 Charlie** | **多帧 FrequencyBranch + 多尺度 concat + NDPN s_noise条件 + phase_conf方向修正** | **1.25M** | ✅ 训练中 | loss 0.28→0.25 正常下降, illum=0.08 活跃 |
+| v6 Bravo | 损失重调 + DWT-LFF分裂 + V raw | 1.20M | 20.05 |
+| **v6 Charlie** | **多帧 F.B. + concat fusion + NDPN s_noise + σ→MRPN + blur_mask** | **1.25M** | 训练中 |

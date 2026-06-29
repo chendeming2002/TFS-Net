@@ -115,6 +115,7 @@ def build_model(cfg, device):
         num_bottleneck_blocks=model_cfg.get("num_bottleneck_blocks", 0),
         num_igrf_res_blocks=model_cfg.get("num_igrf_res_blocks", 2),
         use_amp_enhance=model_cfg.get("use_amp_enhance", False),
+        charlie_mode=model_cfg.get("charlie_mode", False),
     )
     return model.to(device)
 
