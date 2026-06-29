@@ -99,16 +99,10 @@ class SpatialBranch(nn.Module):
 
 class FrequencyBranch(nn.Module):
     """
-    TFSI 频域分支 — 基于 LFFFeatureAdapter 的可学习频率滤波。
+    TFSI 频域分支 — Charlie P0-1: 多帧邻居融合用于 s_noise 估计。
 
-    实现状态: ✅ 已接入 LFF (B.2)
-
-    数据流:
-        feats[:, center_idx]                  # (B, C, H, W)
-        → optional in_proj (若 C != fused_channels)
-        → LFFFeatureAdapter (频域 RBF 整形)
-        → optional out_proj (若 C != fused_channels)
-        → F_f                                 # (B, fused_channels, H, W)
+    v6.4: 仅中心帧 → 噪声/光照解耦物理上不足
+    Charlie: 拼接邻帧 LFF 时域均值 → 频域分支获得时序上下文
     """
 
     def __init__(
@@ -120,11 +114,13 @@ class FrequencyBranch(nn.Module):
         per_channel_rbf: bool = False,
         phase_preserving: bool = True,
         dwt_lff: SpatialDWTLFFAdapter = None,
+        use_temporal_fusion: bool = True,
     ):
         super().__init__()
         self.channels = channels
         self.fused_channels = fused_channels
         self.dwt_lff = dwt_lff
+        self.use_temporal_fusion = use_temporal_fusion
 
         if channels == fused_channels:
             self.in_proj = nn.Identity()
@@ -136,29 +132,32 @@ class FrequencyBranch(nn.Module):
             lff_channels = fused_channels
 
         if dwt_lff is not None:
-            # v6.2: DWT-LFF 模式 — 不创建传统 LFF, 使用外部 SpatialDWTLFFAdapter
             self.lff = None
         else:
-            self.lff = LFFFeatureAdapter(
-                channels=lff_channels,
-                K=K,
-                n_ang_freq=n_ang_freq,
-                per_channel_rbf=per_channel_rbf,
-                phase_preserving=phase_preserving,
-            )
+            self.lff = LFFFeatureAdapter(channels=lff_channels, K=K, n_ang_freq=n_ang_freq,
+                                         per_channel_rbf=per_channel_rbf, phase_preserving=phase_preserving)
+        # Charlie P0-1: 时域融合 Conv (中心 ∥ 邻帧均值 → 单通道特征)
+        self.temporal_fuse = nn.Conv2d(channels, fused_channels, 3, 1, 1) if use_temporal_fusion else None
 
     def forward(self, feats: torch.Tensor, center_idx: int) -> torch.Tensor:
         f_center = feats[:, center_idx]
         f_center = self.in_proj(f_center)
 
         if self.dwt_lff is not None:
-            # v6.2: DWT-LFF — 返回 feat_tfsi (低频幅度 + 噪声信息)
             out = self.dwt_lff(f_center)
-            f_f = out["feat_tfsi"]
+            f_f_center = out["feat_tfsi"]
         else:
-            f_f = self.lff(f_center)
+            f_f_center = self.lff(f_center)
 
-        f_f = self.out_proj(f_f)
+        # Charlie P0-1: 邻帧时域均值 → 时序上下文
+        if self.temporal_fuse is not None:
+            f_neighbors = torch.cat([feats[:, :center_idx], feats[:, center_idx+1:]], dim=1)
+            f_neighbor_mean = f_neighbors.mean(dim=1)  # (B, C, H, W) 邻帧均值
+            f_fused = self.temporal_fuse(f_f_center + f_neighbor_mean)
+        else:
+            f_fused = f_f_center
+
+        f_f = self.out_proj(f_fused)
         return f_f
 
 

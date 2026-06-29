@@ -1,0 +1,39 @@
+"""RWKV-Charlie 配置"""
+model:
+  name: TFSNet
+  version: v6-charlie
+  in_channels: 3
+  num_frames: 5
+  width: 32
+  use_rwkv: true
+  deep_supervision: false
+  use_temporal_fusion: true
+
+loss:
+  lambda_pix: 1.0
+  lambda_perc: 0.04
+  lambda_ssim: 0.2
+
+training:
+  batch_size: 4
+  num_workers: 4
+  max_epochs: 300
+  warmup_epochs: 5
+  max_lr: 2.0e-4
+  min_lr: 1.0e-6
+  weight_decay: 1.0e-4
+  patch_size: 128
+  grad_clip: 1.0
+
+dataset:
+  name: sdsd
+  root: /data/sdsd
+  sigma_range: [0.0, 0.0]
+
+checkpoint:
+  dir: checkpoints/charlie
+  save_interval: 5
+
+logging:
+  log_dir: logs/charlie
+  log_interval: 50

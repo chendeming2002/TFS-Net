@@ -72,6 +72,11 @@ class PureRWKVSACE(nn.Module):
             nn.Sigmoid(),
         )
 
+        # 3️⃣ 多尺度融合 (Charlie P1-1: concat + channel_mix 替代等权平均)
+        self.channel_mix = nn.Sequential(
+            nn.Linear(channels * 3, channels),
+        )
+
         # LayerNorm
         self.norm_out = LayerNorm2d(channels)
 
@@ -140,9 +145,10 @@ class PureRWKVSACE(nn.Module):
             out_qtr.reshape(B * T, C, h4, w4), size=(H, W), mode='bilinear', align_corners=False
         ).reshape(B, T, C, H, W).permute(0, 1, 3, 4, 2).reshape(B, T, H * W, C)
 
-        # === Step 4: 跨尺度聚合 ===
-        out_flat = (out_full + out_half + out_qtr) / 3
-        out = out_flat.reshape(B, T, H, W, C).permute(0, 1, 4, 2, 3)  # (B, T, C, H, W)
+        # === Step 4: 多尺度融合 (Charlie P1-1: concat+channel_mix 替代 /3) ===
+        out_cat = torch.cat([out_full, out_half, out_qtr], dim=-1)  # (B, T, L, 3C)
+        out_flat = self.channel_mix(out_cat)  # (B, T, L, C)
+        out = out_flat.reshape(B, T, H, W, C).permute(0, 1, 4, 2, 3)
 
         # === Step 5: 边缘门控残差 (Video RWKV LCR) ===
         # v6 Bravo P1: V 使用 Encoder 原始中心帧 (而非 DWT-LFF 归一化后)
