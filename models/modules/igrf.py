@@ -125,17 +125,17 @@ class BrightenStage(nn.Module):
         )
 
     def forward(self, lit_up_map_raw: torch.Tensor, f_illum_feat: torch.Tensor,
-                img_dark: torch.Tensor, s_illum: torch.Tensor = None):
+                img_dark: torch.Tensor):
+        """Charlie3 P0: s_illum 已移除 — 光照信息经 IFPN 融合后已蕴含在 f_illum_feat 中"""
         feat_cond = self.feat_proj(f_illum_feat)
         img_cond = self.img_proj(img_dark)
         delta = self.delta_refine(torch.cat([feat_cond, img_cond], dim=1))
         lit_up_map = lit_up_map_raw * (1.0 + torch.tanh(delta) * self.max_delta)
         lit_up_map = lit_up_map.clamp(min=0.5)
 
-        # Charlie2 D4: VSRELL 单一 A_illu — s_illum 门控提亮强度
+        # Charlie3 P0: VSRELL A_illu — f_illum_feat 已含 s_illum 信息 (经 IFPN s_illum_proj)
         A_illu = self.unified_illu(f_illum_feat)  # (B, 1, H, W)
-        if s_illum is not None:
-            lit_up_map = lit_up_map * (1.0 + s_illum * A_illu)
+        lit_up_map = lit_up_map * (1.0 + A_illu)
 
         res_t = torch.clamp(img_dark * lit_up_map, 0.0, 1.0)
         return res_t, lit_up_map
@@ -179,20 +179,17 @@ class IGRF(nn.Module):
         f_motion_out: torch.Tensor,
         lit_up_map_raw: torch.Tensor,
         image_center: torch.Tensor,
-        s_illum: torch.Tensor = None,
         s_noise: torch.Tensor = None,
     ) -> dict:
+        """Charlie3 P0: s_illum 已移除 — 光照信息经 IFPN→f_illum_feat 承载"""
         # Stage 1: denoise (in dark domain, noise amplitude is small)
-        # v5.5: s_noise directly injected as additive correction
         img_s1, delta_s1 = self.stage_noise(f_noise_out, image_center, s_intensity=s_noise)
 
         # Stage 2: motion deblur (no intensity prior)
         img_s2, delta_s2 = self.stage_motion(f_motion_out, img_s1)
 
-        # Stage 3: hybrid brightening
-        # v5.5: s_illum directly injected as additive correction (no channel dilution)
-        # NO .detach() on img_s2: allow L_recon gradient to flow through to NDPN/MRPN
-        res_t, lit_up_map = self.brighten(lit_up_map_raw, f_illum_feat, img_s2, s_illum=s_illum)
+        # Stage 3: VSRELL brightening (s_illum 信息已包含在 f_illum_feat 中)
+        res_t, lit_up_map = self.brighten(lit_up_map_raw, f_illum_feat, img_s2)
 
         return {
             "res_t":       res_t,

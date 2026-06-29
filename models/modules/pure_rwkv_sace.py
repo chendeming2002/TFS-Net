@@ -24,6 +24,38 @@ from .cross_rwkv import VRWKVStyleSpatialMix
 from .blocks import LayerNorm2d
 
 
+class LearnableScaleFusion(nn.Module):
+    """Charlie3 P2: 替代 concat+channel_mix 的轻量多尺度融合 (AMBFF 风格)
+
+    参数: 3 标量 softmax 权重 + 3 逐尺度 SE 校准 block → ~1.5K (vs 12K for Linear(3C→C))
+    初始等权 softmax(0,0,0)→1/3，行为等价于旧版 /3 平均，向后兼容。
+    """
+
+    def __init__(self, channels: int, n_scales: int = 3):
+        super().__init__()
+        self.scale_logits = nn.Parameter(torch.zeros(n_scales))
+        self.calibrate = nn.ModuleList([
+            nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Conv2d(channels, channels, 1),
+                nn.Sigmoid(),
+            )
+            for _ in range(n_scales)
+        ])
+        nn.init.zeros_(self.scale_logits)
+
+    def forward(self, scale_features: list):
+        """scale_features: list of (B, T, C, H, W) — full, half, quarter 尺寸"""
+        weights = F.softmax(self.scale_logits, dim=0)
+        B, T, C, H, W = scale_features[0].shape
+        out = 0
+        for i, feat in enumerate(scale_features):
+            b, t, c, h_i, w_i = feat.shape
+            cal_w = self.calibrate[i](feat.view(b * t, c, h_i, w_i)).view(b, t, c, 1, 1)
+            out = out + weights[i] * feat * cal_w
+        return out
+
+
 class PureRWKVSACE(nn.Module):
     """纯 RWKV 多尺度帧间注意力 (v6.5)
 
@@ -72,10 +104,8 @@ class PureRWKVSACE(nn.Module):
             nn.Sigmoid(),
         )
 
-        # 3️⃣ 多尺度融合 (Charlie P1-1: concat + channel_mix 替代等权平均)
-        self.channel_mix = nn.Sequential(
-            nn.Linear(channels * 3, channels),
-        )
+        # 3️⃣ 多尺度融合 (Charlie3 P2: LearnableScaleFusion 替代 concat+channel_mix)
+        self.scale_fusion = LearnableScaleFusion(channels)  # ~1.5K params
 
         # LayerNorm
         self.norm_out = LayerNorm2d(channels)
@@ -145,10 +175,12 @@ class PureRWKVSACE(nn.Module):
             out_qtr.reshape(B * T, C, h4, w4), size=(H, W), mode='bilinear', align_corners=False
         ).reshape(B, T, C, H, W).permute(0, 1, 3, 4, 2).reshape(B, T, H * W, C)
 
-        # === Step 4: 多尺度融合 (Charlie P1-1: concat+channel_mix 替代 /3) ===
-        out_cat = torch.cat([out_full, out_half, out_qtr], dim=-1)  # (B, T, L, 3C)
-        out_flat = self.channel_mix(out_cat)  # (B, T, L, C)
-        out = out_flat.reshape(B, T, H, W, C).permute(0, 1, 4, 2, 3)
+        # === Step 4: 多尺度融合 (Charlie3 P2: LearnableScaleFusion) ===
+        # 各尺度输出还原为 (B,T,C,H,W) 格式
+        out_full_2d = out_full.reshape(B, T, H, W, C).permute(0, 1, 4, 2, 3)
+        out_half_2d = out_half.reshape(B, T, H, W, C).permute(0, 1, 4, 2, 3)
+        out_qtr_2d = out_qtr.reshape(B, T, H, W, C).permute(0, 1, 4, 2, 3)
+        out = self.scale_fusion([out_full_2d, out_half_2d, out_qtr_2d])
 
         # === Step 5: 边缘门控残差 (Video RWKV LCR) ===
         # v6 Bravo P1: V 使用 Encoder 原始中心帧 (而非 DWT-LFF 归一化后)

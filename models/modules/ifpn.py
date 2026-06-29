@@ -100,11 +100,16 @@ class IFPN(nn.Module):
             nn.GELU(),
         )
 
-        # Charlie2 D3: s_illum 光照感知调制 (VSRELL 风格 A_illu)
-        self.illum_modulate = nn.Sequential(
-            nn.Conv2d(1, self.aligned_channels, 3, 1, 1),
-            nn.Sigmoid(),
+        # Charlie3 P0: s_illum 先验注入 (零初始化，渐进学习)
+        # s_illum 作为光照先验投影到粗特征空间，与 coarse_adapter 输出相加
+        self.s_illum_proj = nn.Sequential(
+            nn.Conv2d(1, self.aligned_channels, 1, bias=False),
+            nn.GELU(),
+            nn.Conv2d(self.aligned_channels, coarse_channels, 3, 1, 1),
         )
+        nn.init.zeros_(self.s_illum_proj[0].weight)
+        nn.init.zeros_(self.s_illum_proj[2].weight)
+        nn.init.zeros_(self.s_illum_proj[2].bias)
 
         self.illum_extract = IllumExtract(
             img_channels=img_channels,
@@ -159,20 +164,29 @@ class IFPN(nn.Module):
         """
         B, T, C_a, H, W = aligned_feats.shape
 
-        # Charlie2 D3: s_illum 光照感知调制 — 暗区(s_illum高)→gate大→激进特征增强
+        # Charlie3 P0: s_illum 先验注入 (替换原 aligned_feats 调制)
+        # 注入位置: coarse_adapter 之后，作为光照先验加到粗特征上
         if s_illum is not None:
-            illum_gate = self.illum_modulate(s_illum)  # (B, C_a, H, W)
-            # broadcast: (B,T,C_a,H,W) * (B,1,C_a,H,W)
-            aligned_feats = aligned_feats * (1.0 + illum_gate.unsqueeze(1) * s_illum.unsqueeze(1))
-
-        # v5.3: 从 SACE 对齐特征生成粗特征（通道投影 + 空间下采样）
-        BT = B * T
-        aligned_flat = aligned_feats.reshape(BT, *aligned_feats.shape[2:])
-        projected = self.coarse_adapter(aligned_flat)
-        # 目标空间尺寸：从 I_t_down 推断
-        h, w = I_t_down.shape[-2:]
-        coarse_flat = F.adaptive_avg_pool2d(projected, (h, w))
-        coarse_feats = coarse_flat.reshape(B, T, self.coarse_channels, h, w)
+            # s_illum_proj: (B,C_a,H,W) → (B,coarse_c,H,W)
+            illum_prior = self.s_illum_proj(s_illum)
+            # broadcast 到每一帧: (B,1,C_c,h,w) → (B,T,C_c,h,w)
+            BT = B * T
+            aligned_flat = aligned_feats.reshape(BT, *aligned_feats.shape[2:])
+            projected = self.coarse_adapter(aligned_flat)
+            h, w = I_t_down.shape[-2:]
+            coarse_flat = F.adaptive_avg_pool2d(projected, (h, w))
+            # 注入 s_illum 先验 (每帧共享)
+            illum_prior_2d = F.interpolate(illum_prior, size=(h, w), mode='bilinear',
+                                           align_corners=False)
+            coarse_flat = coarse_flat + illum_prior_2d.repeat(T, 1, 1, 1)
+            coarse_feats = coarse_flat.reshape(B, T, self.coarse_channels, h, w)
+        else:
+            BT = B * T
+            aligned_flat = aligned_feats.reshape(BT, *aligned_feats.shape[2:])
+            projected = self.coarse_adapter(aligned_flat)
+            h, w = I_t_down.shape[-2:]
+            coarse_flat = F.adaptive_avg_pool2d(projected, (h, w))
+            coarse_feats = coarse_flat.reshape(B, T, self.coarse_channels, h, w)
 
         # F_t_L: 中心帧粗特征（内部生成）
         F_t_L = coarse_feats[:, center_idx]

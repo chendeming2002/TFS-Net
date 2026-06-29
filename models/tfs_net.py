@@ -38,6 +38,38 @@ from models.modules.dwt_lff import SpatialDWTLFFAdapter
 from models.modules.pure_rwkv_sace import PureRWKVSACE
 
 
+class CrossFusionGate(nn.Module):
+    """Charlie3 P1: NDPN/MRPN 输出端交叉门控 (VSRELL cross-modulation + AMBFF adaptive fusion)
+
+    各分支保持独立推理，仅在送入 IGRF 前做互补置信度交换:
+      - 运动剧烈区 → 降低去噪置信度 (gate_noise)
+      - 高噪声区   → 降低运动补偿置信度 (gate_motion)
+    零初始化最后一层 → 初始行为近似恒等，渐进学习。
+    """
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.gate_noise = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, channels // 4, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // 4, channels, 1),
+            nn.Sigmoid(),
+        )
+        self.gate_motion = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, channels // 4, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // 4, channels, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, f_noise: torch.Tensor, f_motion: torch.Tensor):
+        g_n = self.gate_noise(f_motion)
+        g_m = self.gate_motion(f_noise)
+        return f_noise * g_n, f_motion * g_m
+
+
 class TFSNet(nn.Module):
     """
     Args:
@@ -147,6 +179,9 @@ class TFSNet(nn.Module):
         )
         self.ndpn = NDPN(channels=fused_channels)
         self.mrpn = MRPN(channels=fused_channels)
+
+        # Charlie3 P1: NDPN/MRPN 输出端交叉门控 (VSRELL cross-modulation 风格)
+        self.cross_fuse = CrossFusionGate(channels=fused_channels)
 
         # Stage 4: IGRF
         self.igrf = IGRF(channels=fused_channels, out_channels=in_channels,
@@ -284,16 +319,24 @@ class TFSNet(nn.Module):
             sigma_t_clean=sace_out["sigma_t_clean"] if self.charlie_mode else None,
         )
 
+        # Extract outputs for IGRF
+        lit_up_map_raw = ifpn_out["lit_up_map_raw"]
+        f_illum_feat = ifpn_out["f_illum_feat"]
+        f_noise_out_raw = ndpn_out["f_noise_out"]
+        f_motion_out_raw = mrpn_out["f_motion_out"]
+
+        # Charlie3 P1: 交叉门控 — 互补置信度交换
+        f_noise_out, f_motion_out = self.cross_fuse(f_noise_out_raw, f_motion_out_raw)
+
         # Stage 4: IGRF v5.5 - Denoise -> Motion -> Hybrid Brighten
         # Charlie P0: s_noise 移出 IGRF, 仅 NDNP 接收
         igrf_out = self.igrf(
-            f_illum_feat=ifpn_out["f_illum_feat"],
-            f_noise_out=ndpn_out["f_noise_out"],
-            f_motion_out=mrpn_out["f_motion_out"],
-            lit_up_map_raw=ifpn_out["lit_up_map_raw"],
+            f_illum_feat=f_illum_feat,
+            f_noise_out=f_noise_out,
+            f_motion_out=f_motion_out,
+            lit_up_map_raw=lit_up_map_raw,
             image_center=image_center,
-            s_illum=s_illum,
-            s_noise=None if self.charlie_mode else s_noise,
+            s_noise=s_noise,
         )
 
         return {
