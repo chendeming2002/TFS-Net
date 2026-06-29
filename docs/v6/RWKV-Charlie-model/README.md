@@ -8,6 +8,16 @@
 > 5. **Bravo2 P2 (DWT-LFF 全高频)**: 取消 0.5 HF 共享, 两分支使用完整 LH/HL/HH
 > 6. **Bravo2 P0 (Loss 权重调整)**: `lambda_perc=0.04`, `lambda_pix=1.0`, `lambda_ssim=0.2`
 
+## 整体架构概览
+
+```
+输入低光视频 → [Encoder] → [DWT-LFF 三源分离] → ┬─ TFSI (频域/噪声路径)
+                                                    ├─ SACE (空域/结构路径, 3头并行)
+                                                    └→ Fusion → Cross-RWKV → Decoder → 增强输出
+```
+
+> 详见: [`v6-charlie-diagrams.md`](v6-charlie-diagrams.md) — 最简架构图 + 带细节架构图 (Mermaid)
+
 ## 文件结构
 
 ```
