@@ -105,12 +105,9 @@ class SpatialDWTLFFAdapter(nn.Module):
         LL_ref = alpha * LL                # 归一化光照参考 (SACE)
         LL_deg = (1.0 - alpha) * LL        # 光照退化残差 (TFSI)
 
-        # Step 3: HF 平均分配 → 保证 feat_sace+feat_tfsi = x (渐变约束)
-        LH_half, HL_half, HH_half = LH * 0.5, HL * 0.5, HH * 0.5
-
-        # Step 4: IDWT 重构 (保留完整高频, 非 bilinear 上采样)
-        feat_sace = self.dwt.inverse(LL_ref, LH_half, HL_half, HH_half)
-        feat_tfsi = self.dwt.inverse(LL_deg, LH_half, HL_half, HH_half)
+        # Step 3: 两分支用完整高频 (Bravo2 P2: 取消 0.5 共享, 让双分支真正差异化)
+        feat_sace = self.dwt.inverse(LL_ref, LH, HL, HH)
+        feat_tfsi = self.dwt.inverse(LL_deg, LH, HL, HH)
 
         # Step 5: LayerNorm → 适配 Cross-RWKV Q-Shift
         feat_sace = self.norm_sace(feat_sace.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)

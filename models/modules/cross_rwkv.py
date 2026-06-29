@@ -73,6 +73,7 @@ class VRWKVStyleSpatialMix(nn.Module):
         self.value = nn.Linear(channels, channels, bias=False)
         self.receptance = nn.Linear(channels, channels, bias=False)
         self.output = nn.Linear(channels, channels, bias=False)
+        self.post_norm = nn.LayerNorm(channels)  # Brave2 P1: 输出后 LN 防溢出
 
         # 输出全零初始化 → 初始恒等
         nn.init.zeros_(self.output.weight)
@@ -187,14 +188,14 @@ class VRWKVStyleSpatialMix(nn.Module):
         sr = torch.sigmoid(r)  # 接收门控
 
         # Step 4: Bi-WKV 扫描
-        w = self.spatial_decay / T  # (C,)
-        u = self.spatial_first / T  # (C,)
+        w = self.spatial_decay.clamp(-8, 8) / T  # Brave2 P1: 硬上界防溢出
+        u = self.spatial_first.clamp(-5, 5) / T
         wkv_out = self._bi_wkv_scan(w, u, k, v)  # (B, T, L, C)
 
-        # Step 5: 门控 + 输出
+        # Step 5: 门控 + 输出 + LayerNorm (Brave2 P1: 稳定性)
         rwkv = sr * wkv_out
-        out = self.output(rwkv)  # (B, T, L, C)
-
+        out = self.output(rwkv)
+        out = self.post_norm(out)  # post LayerNorm
         return out
 
 

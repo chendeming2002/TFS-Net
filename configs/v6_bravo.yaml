@@ -37,10 +37,10 @@ loss:
   type: TFSNetLoss
   use_freq_loss: true
   perceptual_pretrained: true
-  lambda_perc: 0.4
+  lambda_perc: 0.04
   lambda_freq: 0.05
   lambda_illum: 0.001
-  lambda_ssim: 0.3
+  lambda_ssim: 0.2
   lambda_inter: 0.2
   fused_channels: 64
   lambda_illum_sup: 0.02
@@ -48,7 +48,7 @@ loss:
   perc_multilayer: false
   freq_with_phase: false
   lambda_ifpn_sup: 0.1
-  lambda_pix: 0.5
+  lambda_pix: 1.0
 eval:
   tile_size: 256
   tile_overlap: 32
