@@ -1,6 +1,6 @@
-# TFS-Net v6 Charlie 整体架构图
+# TFS-Net v6 Charlie 整体架构图（2026-06-29）
 
-## 图一：最简架构
+## 图一：最简架构（三源分离估计-三源处理-修正去噪）
 
 ```mermaid
 flowchart TD
@@ -8,45 +8,59 @@ flowchart TD
         IN["多帧低光输入<br/>x : (B, T, 3, H, W)"]
     end
 
-    subgraph 编码层
-        ENC["Encoder<br/>3级逐帧编码<br/>C32→64→128"]
+    subgraph 诊断层["三源分离估计"]
+        ENC["Encoder<br/>3级金字塔编码"]
+        DWT["DWT-LFF<br/>小波光照分离<br/>中心 α=0.6 / 邻居 α=0.4"]
+        TFSI["TFSI<br/>时频诊断<br/>多帧 FrequencyBranch + phase_conf"]
     end
 
-    subgraph 三源分离估计
-        DWT["DWT-LFF<br/>Haar小波光照分离<br/>α 自适应 LL 拆分为<br/>feat_sace (光照/结构) 与<br/>feat_tfsi (噪声/退化)"]
+    subgraph 对齐层
+        SACE["SACE<br/>纯 RWKV 帧间注意力<br/>多尺度双向 Bi-WKV<br/>concat+channel_mix 融合<br/>V 源 = Encoder 原始中心帧"]
     end
 
-    subgraph 三源退化并行建模
-        direction LR
-        TFSI["TFSI 路径<br/>时频交互<br/>temporal_fuse + FFT"]
-        SACE["SACE 路径<br/>多尺度帧间注意<br/>concat+channel_mix 融合"]
+    subgraph 处理层["三源退化并行建模"]
+        IFPN["IFPN<br/>光照图估计"]
+        NDPN["NDPN<br/>SNR自适应去噪<br/>+ s_noise 条件输入"]
+        MRPN["MRPN<br/>运动补偿<br/>+ σ_t_clean 运动感知"]
     end
 
-    subgraph 融合修正
-        FUSE["特征融合<br/>feat_sace + feat_tfsi"]
-        CRWKV["Cross-RWKV<br/>Bi-WKV 跨帧扫描<br/>post_norm + clamp 稳定化"]
-        CSA["Cross-Scale<br/>Attention"]
+    subgraph 执行层["修正去噪"]
+        IGRF["IGRF<br/>去噪→去模糊→提亮"]
     end
 
-    subgraph 解码层
-        DEC["Decoder<br/>PixelShuffle 逐层上采样<br/>+ DWT-LFF 跳跃连接"]
-    end
-
-    OUT["输出增强帧<br/>(B×T×3×H×W)"]
+    OUT["输出 res_t"]
 
     IN --> ENC
     ENC --> DWT
-    DWT -- "feat_sace" --> SACE
-    DWT -- "feat_tfsi" --> TFSI
-    TFSI --> FUSE
-    SACE --> FUSE
-    FUSE --> CRWKV
-    CRWKV --> CSA
-    CSA --> DEC
-    DEC --> OUT
-    ENC -- "f2 skip (DWT-LFF)" --> DEC
-    ENC -- "f1 skip" --> DEC
+    ENC -- "F_t (中心帧原始)" --> SACE
+    DWT --> TFSI
+    DWT --> SACE
+    TFSI -- "s_illum" --> IGRF
+    TFSI -- "s_noise (+phase_conf)" --> SACE
+    TFSI -- "s_noise" --> NDPN
+    TFSI -- "s_noise" --> IGRF
+
+    SACE -- "F_aligned" --> IFPN
+    SACE -- "F_aligned, σ_t_clean" --> MRPN
+    SACE -- "F_aligned, μ_t_clean" --> NDPN
+
+    IFPN -- "lit_up_map, f_illum" --> IGRF
+    NDPN -- "f_noise" --> IGRF
+    MRPN -- "f_motion" --> IGRF
+
+    IGRF --> OUT
+    IN -- "img_center" --> IGRF
+    IN -- "img_center" --> IFPN
 ```
+
+### 框架要点
+
+- **三源分离估计**：DWT-LFF + TFSI 联合诊断光照(s_illum)和噪声(s_noise)；SACE 通过帧间方差(σ_t_clean)隐式感知运动
+- **TFSI ↔ SACE 关系**：TFSI 的 FrequencyBranch 使用多帧邻居融合（Charlie P0-1）；SACE 使用 DWT-LFF 双实例（中心 α=0.6 / 邻居 α=0.4）做对齐前归一化；两者共享 DWT-LFF 核心思想但独立实现
+- **三源并行处理**：IFPN/NDPN/MRPN 三个分支从 SACE 对齐特征各自估计修复方案；NDPN 接收 s_noise 作为条件输入，MRPN 接收 σ_t_clean 作为运动感知信号
+- **SACE 纯 RWKV 注意力**：多尺度双向 Bi-WKV（full/half/quarter），concat+channel_mix 可学习融合（Charlie P1-1），V 源使用 Encoder 原始中心帧保留内容
+
+---
 
 ## 图二：带细节架构
 
@@ -54,150 +68,121 @@ flowchart TD
 flowchart TD
     IN["多帧低光输入<br/>x : (B, T, 3, H, W)"]
 
-    subgraph Encoder["Encoder 编码器 (3级金字塔)"]
-        ENC_H["head: Conv2d(3→32) + ConvBlock"]
-        ENC_D2["conv_down2: ConvBlock(stride2) → 64"]
-        ENC_D4["conv_down4: ConvBlock(stride2) → 128"]
-        ENC_H --> ENC_D2 --> ENC_D4
+    subgraph Encoder
+        ENC["PyramidEncoder<br/>[32,64,96] → 64ch<br/>逐帧编码 → F_stack"]
     end
 
-    subgraph DWT["DWT-LFF 三源分离估计"]
-        DWT_D["HaarDWT2D<br/>→ LL, LH, HL, HH"]
-        DWT_A["illum_alpha<br/>Conv→GELU→Conv→Sigmoid<br/>LL_ref = α·LL (光照/结构)<br/>LL_deg = (1-α)·LL (噪声/退化)"]
-        DWT_S["feat_sace<br/>IDWT(LL_ref, LH, HL, HH)"]
-        DWT_T["feat_tfsi<br/>IDWT(LL_deg, LH, HL, HH)"]
-        DWT_D --> DWT_A
-        DWT_A --> DWT_S
-        DWT_A --> DWT_T
+    subgraph DWT["DWT-LFF 分裂"]
+        DWT_C["lff_center<br/>中心帧, α init=0.6<br/>→ F_lff_t + feat_tfsi"]
+        DWT_N["lff_neighbor<br/>邻居帧, α init=0.4<br/>→ F_lff_Ω"]
     end
 
-    subgraph TFSI["TFSI 路径: 时频交互 (噪声/退化建模)"]
+    subgraph TFSI["TFSI 时频诊断"]
         direction TB
-        TFSI_SFI["SpatialFreqInteraction<br/>FFT → 幅度增强(相位保留)<br/>→ IFFT"]
-        subgraph TFSI_FB["FrequencyBranch (Charlie)"]
-            TFSI_TF["temporal_fuse<br/>Conv3d 中心+邻帧均值融合"]
-            TFSI_FFT["LayerNorm → Conv → FFT<br/>→ 幅度增益 (α·tanh)<br/>→ IFFT"]
-            TFSI_TF --> TFSI_FFT
-        end
-        TFSI_OUT["TFSI 输出: f4_tfsi<br/>(B, T, 128, H/4, W/4)"]
-        TFSI_SFI --> TFSI_OUT
-        TFSI_FB --> TFSI_OUT
+        TFSI_SPATIAL["SpatialBranch<br/>soft-median → μ,σ,SNR → Conv → F_s"]
+        TFSI_FREQ["FrequencyBranch ★多帧<br/>lff_center(中心) + 邻帧时域均值<br/>→ temporal_fuse → F_f"]
+        TFSI_PHASE["phase_conf_head<br/>→ phase_conf (B,1,H,W)"]
+        TFSI_HEAD["IntensityHead<br/>Conv(F_s||F_f||phase_conf)<br/>→ s_illum, s_noise<br/>s_noise×(1+0.5(1-phase_conf))"]
+        TFSI_SPATIAL --> TFSI_HEAD
+        TFSI_FREQ --> TFSI_PHASE
+        TFSI_FREQ --> TFSI_HEAD
+        TFSI_PHASE --> TFSI_HEAD
     end
 
-    subgraph SACE["SACE 路径: 多尺度帧间注意 (光照/结构建模)"]
+    subgraph SACE["SACE 纯 RWKV 帧间注意力"]
         direction TB
-        SACE_IN["sace_in ×3<br/>3组并行投影头<br/>建模三重退化源"]
-
-        subgraph SACE_ATTN["Bi-RWKV 帧间注意力"]
-            direction TB
-            RWKV_S["Q-Shift → Time Mix<br/>mix_k/v/r 可学习混合"]
-            RWKV_WKV["Bi-WKV 跨帧扫描<br/>y = (u·k·v + Σe^w·k·v) / (u·k + Σe^w·k)<br/>post_norm(LayerNorm)<br/>spatial_decay.clamp(-8,8)<br/>spatial_first.clamp(-5,5)"]
-            RWKV_S --> RWKV_WKV
+        SACE_DWT["DWT-LFF 逐帧<br/>center→lff_center<br/>neighbor→lff_neighbor"]
+        SACE_REF["μ_t_clean = lff_stack[center]<br/>σ_t_clean = lff_stack.std<br/>→ MRPN (运动感知)"]
+        
+        subgraph SACE_RWKV["多尺度 Bi-RWKV 帧间注意力"]
+            RWKV_F["full: VRWKV ×2 (双向)"]
+            RWKV_H["half: avg_pool3d(×2) → VRWKV ×2 → bilinear↑"]
+            RWKV_Q["quarter: avg_pool3d(×4) → VRWKV ×2 → bilinear↑"]
+            RWKV_FUSE["★ channel_mix<br/>concat[full,half,quarter](3C)<br/>→ Linear(3C→C) 可学习融合"]
         end
-
-        subgraph SACE_3SRC["三源退化并行处理"]
-            SRC1["Head 1<br/>光照退化估计"]
-            SRC2["Head 2<br/>噪声退化估计"]
-            SRC3["Head 3<br/>纹理退化估计"]
-        end
-
-        SACE_MULTI["多尺度处理<br/>full: H×W<br/>half: avg_pool ×2<br/>quarter: avg_pool ×4"]
-
-        SACE_FUSE["concatenation + channel_mix (Charlie)<br/>cat(full, half↑, quarter↑) → Conv → 融合"]
-
-        SACE_OUT["sace_out ×3<br/>3组输出头 → stack → mean<br/>→ f4_sace (B, T, 128, H/4, W/4)"]
-
-        SACE_IN --> SACE_3SRC
-        SACE_3SRC --> SACE_MULTI
-        SACE_MULTI --> SACE_ATTN
-        SACE_ATTN --> SACE_FUSE
-        SACE_FUSE --> SACE_OUT
+        
+        SACE_GATE["边缘门控 + V raw<br/>edge_weight = edge_prompt(f_raw_center)<br/>F_aligned[t] = out[t] + (1-edge_w)·f_raw<br/>+ (1-s_noise)·f_raw"]
     end
 
-    subgraph 融合层["融合 & 修正"]
-        FUSE["f4_fused = f4_sace + f4_tfsi"]
-
-        subgraph CRWKV["Cross-RWKV (帧间上下文聚合)"]
-            CRWKV_Q["Q-Shift → Time Mix"]
-            CRWKV_WKV["Bi-WKV 跨帧扫描<br/>post_norm + clamp"]
-            CRWKV_Q --> CRWKV_WKV
+    subgraph 三源处理["三源退化并行建模"]
+        direction LR
+        subgraph IFPN["IFPN 光照图估计"]
+            IFPN_F["coarse_adapter → IllumExtract×T<br/>→ L_ratio → lit_up_map_raw [1,5]<br/>→ side_head → ifpn_side<br/>→ f_illum_feat"]
         end
-
-        CSA["CrossScaleAttention<br/>MultiheadAttention<br/>跨空间位置自注意"]
+        subgraph NDPN["NDPN 去噪 ★s_noise条件"]
+            NDPN_F["SNR估计 (μ_t_clean/σ_t_clean)<br/>→ 双因素权重 + s_noise 条件<br/>→ 加权聚合 → f_noise"]
+        end
+        subgraph MRPN["MRPN 运动 ★σ_t_clean感知"]
+            MRPN_F["窗口相关 → 门控融合<br/>+ σ_t_clean 运动置信<br/>→ ResBlock → f_motion"]
+        end
     end
 
-    subgraph Decoder["Decoder 解码器"]
-        DEC_DWT["DWT-LFF skip (f2)<br/>64ch, 全高频"]
-        DEC_U2["conv_up2<br/>128→64→32 (PixelShuffle 2×)"]
-        DEC_U4["conv_up4<br/>64→32→16 (PixelShuffle 2×)"]
-        DEC_TAIL["tail<br/>ConvBlock(48→3) → Conv2d(3→3)"]
-        DEC_DWT --> DEC_U2
-        DEC_U2 --> DEC_U4
-        DEC_U4 --> DEC_TAIL
+    subgraph IGRF["IGRF 逆序修复"]
+        IGRF_S1["Stage1: δ=Fuse(f_noise,img)+s_noise_corr<br/>img_s1=clamp(img+δ)"]
+        IGRF_S2["Stage2: δ=Fuse(f_motion, img_s1)<br/>img_s2=clamp(img_s1+δ)"]
+        IGRF_S3["Stage3: res_t=clamp(img_s2×lit_up_map<br/>+ s_illum·corr_mag)"]
     end
 
-    OUT["输出增强帧<br/>(B×T×3×H×W)"]
+    OUT["输出 res_t"]
 
-    %% ── 数据流 ──
-    IN --> ENC_H
-
-    ENC_D4 --> DWT_D
-    ENC_D2 --> DEC_DWT
-    ENC_H -- "f1 skip" --> DEC_TAIL
-
-    DWT_T --> TFSI_SFI
-    DWT_T --> TFSI_FB
-    DWT_S --> SACE_IN
-
-    TFSI_OUT --> FUSE
-    SACE_OUT --> FUSE
-
-    FUSE --> CRWKV_Q
-    CRWKV_WKV --> CSA
-    CSA --> DEC_U2
-
-    DEC_TAIL --> OUT
+    %% 数据流
+    IN --> ENC
+    ENC --> DWT_C
+    ENC --> DWT_N
+    ENC -- "F_t (中心帧原始)" --> SACE_GATE
+    DWT_C -- "F_lff_t, feat_tfsi" --> TFSI_FREQ
+    DWT_N --> SACE_DWT
+    DWT_C --> SACE_DWT
+    TFSI_HEAD -- "s_illum" --> IGRF_S3
+    TFSI_HEAD -- "s_noise + phase_conf" --> SACE_GATE
+    TFSI_HEAD -- "s_noise" --> NDPN_F
+    TFSI_HEAD -- "s_noise" --> IGRF_S1
+    SACE_REF -- "σ_t_clean" --> MRPN_F
+    SACE_REF -- "μ_t_clean" --> NDPN_F
+    SACE_GATE -- "F_aligned_list" --> IFPN_F
+    SACE_GATE -- "F_aligned_list" --> NDPN_F
+    SACE_GATE -- "F_aligned_list" --> MRPN_F
+    IFPN_F -- "lit_up_map_raw" --> IGRF_S3
+    IFPN_F -- "f_illum_feat" --> IGRF_S3
+    NDPN_F -- "f_noise_out" --> IGRF_S1
+    MRPN_F -- "f_motion_out" --> IGRF_S2
+    IN -- "image_center" --> IGRF_S1
+    IN -- "image_down" --> IFPN_F
+    IGRF_S1 --> IGRF_S2 --> IGRF_S3 --> OUT
 ```
 
-### SACE 三源退化并行建模 详解
+### Charlie vs Bravo 核心差异
+
+| 维度 | Bravo | Charlie |
+|---|---|---|
+| **FrequencyBranch** | 仅中心帧 LFF | ★ 多帧：中心 LFF + 邻帧时域均值 → temporal_fuse |
+| **多尺度融合** | /3 等权平均 | ★ concat+channel_mix (Linear 3C→C) |
+| **σ_t_clean 路由** | → NDPN | ★ → MRPN (运动感知)，NDPN 保留 μ_t_clean |
+| **s_noise 路由** | → SACE + IGRF | → SACE + **NDPN** (条件输入) + IGRF |
+
+### SACE 纯 RWKV 注意力详解
 
 ```
-SACE 内部 (Charlie 关键改动):
+F_stack (B,T,64,H,W)
+  ├─ center frame → lff_center (α=0.6) → Q/V reference
+  ├─ neighbor frames → lff_neighbor (α=0.4) → K source
+  └─ f_raw_center (Encoder 原始) → V source (content)
 
-  feat_sace (B, T, 128, H/4, W/4)
-    │
-    ├─ sace_in ×3 (3组独立投影头)
-    │     ├─ Head 1: Conv(dw)→Conv→GELU  → 光照退化估计
-    │     ├─ Head 2: Conv(dw)→Conv→GELU  → 噪声退化估计
-    │     └─ Head 3: Conv(dw)→Conv→GELU  → 纹理退化估计
-    │
-    ├─ 多尺度 Bi-RWKV 帧间注意力 (per head)
-    │     full:  VRWKVStyleSpatialMix(H×W, 5帧) + post_norm + clamp
-    │     half:  avg_pool(x2) → RWKV → bilinear ↑
-    │     qtr:   avg_pool(x4) → RWKV → bilinear ↑
-    │
-    ├─ 多尺度融合 (Charlie P1-1)
-    │     cat(full, half↑, qtr↑) → channel_mix(3C → C)    ← 替代 /3 平均
-    │
-    └─ sace_out ×3 → stack → mean → f4_sace
+多尺度 Bi-RWKV (Charlie P1-1):
+  full → VRWKV ×2 (fwd+bwd)
+  half → avg_pool3d(1,2,2) → VRWKV ×2 → bilinear↑
+  quarter → avg_pool3d(1,4,4) → VRWKV ×2 → bilinear↑
+  out = channel_mix(concat[full, half, quarter])  ← 可学习融合
+
+边缘门控残差:
+  edge_weight = sigmoid(Conv(f_raw_center))
+  F_aligned[t] = out[t] + (1-edge_weight)·f_raw_center + (1-s_noise)·f_raw_center
 ```
 
-### 整体框架：三源分离估计 → 三源退化并行建模 → 修正去噪
+### 损失函数
 
-| 阶段 | 模块 | 功能 |
-|------|------|------|
-| **Phase 1: 三源分离估计** | DWT-LFF (Haar + α门控) | 小波分解 4子带, α 自适应分配 LL 到光照/退化两路; HF (LH/HL/HH) 全共享给两分支 |
-| **Phase 2: 三源退化并行建模** | TFSI (时频路径) + SACE (空域路径) | TFSI: temporal_fuse 多帧融合 + FFT 频域增强 建模噪声/退化; SACE: 3头多尺度 RWKV 帧间注意力 建模光照/噪声/纹理三重退化 |
-| **Phase 3: 修正去噪** | Fusion + Cross-RWKV + Decoder | 特征相加融合 → Bi-WKV 跨帧修正 → CSA 空间自注意 → PixelShuffle 解码 (含 DWT-LFF skip) |
-
-### Charlie vs Bravo 架构差异
-
-| 模块 | Bravo | Charlie |
-|------|-------|---------|
-| TFSI F.B. | 单帧 LFF + phase_conf | 多帧 temporal_fuse (Conv3d) |
-| SACE 融合 | /3 等权平均 | concat + channel_mix |
-| SACE 三源建模 | 隐式 (统一处理) | 显式 3 头并行 |
-| DWT-LFF HF | 0.5 共享 | 全高频 (无共享) |
-| RWKV 稳定化 | 无 | post_norm + clamp(-8,8)+clamp(-5,5) |
-| MRPN | 窗口相关 + 门控 | σ_t 输入 (实验中) |
-| 损失权重 | 0.8p/0.3c/0.5s | 0.04p/1.0c/0.2s |
+```
+L_total = 1.0·Charbonnier(res, GT) + 0.04·VGG(relu3_3) + 0.2·(1-SSIM)
+        + 0.05·L_freq + 0.001·L_illum_smooth + 0.02·L_illum_sup
+        + 0.2·L_inter + 0.1·L_ifpn_sup
+```
