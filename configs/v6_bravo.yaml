@@ -25,8 +25,8 @@ model:
   use_pure_rwkv: true
 train:
   batch_size: 2
-  epochs: 50
-  lr: 0.001
+  epochs: 30
+  lr: 0.0008
   weight_decay: 0.0001
   amp: false
   log_interval: 50
@@ -37,10 +37,10 @@ loss:
   type: TFSNetLoss
   use_freq_loss: true
   perceptual_pretrained: true
-  lambda_perc: 0.8
+  lambda_perc: 0.4
   lambda_freq: 0.05
   lambda_illum: 0.001
-  lambda_ssim: 0.5
+  lambda_ssim: 0.3
   lambda_inter: 0.2
   fused_channels: 64
   lambda_illum_sup: 0.02
@@ -48,8 +48,7 @@ loss:
   perc_multilayer: false
   freq_with_phase: false
   lambda_ifpn_sup: 0.1
-  # Bravo plan P0-1: pixel loss reduced to 0.3 via lambda_pix (in code)
-  lambda_pix: 0.3
+  lambda_pix: 0.5
 eval:
   tile_size: 256
   tile_overlap: 32

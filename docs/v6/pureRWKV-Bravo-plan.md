@@ -267,15 +267,29 @@ class ModifiedTFSI(nn.Module):
 
 ---
 
-## 五、实施优先级建议
+## 五、实施状态（2026-06-28 更新）
 
-| 优先级 | 修改项 | 风险 | 收益 |
-|-------|-------|------|------|
-| 🔥 P0 | 损失权重调整（§2） | 极低 | 立即缓解未对齐数据训练困难 |
-| 🔥 P0 | TFSI phase_conf 通道（§3） | 低 | s_noise 更准确，下游受益 |
-| ⚡ P1 | DWT-LFF 拆分 + V取原始（§1） | 中 | 需重训练，预期 +0.2~0.5 dB |
-| ⚡ P1 | 删除 AmpEnhance + DAT（§4） | 低 | 1.169M → ~1.00M |
-| 🔧 P2 | IFPN/IGRF 内部精简 | 低 | 边际收益 |
+| 优先级 | 修改项 | 状态 | 文件 | 说明 |
+|-------|-------|------|------|------|
+| 🔥 P0 | 损失权重: VGG 0.4 + SSIM 0.3 + pix 0.5 | ✅ 已实施 | configs/v6_bravo.yaml, losses/losses.py | 均衡版(1.4:1), VGG+SSIM温和主导 |
+| 🔥 P0 | TFSI phase_conf + s_noise 调制 | ✅ 已实施 | tfsi.py | phase_conf_head → IntensityHead |
+| ⚡ P1 | DWT-LFF 拆分 (α 0.6/0.4) | ✅ 已实施 | pure_rwkv_sace.py:50-51 | lff_center + lff_neighbor 独立实例 |
+| ⚡ P1 | V 源 = Encoder 原始中心帧 | ✅ 已实施 | pure_rwkv_sace.py:150 | f_raw_center 替换 lff_stack |
+| ⚡ P1 | 删除 DAT | ✅ v6.5 已移除 | pure_rwkv_sace.py | PureRWKVSACE |
+| ⚡ P1 | 删除 AmpEnhance | ⏸ 代码保留 | — | config 已关闭 |
+| 🔧 P2 | IFPN/IGRF 精简 | ⏸ | — | 边际收益 |
+| — | size-mismatch ckpt 加载 | ✅ 已实施 | train.py | 过滤 shape 不匹配的 key |
+
+### 五-B：训练实证（2026-06-28）
+
+**Run 1（崩塌）**: lr=0.001, VGG 0.8+SSIM 0.5+pix 0.3
+- ep5 PSNR=19.79 → ep10 暴跌 11.32 (-8.5dB) → ep15 锁定 10.85
+- **教训**: VGG+SSIM=1.3 碾压 pix=0.3 (4.3:1), warmup 结束后 lr 跳升触发放大。**损失权重必须逐项消融。**
+
+**Run 2（均衡版，进行中）**: lr=0.0008, VGG 0.4+SSIM 0.3+pix 0.5, warmup=5
+- VGG+SSIM=0.7 : pix=0.5 = 1.4:1, 温和主导
+- loss 正常下降 (0.489→0.446), 无崩塌迹象
+- ep5 验证约 4h 后出
 
 ---
 
