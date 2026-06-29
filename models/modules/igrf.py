@@ -117,32 +117,27 @@ class BrightenStage(nn.Module):
             Block(img_channels),
             nn.Conv2d(img_channels, img_channels, 3, 1, 1),
         )
-        # v5.5: s_illum additive correction — zero-init so initial behavior = v4.3
-        self.illum_corr = nn.Conv2d(channels, img_channels, kernel_size=1, bias=True)
-        nn.init.zeros_(self.illum_corr.weight)
-        nn.init.zeros_(self.illum_corr.bias)
+        # Charlie2 D4: VSRELL 风格统一 A_illu (移除 additive correction)
+        # A_illu = sigmoid(Conv(f_illum_feat)), s_illum 门控提亮强度
+        self.unified_illu = nn.Sequential(
+            nn.Conv2d(channels, 1, 3, 1, 1),
+            nn.Sigmoid(),
+        )
 
     def forward(self, lit_up_map_raw: torch.Tensor, f_illum_feat: torch.Tensor,
                 img_dark: torch.Tensor, s_illum: torch.Tensor = None):
         feat_cond = self.feat_proj(f_illum_feat)
         img_cond = self.img_proj(img_dark)
         delta = self.delta_refine(torch.cat([feat_cond, img_cond], dim=1))
-
-        # Bounded delta: adjustment limited to +/- max_delta (default +/-50%)
         lit_up_map = lit_up_map_raw * (1.0 + torch.tanh(delta) * self.max_delta)
         lit_up_map = lit_up_map.clamp(min=0.5)
 
-        # Multiplicative base (Retinex)
-        brighten_base = img_dark * lit_up_map
-
-        # v5.5: additive s_illum correction (zero-init -> initial res_t = brighten_base)
+        # Charlie2 D4: VSRELL 单一 A_illu — s_illum 门控提亮强度
+        A_illu = self.unified_illu(f_illum_feat)  # (B, 1, H, W)
         if s_illum is not None:
-            corr_mag = self.illum_corr(f_illum_feat)
-            illum_residual = s_illum * corr_mag
-            res_t = torch.clamp(brighten_base + illum_residual, 0.0, 1.0)
-        else:
-            res_t = torch.clamp(brighten_base, 0.0, 1.0)
+            lit_up_map = lit_up_map * (1.0 + s_illum * A_illu)
 
+        res_t = torch.clamp(img_dark * lit_up_map, 0.0, 1.0)
         return res_t, lit_up_map
 
 

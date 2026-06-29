@@ -1,4 +1,4 @@
-# TFS-Net v6 Charlie 整体架构图 (2026-06-29, 更新: Charlie P0/P1/P2 数据流实施)
+# TFS-Net v6 Charlie2 整体架构图 (2026-06-29, 更新: Charlie2 D1-D4 实施)
 
 ## 图一：最简架构（三源分离估计-三源处理-修正去噪）
 
@@ -15,17 +15,17 @@ flowchart TD
     end
 
     subgraph 对齐层
-        SACE["SACE<br/>纯 RWKV 帧间注意力<br/>多尺度双向 Bi-WKV<br/>concat+channel_mix 融合<br/>V 源 = Encoder 原始中心帧"]
+        SACE["SACE<br/>纯 RWKV 帧间注意力<br/>多尺度双向 Bi-WKV<br/>concat+channel_mix 融合<br/>V 源 = Encoder 原始中心帧<br/>★ Charlie2: s_noise 已移除"]
     end
 
     subgraph 处理层["三源退化并行建模"]
-        IFPN["IFPN<br/>光照图估计"]
-        NDPN["NDPN<br/>SNR自适应去噪<br/>s_noise 条件输入 ★"]
-        MRPN["MRPN<br/>运动补偿<br/>σ→MRPN 运动感知 ★"]
+        IFPN["IFPN<br/>光照图估计<br/>★ Charlie2: s_illum 调制 + encoder 特征输入"]
+        NDPN["NDPN<br/>SNR自适应去噪<br/>s_noise 条件输入"]
+        MRPN["MRPN<br/>运动补偿<br/>σ→MRPN 运动感知"]
     end
 
     subgraph 执行层["修正去噪"]
-        IGRF["IGRF<br/>去噪→去模糊→提亮<br/>★ IGRF ≠ s_noise"]
+        IGRF["IGRF<br/>去噪→去模糊→提亮<br/>★ Charlie2: VSRELL A_illu 单一光照"]
     end
 
     OUT["输出 res_t"]
@@ -33,17 +33,18 @@ flowchart TD
     IN --> ENC
     ENC --> DWT
     ENC -- "F_t (中心帧原始)" --> SACE
+    ENC -- "encoder 特征 ★" --> IFPN
     DWT --> TFSI
     DWT --> SACE
-    TFSI -- "s_illum" --> IGRF
-    TFSI -- "s_noise + phase_conf" --> SACE
+    TFSI -- "s_illum ★" --> IGRF
+    TFSI -- "s_illum ★" --> IFPN
     TFSI -- "s_noise ★" --> NDPN
 
     SACE -- "F_aligned" --> IFPN
     SACE -- "F_aligned, μ_t_clean, σ_t_clean" --> NDPN
-    SACE -- "F_aligned, σ_t_clean ★" --> MRPN
+    SACE -- "F_aligned, σ_t_clean" --> MRPN
 
-    IFPN -- "lit_up_map, f_illum" --> IGRF
+    IFPN -- "f_illum" --> IGRF
     NDPN -- "f_noise" --> IGRF
     MRPN -- "f_motion" --> IGRF
 

@@ -158,13 +158,8 @@ class PureRWKVSACE(nn.Module):
 
         F_aligned_list: List[torch.Tensor] = []
         for t in range(T):
-            # RWKV 对齐输出 + 原始内容残差 (V source = encoder raw)
-            f_t = out[:, t] + (1.0 - edge_weight) * f_raw_center
-            # 噪声感知残差: 也在原始空间
-            if s_noise is not None:
-                f_t = f_t + (1.0 - s_noise) * f_raw_center
-            else:
-                f_t = f_t + f_raw_center
+            # V raw 残差融合 (Charlie2: 移除 s_noise 调制, 噪声信息仅去 NDPN)
+            f_t = out[:, t] + f_raw_center
             f_t = self.norm_out(f_t)
             F_aligned_list.append(f_t)
 

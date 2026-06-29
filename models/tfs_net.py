@@ -98,6 +98,9 @@ class TFSNet(nn.Module):
             num_bottleneck_blocks=num_bottleneck_blocks,
         )
 
+        # Charlie2 D2: IFPN 图像输入 → encoder 特征投影 (64→3)
+        self.feat_to_img = nn.Conv2d(fused_channels, in_channels, 3, 1, 1)
+
         # v6 Bravo: DWT-LFF — TFSI 用 center (α=0.6 锚定), SACE 自建双实例
         self.use_dwt_lff = use_dwt_lff
         if use_dwt_lff:
@@ -237,21 +240,26 @@ class TFSNet(nn.Module):
         # v5.3: IFPN 改用 SACE 对齐特征（不再使用 Encoder 粗特征）
         aligned_feats = torch.stack(F_aligned_list, dim=1)  # (B, T, C_f, H, W)
 
-        # 下采样图像到粗特征分辨率（H/4, W/4 由编码器结构决定）
+        # Charlie2 D2: IFPN 输入用 Encoder 浅层特征 (避免原始噪声泄漏)
         h_c, w_c = H // 4, W // 4
+        f_center_for_ifpn = feats[:, center_idx]  # (B, 64, H, W) encoder 中心帧
         image_down = F.interpolate(
-            image_center, size=(h_c, w_c), mode='bicubic', align_corners=False
+            self.feat_to_img(f_center_for_ifpn),
+            size=(h_c, w_c), mode='bilinear', align_corners=False
         )
+        # 邻帧图像: 对 encoder 邻帧做同样投影
+        imgs_flat = feats.reshape(B * T, feats.shape[2], H, W)
+        imgs_proj = self.feat_to_img(imgs_flat)
         imgs_down = F.interpolate(
-            x.view(B * T, C_in, H, W),
-            size=(h_c, w_c), mode='bicubic', align_corners=False,
-        ).view(B, T, C_in, h_c, w_c)
+            imgs_proj, size=(h_c, w_c), mode='bilinear', align_corners=False
+        ).view(B, T, imgs_proj.shape[1], h_c, w_c)
 
         ifpn_out = self.ifpn(
             I_t_down=image_down,
             aligned_feats=aligned_feats,
             center_idx=center_idx,
             imgs_down=imgs_down,
+            s_illum=s_illum,
         )
 
         ndpn_out = self.ndpn(

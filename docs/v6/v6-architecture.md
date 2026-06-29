@@ -211,4 +211,5 @@ Stage3: res_t = clamp(img_s2 × lit_up_map + s_illum × corr_mag)
 | v5.9.2 | s_illum 复生 + IFPN 监督 | 1.14M | 20.39 |
 | v6.5 | PureRWKV 移除 DAT | 1.17M | 20.36 |
 | v6 Bravo | 损失重调 + DWT-LFF分裂 + V raw | 1.20M | 20.05 |
-| **v6 Charlie** | **多帧 F.B. + concat fusion + NDPN s_noise + σ→MRPN + blur_mask** | **1.25M** | 训练中 |
+| v6 Charlie | 多帧 F.B. + concat fusion + NDPN s_noise + σ→MRPN + blur_mask | 1.25M | 训练中 |
+| **v6 Charlie2** | **D1 s_noise→NDPN only + D2 encoder feat→IFPN + D3 s_illum→IFPN gate + D4 VSRELL A_illu** | **1.26M** | 训练中 |

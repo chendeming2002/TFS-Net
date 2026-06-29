@@ -100,6 +100,12 @@ class IFPN(nn.Module):
             nn.GELU(),
         )
 
+        # Charlie2 D3: s_illum 光照感知调制 (VSRELL 风格 A_illu)
+        self.illum_modulate = nn.Sequential(
+            nn.Conv2d(1, self.aligned_channels, 3, 1, 1),
+            nn.Sigmoid(),
+        )
+
         self.illum_extract = IllumExtract(
             img_channels=img_channels,
             feat_channels=coarse_channels,
@@ -141,6 +147,7 @@ class IFPN(nn.Module):
         aligned_feats: torch.Tensor,
         center_idx: int,
         imgs_down: torch.Tensor = None,
+        s_illum: torch.Tensor = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Args:
@@ -148,10 +155,15 @@ class IFPN(nn.Module):
             aligned_feats : (B, T, C_a, H, W) SACE 对齐后的多帧特征
             center_idx    : 中心帧索引
             imgs_down     : (B, T, 3, h, w) 下采样后的多帧图像（可选）
-
-        v5.5: s_illum removed — directly injected into IGRF BrightenStage instead.
+            s_illum       : (B, 1, H, W) TFSI 光照退化强度 (Charlie2 D3 新增)
         """
         B, T, C_a, H, W = aligned_feats.shape
+
+        # Charlie2 D3: s_illum 光照感知调制 — 暗区(s_illum高)→gate大→激进特征增强
+        if s_illum is not None:
+            illum_gate = self.illum_modulate(s_illum)  # (B, C_a, H, W)
+            # broadcast: (B,T,C_a,H,W) * (B,1,C_a,H,W)
+            aligned_feats = aligned_feats * (1.0 + illum_gate.unsqueeze(1) * s_illum.unsqueeze(1))
 
         # v5.3: 从 SACE 对齐特征生成粗特征（通道投影 + 空间下采样）
         BT = B * T

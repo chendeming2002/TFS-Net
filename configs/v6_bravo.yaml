@@ -1,5 +1,5 @@
 seed: 42
-output_dir: outputs/sdsd_v6_bravo
+output_dir: outputs/sdsd_v6_charlie2
 dataset:
   train_input_root: /home/a1005/yzy/dataset/SDSD/indoor/input
   train_target_root: /home/a1005/yzy/dataset/SDSD/indoor/GT
