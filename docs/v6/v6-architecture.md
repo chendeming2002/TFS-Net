@@ -149,4 +149,4 @@ s_noise *= (1 + 0.5·(1-phase_conf))   # 相位不可靠 → 增强去噪
 | v5.9.1 | fuse 修复 | 1.12M | 20.11 |
 | v5.9.2 | s_illum 复生 + IFPN 监督 | 1.14M | 20.39 |
 | v6.5 | PureRWKV 移除 DAT | 1.17M | 20.36 |
-| **v6 Bravo** | **损失重调 + phase_conf + DWT-LFF分裂 + V raw** | **1.20M** | ✅ 训练中 | ep5=19.79 (初次崩塌), ep5=待出 (均衡版) |
+| **v6 Bravo** | **损失重调 + phase_conf + DWT-LFF分裂 + V raw** | **1.20M** | ✅ 训练完成 | **ep5=20.05 (历史最高!)** +0.44 dB vs v5.9.2 |

@@ -276,6 +276,21 @@ RWKV 缺少硬约束 ───────────────────�
 
 ---
 
+## 六、训练实证（2026-06-29）
+
+**Bravo2 ep5**: PSNR=**20.05**, SSIM=0.7676 — **历史最高 ep5！**
+
+| 实验 | ep5 PSNR | SSIM | 说明 |
+|---|---|---|---|
+| v5.5 | 19.09 | 0.7577 | fuse 死亡 |
+| v5.9.2 | 19.61 | 0.7595 | s_illum 复生 |
+| v6.5 | 19.74 | 0.7620 | Pure RWKV |
+| **Bravo2** | **20.05** | **0.7676** | **+0.44 dB vs v5.9.2** |
+
+三项修复验证成功：P0(VGG 0.04+pix 1.0)→训练稳定无崩塌, P1(RWKV clamp)→数值稳定, P2(DWT-LFF完整HF)→双分支差异化。
+
+---
+
 ## 参考来源
 
 1. [Vision-RWKV: Efficient and Scalable Visual Perception with RWKV-Like Architectures (ICLR 2025)](https://arxiv.org/html/2403.02308)
