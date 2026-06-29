@@ -20,7 +20,7 @@ flowchart TD
 
     subgraph 处理层["三源退化并行建模"]
         IFPN["IFPN<br/>光照图估计"]
-        NDPN["NDPN<br/>SNR自适应去噪<br/>+ s_noise 条件输入"]
+        NDPN["NDPN<br/>SNR自适应去噪<br/>+ s_noise 条件输入 (noise_proj)"]
         MRPN["MRPN<br/>运动补偿<br/>+ σ_t_clean 运动感知"]
     end
 
@@ -82,7 +82,7 @@ flowchart TD
         TFSI_SPATIAL["SpatialBranch<br/>soft-median → μ,σ,SNR → Conv → F_s"]
         TFSI_FREQ["FrequencyBranch ★多帧<br/>lff_center(中心) + 邻帧时域均值<br/>→ temporal_fuse → F_f"]
         TFSI_PHASE["phase_conf_head<br/>→ phase_conf (B,1,H,W)"]
-        TFSI_HEAD["IntensityHead<br/>Conv(F_s||F_f||phase_conf)<br/>→ s_illum, s_noise<br/>s_noise×(1+0.5(1-phase_conf))"]
+        TFSI_HEAD["IntensityHead<br/>Conv(F_s||F_f||phase_conf)<br/>→ s_illum, s_noise<br/>s_noise×(1-0.3(1-phase_conf))"]
         TFSI_SPATIAL --> TFSI_HEAD
         TFSI_FREQ --> TFSI_PHASE
         TFSI_FREQ --> TFSI_HEAD
@@ -110,7 +110,7 @@ flowchart TD
             IFPN_F["coarse_adapter → IllumExtract×T<br/>→ L_ratio → lit_up_map_raw [1,5]<br/>→ side_head → ifpn_side<br/>→ f_illum_feat"]
         end
         subgraph NDPN["NDPN 去噪 ★s_noise条件"]
-            NDPN_F["SNR估计 (μ_t_clean/σ_t_clean)<br/>→ 双因素权重 + s_noise 条件<br/>→ 加权聚合 → f_noise"]
+            NDPN_F["SNR估计 (μ_t_clean/σ_t_clean)<br/>→ 双因素权重 + s_noise 条件<br/>(noise_proj → 0初始化)<br/>→ 加权聚合 → f_noise"]
         end
         subgraph MRPN["MRPN 运动 ★σ_t_clean感知"]
             MRPN_F["窗口相关 → 门控融合<br/>+ σ_t_clean 运动置信<br/>→ ResBlock → f_motion"]
@@ -158,7 +158,8 @@ flowchart TD
 | **FrequencyBranch** | 仅中心帧 LFF | ★ 多帧：中心 LFF + 邻帧时域均值 → temporal_fuse |
 | **多尺度融合** | /3 等权平均 | ★ concat+channel_mix (Linear 3C→C) |
 | **σ_t_clean 路由** | → NDPN | ★ → MRPN (运动感知)，NDPN 保留 μ_t_clean |
-| **s_noise 路由** | → SACE + IGRF | → SACE + **NDPN** (条件输入) + IGRF |
+| **phase_conf 方向** | +(1+0.5(1-pc)) (→s_noise↑) | **−(1−0.3(1-pc)) (→s_noise↓)** |
+| **s_noise 路由** | → SACE + IGRF | → SACE + **NDPN** (noise_proj条件) + IGRF |
 
 ### SACE 纯 RWKV 注意力详解
 

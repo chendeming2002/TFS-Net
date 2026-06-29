@@ -215,9 +215,9 @@ class IntensityHead(nn.Module):
         intensities = torch.sigmoid(raw)
         s_illum = intensities[:, 0:1]
         s_noise = intensities[:, 1:2]
-        # Bravo: phase_conf 调制 s_noise — 相位不可靠 → 加强去噪
+        # Charlie: phase_conf 调制 s_noise — 相位不可靠 → 减小 s_noise → 增大中心帧残差贡献
         if phase_conf is not None:
-            s_noise = s_noise * (1.0 + 0.5 * (1.0 - phase_conf))
+            s_noise = s_noise * (1.0 - 0.3 * (1.0 - phase_conf))
             s_noise = s_noise.clamp(0.0, 1.0)
         return {"s_illum": s_illum, "s_noise": s_noise}
 

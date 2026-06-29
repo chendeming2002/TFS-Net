@@ -149,4 +149,4 @@ s_noise *= (1 + 0.5·(1-phase_conf))   # 相位不可靠 → 增强去噪
 | v5.9.1 | fuse 修复 | 1.12M | 20.11 |
 | v5.9.2 | s_illum 复生 + IFPN 监督 | 1.14M | 20.39 |
 | v6.5 | PureRWKV 移除 DAT | 1.17M | 20.36 |
-| **v6 Charlie** | **多帧 FrequencyBranch + 多尺度 concat fusion + σ→MRPN** | **1.25M** | ✅ 训练中 | 在 Bravo2 基础上叠加 |
+| **v6 Charlie** | **多帧 FrequencyBranch + 多尺度 concat + NDPN s_noise条件 + phase_conf方向修正** | **1.25M** | ✅ 训练中 | loss 0.28→0.25 正常下降, illum=0.08 活跃 |

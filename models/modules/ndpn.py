@@ -56,6 +56,10 @@ class NDPN(nn.Module):
             ConvBlock(channels, channels, kernel_size=3, stride=1, padding=1, act=True),
             ConvBlock(channels, channels, kernel_size=1, stride=1, padding=0, act=False),
         )
+        # Charlie P0-2: s_noise 条件输入 — 投影到特征空间后与去噪特征融合
+        self.noise_proj = nn.Conv2d(1, channels, 1, 1, 0)
+        nn.init.zeros_(self.noise_proj.weight)
+        nn.init.zeros_(self.noise_proj.bias)
 
     def forward(
         self,
@@ -103,8 +107,9 @@ class NDPN(nn.Module):
 
         F_denoised = self.refine(F_denoised)
 
-        # 移除双重门控：直接输出去噪特征（由 IGRF 统一做强度加权）
-        f_noise_out = F_denoised
+        # Charlie P0-2: s_noise 作为条件调制去噪强度
+        noise_cond = self.noise_proj(s_noise)  # (B, C, H, W)
+        f_noise_out = F_denoised + noise_cond
 
         return {
             "f_noise_out": f_noise_out,
