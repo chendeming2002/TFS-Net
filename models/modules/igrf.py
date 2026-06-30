@@ -23,7 +23,7 @@ References:
 
 import torch
 import torch.nn as nn
-
+import torch.nn.functional as F
 from .blocks import ResBlock, NAFBlock
 
 
@@ -117,25 +117,21 @@ class BrightenStage(nn.Module):
             Block(img_channels),
             nn.Conv2d(img_channels, img_channels, 3, 1, 1),
         )
-        # Charlie2 D4: VSRELL 风格统一 A_illu (移除 additive correction)
-        # A_illu = sigmoid(Conv(f_illum_feat)), s_illum 门控提亮强度
-        self.unified_illu = nn.Sequential(
-            nn.Conv2d(channels, 1, 3, 1, 1),
-            nn.Sigmoid(),
-        )
+        # Delta: unified_illu 已移除 — A_illu 改由 IFPN 生成并传入
 
     def forward(self, lit_up_map_raw: torch.Tensor, f_illum_feat: torch.Tensor,
-                img_dark: torch.Tensor):
-        """Charlie3 P0: s_illum 已移除 — 光照信息经 IFPN 融合后已蕴含在 f_illum_feat 中"""
+                img_dark: torch.Tensor, A_illu: torch.Tensor = None):
+        """Delta: A_illu 由 IFPN 传入，不再内部生成"""
         feat_cond = self.feat_proj(f_illum_feat)
         img_cond = self.img_proj(img_dark)
         delta = self.delta_refine(torch.cat([feat_cond, img_cond], dim=1))
         lit_up_map = lit_up_map_raw * (1.0 + torch.tanh(delta) * self.max_delta)
         lit_up_map = lit_up_map.clamp(min=0.5)
 
-        # Charlie3 P0: VSRELL A_illu — f_illum_feat 已含 s_illum 信息 (经 IFPN s_illum_proj)
-        A_illu = self.unified_illu(f_illum_feat)  # (B, 1, H, W)
-        lit_up_map = lit_up_map * (1.0 + A_illu)
+        if A_illu is not None:
+            A_resized = F.interpolate(A_illu, size=lit_up_map.shape[-2:],
+                                      mode='bilinear', align_corners=False)
+            lit_up_map = lit_up_map * (1.0 + A_resized)
 
         res_t = torch.clamp(img_dark * lit_up_map, 0.0, 1.0)
         return res_t, lit_up_map
@@ -179,17 +175,13 @@ class IGRF(nn.Module):
         f_motion_out: torch.Tensor,
         lit_up_map_raw: torch.Tensor,
         image_center: torch.Tensor,
+        A_illu: torch.Tensor = None,
         s_noise: torch.Tensor = None,
     ) -> dict:
-        """Charlie3 P0: s_illum 已移除 — 光照信息经 IFPN→f_illum_feat 承载"""
-        # Stage 1: denoise (in dark domain, noise amplitude is small)
+        """Delta: A_illu 由 IFPN 生成传入"""
         img_s1, delta_s1 = self.stage_noise(f_noise_out, image_center, s_intensity=s_noise)
-
-        # Stage 2: motion deblur (no intensity prior)
         img_s2, delta_s2 = self.stage_motion(f_motion_out, img_s1)
-
-        # Stage 3: VSRELL brightening (s_illum 信息已包含在 f_illum_feat 中)
-        res_t, lit_up_map = self.brighten(lit_up_map_raw, f_illum_feat, img_s2)
+        res_t, lit_up_map = self.brighten(lit_up_map_raw, f_illum_feat, img_s2, A_illu=A_illu)
 
         return {
             "res_t":       res_t,

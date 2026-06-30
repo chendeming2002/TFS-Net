@@ -111,6 +111,21 @@ class IFPN(nn.Module):
         nn.init.zeros_(self.s_illum_proj[2].weight)
         nn.init.zeros_(self.s_illum_proj[2].bias)
 
+        # Delta: A_illu 生成 (从 IGRF 移入)
+        self.illu_conv = nn.Sequential(
+            nn.Conv2d(fused_channels, fused_channels, 3, 1, 1, groups=fused_channels),
+            nn.Conv2d(fused_channels, 1, 1),
+            nn.Sigmoid(),
+        )
+
+        # Delta: F_t_aligned 锚定光照 (参考 FRESCO spatial correspondence)
+        self.illu_anchor = nn.Sequential(
+            nn.Conv2d(fused_channels * 2, fused_channels, 1),
+            nn.GELU(),
+            nn.Conv2d(fused_channels, fused_channels, 1),
+        )
+        self.illu_anchor_gate = nn.Parameter(torch.zeros(1, fused_channels, 1, 1))
+
         self.illum_extract = IllumExtract(
             img_channels=img_channels,
             feat_channels=coarse_channels,
@@ -153,6 +168,7 @@ class IFPN(nn.Module):
         center_idx: int,
         imgs_down: torch.Tensor = None,
         s_illum: torch.Tensor = None,
+        F_t_aligned: torch.Tensor = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Args:
@@ -160,7 +176,8 @@ class IFPN(nn.Module):
             aligned_feats : (B, T, C_a, H, W) SACE 对齐后的多帧特征
             center_idx    : 中心帧索引
             imgs_down     : (B, T, 3, h, w) 下采样后的多帧图像（可选）
-            s_illum       : (B, 1, H, W) TFSI 光照退化强度 (Charlie2 D3 新增)
+            s_illum       : (B, 1, H, W) TFSI 光照退化强度
+            F_t_aligned   : (B, C_coarse, H, W) Delta SACE 对齐增强特征
         """
         B, T, C_a, H, W = aligned_feats.shape
 
@@ -226,6 +243,16 @@ class IFPN(nn.Module):
         # v5.5: s_illum no longer concatenated here — directly injected into IGRF
         f_illum_feat = self.feat_refine(ratio_feat)
 
+        # Delta: F_t_aligned 锚定光照特征 (防止帧间闪烁)
+        if F_t_aligned is not None:
+            F_t_resized = F.interpolate(F_t_aligned, size=f_illum_feat.shape[-2:],
+                                        mode='bilinear', align_corners=False)
+            anchor_feat = self.illu_anchor(torch.cat([f_illum_feat, F_t_resized], dim=1))
+            f_illum_feat = f_illum_feat + anchor_feat * self.illu_anchor_gate.tanh()
+
+        # Delta: A_illu 生成 (从 IGRF 移入)
+        A_illu = self.illu_conv(f_illum_feat)  # (B, C_coarse, h, w)
+
         # v4.3: hybrid estimation - L_ratio anchor + feature-space delta
         lit_up_delta = self.lit_up_proj(f_illum_feat)              # 64ch -> 3ch
         lit_up_feat = L_ratio + lit_up_delta                        # physical anchor + feature correction
@@ -236,9 +263,10 @@ class IFPN(nn.Module):
 
         return {
             "lit_up_map_raw": lit_up_map_raw,
-            "f_illum_feat":  f_illum_feat,
-            "L_t":           L_t,
-            "L_ref":         L_ref,
-            "L_ratio":       L_ratio,
-            "ifpn_side":     ifpn_side,
+            "f_illum_feat":   f_illum_feat,
+            "A_illu":         A_illu,         # Delta: 从 IGRF 移入
+            "L_t":            L_t,
+            "L_ref":          L_ref,
+            "L_ratio":        L_ratio,
+            "ifpn_side":      ifpn_side,
         }

@@ -65,22 +65,37 @@ class NDPN(nn.Module):
         sigma_t_clean: torch.Tensor,
         s_noise: torch.Tensor,
         center_idx: int,
+        C_omega_list: list = None,
+        F_t_aligned: torch.Tensor = None,
     ) -> Dict[str, torch.Tensor]:
         B, T, C, H, W = feats.shape
         assert len(F_aligned_list) == T
         assert C == self.channels
 
-        # Step 1: SNR 估计 (M2: sigma_t_clean 与 mu_t_clean 同处 LFF 域, 尺度一致)
+        # Step 1: SNR 估计
         eps = 1e-6
         signal = mu_t_clean.abs().mean(dim=1, keepdim=True)
         noise = sigma_t_clean.mean(dim=1, keepdim=True)
         snr_hat = signal / (noise + eps)
-
         tau_scale = torch.exp(self.log_tau_scale).clamp(min=1e-2)
         s_snr = torch.sigmoid((snr_hat - self.tau_mid) / tau_scale)
 
+        # Delta: correspondence confidence from C_omega_list
+        conf_map = None
+        if C_omega_list is not None and len(C_omega_list) > 0:
+            diag_scores = []
+            for C_t in C_omega_list:
+                diag = C_t.diagonal(dim1=-2, dim2=-1)
+                diag_scores.append(diag)
+            diag_stack = torch.stack(diag_scores, dim=-1)  # (B, N, T-1)
+            conf_map = diag_stack.mean(dim=-1)  # (B, N) avg confidence
+            ds = int(conf_map.shape[-1] ** 0.5)
+            conf_map = conf_map.reshape(B, 1, ds, ds)
+            conf_map = F.interpolate(conf_map, size=(H, W), mode='bilinear',
+                                     align_corners=False)  # (B, 1, H, W)
+
         # Step 2: 各帧权重
-        F_t = feats[:, center_idx]
+        F_t = F_t_aligned if F_t_aligned is not None else feats[:, center_idx]
         alphas: List[torch.Tensor] = []
 
         for i in range(T):
@@ -103,8 +118,12 @@ class NDPN(nn.Module):
 
         F_denoised = self.refine(F_denoised)
 
-        # Charlie P0-2: s_noise 作为条件调制去噪强度
-        noise_cond = self.noise_proj(s_noise)  # (B, C, H, W)
+        # Delta: correspondence confidence modulates denoising
+        if conf_map is not None:
+            F_denoised = F_denoised * (0.5 + 0.5 * conf_map)
+
+        # s_noise 条件调制
+        noise_cond = self.noise_proj(s_noise)
         f_noise_out = F_denoised + noise_cond
 
         return {

@@ -1,5 +1,5 @@
 seed: 42
-output_dir: outputs/sdsd_v6_charlie3
+output_dir: outputs/sdsd_delta
 dataset:
   train_input_root: /home/a1005/yzy/dataset/SDSD/indoor/input
   train_target_root: /home/a1005/yzy/dataset/SDSD/indoor/GT
@@ -24,7 +24,7 @@ model:
   use_dwt_lff: true
   use_pure_rwkv: true
 train:
-  batch_size: 2
+  batch_size: 1
   epochs: 50
   lr: 0.0008
   weight_decay: 0.0001

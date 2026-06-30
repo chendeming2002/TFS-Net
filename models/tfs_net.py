@@ -39,35 +39,50 @@ from models.modules.pure_rwkv_sace import PureRWKVSACE
 
 
 class CrossFusionGate(nn.Module):
-    """Charlie3 P1: NDPN/MRPN 输出端交叉门控 (VSRELL cross-modulation + AMBFF adaptive fusion)
+    """Charlie3 P1 + Delta: NDPN/MRPN 交叉门控 (结构性重参数化)
 
-    各分支保持独立推理，仅在送入 IGRF 前做互补置信度交换:
-      - 运动剧烈区 → 降低去噪置信度 (gate_noise)
-      - 高噪声区   → 降低运动补偿置信度 (gate_motion)
-    零初始化最后一层 → 初始行为近似恒等，渐进学习。
+    训练时: 动态交叉门控协调梯度冲突
+    推理时: 融合为静态逐通道缩放 (deploy=True)
+    参考 DRNet (CVPR 2026) DRMLP 重参数化范式
     """
 
-    def __init__(self, channels: int):
+    def __init__(self, channels: int, deploy: bool = False):
         super().__init__()
-        self.gate_noise = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels, channels // 4, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels // 4, channels, 1),
-            nn.Sigmoid(),
-        )
-        self.gate_motion = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels, channels // 4, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels // 4, channels, 1),
-            nn.Sigmoid(),
-        )
+        self.deploy = deploy
+        self.channels = channels
+
+        if not deploy:
+            self.gate_noise = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Conv2d(channels, channels // 4, 1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(channels // 4, channels, 1),
+                nn.Sigmoid(),
+            )
+            self.gate_motion = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Conv2d(channels, channels // 4, 1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(channels // 4, channels, 1),
+                nn.Sigmoid(),
+            )
+        else:
+            self.scale_noise = nn.Parameter(torch.ones(1, channels, 1, 1))
+            self.scale_motion = nn.Parameter(torch.ones(1, channels, 1, 1))
 
     def forward(self, f_noise: torch.Tensor, f_motion: torch.Tensor):
+        if self.deploy:
+            return f_noise * self.scale_noise, f_motion * self.scale_motion
         g_n = self.gate_noise(f_motion)
         g_m = self.gate_motion(f_noise)
         return f_noise * g_n, f_motion * g_m
+
+    def get_deploy(self, avg_gate_n: torch.Tensor, avg_gate_m: torch.Tensor):
+        """训练结束后调用: 用统计平均门控权重创建推理融合模块"""
+        deploy_mod = CrossFusionGate(self.channels, deploy=True)
+        deploy_mod.scale_noise.data = avg_gate_n.view(1, -1, 1, 1)
+        deploy_mod.scale_motion.data = avg_gate_m.view(1, -1, 1, 1)
+        return deploy_mod
 
 
 class TFSNet(nn.Module):
@@ -254,20 +269,20 @@ class TFSNet(nn.Module):
                 if gidx in self.frame_cache and "lff" in self.frame_cache[gidx]:
                     cached_lff[i] = self.frame_cache[gidx]["lff"]
 
-        sace_out = self.sace(
+        sace_out_dict = self.sace(
             feats, tfsi_out,
             cached_lff=cached_lff if cached_lff else None,
         )
 
-        # 将 SACE 返回的 lff_feats 存入缓存
-        if frame_indices and "lff_feats" in sace_out:
-            for i, gidx in enumerate(frame_indices):
-                if gidx in self.frame_cache:
-                    self.frame_cache[gidx]["lff"] = sace_out["lff_feats"][i]
+        # Delta: 新 SACE 输出接口
+        sace_feats      = sace_out_dict["sace_out"]   # (B, T, C, H, W)
+        C_omega_list    = sace_out_dict.get("C_omega_list", [])
+        F_t_aligned     = sace_out_dict["F_t_aligned"] # (B, C, H, W)
+        mu_t_clean      = sace_out_dict["mu_t_clean"]
+        sigma_t_clean   = sace_out_dict["sigma_t_clean"]
 
-        mu_t_clean     = sace_out["mu_t_clean"]
-        F_aligned_list = sace_out["F_aligned_list"]
-        attn_maps      = sace_out["attn_maps"]
+        # 兼容旧接口: F_aligned_list = list of (B, C, H, W) per frame
+        F_aligned_list = [sace_feats[:, t] for t in range(T)]
 
         # Stage 3: 三源恢复
         image_center = x[:, center_idx]
@@ -295,47 +310,52 @@ class TFSNet(nn.Module):
             center_idx=center_idx,
             imgs_down=imgs_down,
             s_illum=s_illum,
+            F_t_aligned=F_t_aligned,
         )
 
         ndpn_out = self.ndpn(
             feats=feats,
             F_aligned_list=F_aligned_list,
             mu_t_clean=mu_t_clean,
-            sigma_t_clean=sace_out["sigma_t_clean"],
+            sigma_t_clean=sigma_t_clean,
             s_noise=s_noise,
             center_idx=center_idx,
+            C_omega_list=C_omega_list,         # Delta: correspondence confidence
+            F_t_aligned=F_t_aligned,            # Delta: aligned reference
         )
 
-        # Charlie P2: sigma_sace 调制 s_noise (TFSI 主 + SACE σ 辅)
-        # 高帧间方差 → 可能是运动而非噪声 → 降低 s_noise 置信度
+        # Charlie P2: sigma_sace 调制 s_noise
         if self.charlie_mode and s_noise is not None:
-            sigma_sace = sace_out["sigma_t_clean"].mean(dim=1, keepdim=True)  # (B, 1, H, W)
-            scale_sigma = torch.sigmoid(-sigma_sace * 2.0)  # 高σ → 低调制
-            s_noise = s_noise * scale_sigma  # Charlie P2: 噪声图来源调制
+            sigma_sace = sigma_t_clean.mean(dim=1, keepdim=True)
+            scale_sigma = torch.sigmoid(-sigma_sace * 2.0)
+            s_noise = s_noise * scale_sigma
 
         mrpn_out = self.mrpn(
             F_aligned_list=F_aligned_list,
             center_idx=center_idx,
-            sigma_t_clean=sace_out["sigma_t_clean"] if self.charlie_mode else None,
+            sigma_t_clean=sigma_t_clean if self.charlie_mode else None,
+            C_omega_list=C_omega_list,         # Delta: motion magnitude
+            F_t_aligned=F_t_aligned,            # Delta: alignment baseline
         )
 
         # Extract outputs for IGRF
         lit_up_map_raw = ifpn_out["lit_up_map_raw"]
-        f_illum_feat = ifpn_out["f_illum_feat"]
+        f_illum_feat   = ifpn_out["f_illum_feat"]
+        A_illu         = ifpn_out.get("A_illu")        # Delta: from IFPN
         f_noise_out_raw = ndpn_out["f_noise_out"]
         f_motion_out_raw = mrpn_out["f_motion_out"]
 
         # Charlie3 P1: 交叉门控 — 互补置信度交换
         f_noise_out, f_motion_out = self.cross_fuse(f_noise_out_raw, f_motion_out_raw)
 
-        # Stage 4: IGRF v5.5 - Denoise -> Motion -> Hybrid Brighten
-        # Charlie P0: s_noise 移出 IGRF, 仅 NDNP 接收
+        # Stage 4: IGRF (Delta: A_illu 由 IFPN 传入)
         igrf_out = self.igrf(
             f_illum_feat=f_illum_feat,
             f_noise_out=f_noise_out,
             f_motion_out=f_motion_out,
             lit_up_map_raw=lit_up_map_raw,
             image_center=image_center,
+            A_illu=A_illu,
             s_noise=s_noise,
         )
 
@@ -353,8 +373,8 @@ class TFSNet(nn.Module):
             "L_t":            ifpn_out["L_t"],
             "L_ref":          ifpn_out["L_ref"],
             "L_ratio":        ifpn_out["L_ratio"],
+            "A_illu":         A_illu,                       # Delta: from IFPN
             "ifpn_side":      ifpn_out.get("ifpn_side"),
-            "attn_maps":      attn_maps,
             "mu_t_clean":     mu_t_clean,
             "s_snr":          ndpn_out["s_snr"],
             "motion_weights": mrpn_out["G_t"],

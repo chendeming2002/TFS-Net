@@ -213,4 +213,5 @@ Stage3: res_t = clamp(img_s2 × lit_up_map + s_illum × corr_mag)
 | v6 Bravo | 损失重调 + DWT-LFF分裂 + V raw | 1.20M | 20.05 |
 | v6 Charlie | 多帧 F.B. + concat fusion + NDPN s_noise + σ→MRPN + blur_mask | 1.25M | 训练中 |
 | v6 Charlie2 | D1 s_noise→NDPN only + D2 encoder feat→IFPN + D3 s_illum→IFPN gate + D4 VSRELL A_illu | 1.26M | ep7 loss=0.19（中断） |
-| **v6 Charlie3** | **P0 s_illum→IFPN唯一路径 + P1 CrossFusionGate + P2 LearnableScaleFusion** | **1.32M** | 训练中 |
+| **v6 Charlie3** | **P0 s_illum→IFPN唯一路径 + P1 CrossFusionGate + P2 LearnableScaleFusion** | **1.32M** | ep29 loss=0.176（中断） |
+| **v6 Delta** | **SACE 空间扫描 2D-WKV + MVCShift + C_omega_list + F_t_aligned + A_illu→IFPN** | **1.33M** | 训练中 |

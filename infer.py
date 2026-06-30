@@ -74,6 +74,16 @@ def main():
         in_channels=cfg["model"]["in_channels"],
         level_channels=tuple(cfg["model"]["level_channels"]),
         fused_channels=cfg["model"]["fused_channels"],
+        use_dwt_lff=cfg["model"].get("use_dwt_lff", False),
+        use_pure_rwkv=cfg["model"].get("use_pure_rwkv", False),
+        use_soft_clamp=cfg["model"].get("use_soft_clamp", False),
+        sace_offset_use_norm=cfg["model"].get("sace_offset_use_norm", False),
+        sace_offset_kaiming_init=cfg["model"].get("sace_offset_kaiming_init", False),
+        use_soft_median=cfg["model"].get("use_soft_median", True),
+        use_nafblock=cfg["model"].get("use_nafblock", False),
+        num_bottleneck_blocks=cfg["model"].get("num_bottleneck_blocks", 0),
+        num_igrf_res_blocks=cfg["model"].get("num_igrf_res_blocks", 2),
+        use_amp_enhance=cfg["model"].get("use_amp_enhance", False),
     ).to(device)
     checkpoint = load_checkpoint(args.checkpoint, map_location=device)
     model.load_state_dict(checkpoint["model"], strict=True)

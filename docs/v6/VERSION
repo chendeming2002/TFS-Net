@@ -1,6 +1,6 @@
 name: pureRWKV
-series: Charlie
+series: Delta
 block: 1
-mk: 4
+mk: 0
 mod: 0
-description: "Charlie P0/P1/P2 fully implemented; s_noise→NDPN, σ→MRPN, blur_mask, σ调制"
+description: "Delta 实验版本 — 系列起始, MK/Mod 归零"

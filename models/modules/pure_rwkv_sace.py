@@ -1,14 +1,16 @@
 """
-PureRWKVSACE — v6.5 纯 RWKV 帧间对齐 (2026-06-27)
-===================================================
-基于 pureRWKV.md 三大范式:
-  范式 1: 双向扫描对齐 (ABMamba AHBS + Otter TRM)
-  范式 2: 帧间门控交互 (Video RWKV LCR edge prompt)
-  范式 3: 多尺度时序建模 (ABMamba M=3 stride=2)
+PureRWKVSACE — Charlie-Mark4 (Delta): 空间扫描 + 时序对应矩阵 (2026-06-30)
+===========================================================================
+核心改动 vs Charlie3:
+  1. 扫描轴 T→H×W：RSRWKV 2D-WKV 四方向并行空间扫描
+  2. Token shift: Q-Shift→MVC-Shift (多尺度空洞 DWConv)
+  3. 输出 C_omega_list + F_t_aligned 替代 F_aligned_list
+  4. 删除 edge_weight 死代码
 
-设计: 移除 DeformableCrossAttention (130K 参数), 用多尺度双向 RWKV + 边缘门控替代
-
-API 兼容原 SACE: 输入 feats/tfsi_out, 输出 F_aligned_list
+文献依据:
+  - RSRWKV (TCSVT 2025): 2D-WKV + MVC-Shift
+  - Vision-RWKV (2024): Bi-WKV bidirectional attention 基础
+  - C²-STVSR (CVPRW 2026): 4D correlation volume 引导时序对应
 """
 
 from __future__ import annotations
@@ -16,189 +18,337 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Tuple, Dict
+from typing import List, Dict
 
-from models.modules.lff import LFFFeatureAdapter
-from .dwt_lff import SpatialDWTLFFAdapter
-from .cross_rwkv import VRWKVStyleSpatialMix
 from .blocks import LayerNorm2d
 
 
-class LearnableScaleFusion(nn.Module):
-    """Charlie3 P2: 替代 concat+channel_mix 的轻量多尺度融合 (AMBFF 风格)
+# ============================================================
+# 1. MVC-Shift (Multi-View Context Token Shift)
+# ============================================================
+class MVCShift(nn.Module):
+    """RSRWKV MVC-Shift: 多尺度空洞 depthwise conv + 1×1 跨通道交互"""
 
-    参数: 3 标量 softmax 权重 + 3 逐尺度 SE 校准 block → ~1.5K (vs 12K for Linear(3C→C))
-    初始等权 softmax(0,0,0)→1/3，行为等价于旧版 /3 平均，向后兼容。
-    """
-
-    def __init__(self, channels: int, n_scales: int = 3):
+    def __init__(self, channels: int):
         super().__init__()
-        self.scale_logits = nn.Parameter(torch.zeros(n_scales))
-        self.calibrate = nn.ModuleList([
+        self.branches = nn.ModuleList([
             nn.Sequential(
-                nn.AdaptiveAvgPool2d(1),
-                nn.Conv2d(channels, channels, 1),
-                nn.Sigmoid(),
+                nn.Conv2d(channels, channels, 3, 1, d, dilation=d, groups=channels, bias=False),
+                nn.Conv2d(channels, channels, 1, bias=False),
             )
-            for _ in range(n_scales)
+            for d in [1, 2, 3]
         ])
-        nn.init.zeros_(self.scale_logits)
 
-    def forward(self, scale_features: list):
-        """scale_features: list of (B, T, C, H, W) — full, half, quarter 尺寸"""
-        weights = F.softmax(self.scale_logits, dim=0)
-        B, T, C, H, W = scale_features[0].shape
-        out = 0
-        for i, feat in enumerate(scale_features):
-            b, t, c, h_i, w_i = feat.shape
-            cal_w = self.calibrate[i](feat.view(b * t, c, h_i, w_i)).view(b, t, c, 1, 1)
-            out = out + weights[i] * feat * cal_w
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = x
+        for branch in self.branches:
+            out = out + branch(x)
         return out
 
 
-class PureRWKVSACE(nn.Module):
-    """纯 RWKV 多尺度帧间注意力 (v6.5)
+# ============================================================
+# 2. Bi-WKV (双向 WKV 注意力，单方向)
+# ============================================================
+class BiWKV(nn.Module):
+    """Vision-RWKV Bi-WKV 核心 — 空间序列版，线性复杂度 O(L×C)"""
 
-    移除 DeformableCrossAttention, 用 3 尺度双向 RWKV 替换。
+    def __init__(self, channels: int):
+        super().__init__()
+        self.channels = channels
+        self.spatial_decay = nn.Parameter(torch.randn(channels) * 0.1)
+        self.spatial_first = nn.Parameter(torch.randn(channels) * 0.1)
+
+    def forward(self, k: torch.Tensor, v: torch.Tensor,
+                total_tokens: int) -> torch.Tensor:
+        """WKV cumsum: S_t = Σ_{i≤t} exp(w)^{t-i}·k_i·v_i (完全向量化)"""
+        B, L, C = k.shape
+        w = self.spatial_decay.clamp(-8, 8)
+        u = self.spatial_first.clamp(-5, 5)
+        ew = (-w.abs() / total_tokens).exp().view(1, 1, C)
+        u_coef = (u / total_tokens).exp().view(1, 1, C)
+        ek, ekv = k.exp(), k.exp() * v
+        arange_L = torch.arange(L, device=k.device).float().view(1, L, 1)
+        ew_pow = ew.pow(arange_L)
+        S = (ekv / ew_pow).cumsum(dim=1) * ew_pow
+        D = (ek  / ew_pow).cumsum(dim=1) * ew_pow
+        return (u_coef * ekv + S) / (u_coef * ek + D + 1e-8)
+
+
+# ============================================================
+# 3. SpatialWKV2D — 四方向空间扫描
+# ============================================================
+class SpatialWKV2D(nn.Module):
+    """RSRWKV 2D-WKV: 水平/垂直/主对角线/副对角线 四方向 + recep gate"""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        assert channels % 4 == 0
+        self.channels = channels
+        self.head_dim = channels // 4
+        self.bi_wkv = BiWKV(self.head_dim)
+
+        self.proj_r = nn.Linear(channels, channels, bias=False)
+        self.proj_k = nn.Linear(channels, channels, bias=False)
+        self.proj_v = nn.Linear(channels, channels, bias=False)
+        self.proj_out = nn.Linear(channels, channels, bias=False)
+        self.post_norm = nn.LayerNorm(channels)
+        nn.init.zeros_(self.proj_out.weight)
+
+    @staticmethod
+    def _scan_horizontal(x: torch.Tensor) -> torch.Tensor:
+        return x.flatten(2).transpose(1, 2)
+
+    @staticmethod
+    def _scan_vertical(x: torch.Tensor) -> torch.Tensor:
+        return x.permute(0, 1, 3, 2).flatten(2).transpose(1, 2)
+
+    @staticmethod
+    def _scan_diag_main(x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        coords = []
+        for s in range(H + W - 1):
+            for i in range(max(0, s - W + 1), min(s + 1, H)):
+                coords.append(i * W + (s - i))
+        idx = torch.tensor(coords, device=x.device)
+        x_flat = x.flatten(2)
+        return x_flat[:, :, idx].transpose(1, 2)
+
+    @staticmethod
+    def _scan_diag_anti(x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        coords, used = [], set()
+        for s in range(H + W - 1):
+            for i in range(max(0, s - W + 1), min(s + 1, H)):
+                j = W - 1 - (s - i)
+                if 0 <= j < W:
+                    ij = i * W + j
+                    coords.append(ij)
+                    used.add(ij)
+        for ij in range(H * W):
+            if ij not in used:
+                coords.append(ij)
+        idx = torch.tensor(coords[:H * W], device=x.device)
+        x_flat = x.flatten(2)
+        return x_flat[:, :, idx].transpose(1, 2)
+
+    @staticmethod
+    def _inv_scan(scan_fn, shape, device):
+        B, C, H, W = shape
+        identity = torch.arange(H * W, device=device).float().view(1, 1, H, W)
+        scanned = scan_fn(identity).squeeze(-1).long()
+        inv_idx = torch.zeros(1, H * W, dtype=torch.long, device=device)
+        for b in range(1):
+            inv_idx[b].scatter_(0, scanned[b], torch.arange(H * W, device=device))
+        return inv_idx
+
+    def forward(self, x_2d: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x_2d.shape
+        N = H * W
+        x_tokens = x_2d.flatten(2).transpose(1, 2)
+        r = self.proj_r(x_tokens)
+        k = self.proj_k(x_tokens)
+        v = self.proj_v(x_tokens)
+
+        scan_fns = [self._scan_horizontal, self._scan_vertical,
+                    self._scan_diag_main, self._scan_diag_anti]
+
+        heads = []
+        for i, scan_fn in enumerate(scan_fns):
+            c0, c1 = i * self.head_dim, (i + 1) * self.head_dim
+            k_head = k[:, :, c0:c1]
+            v_head = v[:, :, c0:c1]
+            k_2d = k_head.transpose(1, 2).reshape(B, self.head_dim, H, W)
+            v_2d = v_head.transpose(1, 2).reshape(B, self.head_dim, H, W)
+            k_seq = scan_fn(k_2d)
+            v_seq = scan_fn(v_2d)
+            wkv_seq = self.bi_wkv(k_seq, v_seq, total_tokens=N)
+            inv_idx = self._inv_scan(scan_fn, (B, self.head_dim, H, W), x_2d.device)
+            wkv_restored = wkv_seq[:, inv_idx[0]]
+            heads.append(wkv_restored)
+
+        wkv_concat = torch.cat(heads, dim=-1)
+        output = torch.sigmoid(r) * wkv_concat
+        output = self.proj_out(output)
+        output = self.post_norm(output)
+        return output.transpose(1, 2).reshape(B, C, H, W)
+
+
+# ============================================================
+# 4. TemporalCorrespondence → C_omega_list
+# ============================================================
+class TemporalCorrespondence(nn.Module):
+    """生成 C_omega_list: 中心帧与每个邻帧的空间 cosine similarity 矩阵"""
+
+    def __init__(self, channels: int, proj_dim: int = 0):
+        super().__init__()
+        proj_dim = proj_dim if proj_dim > 0 else max(channels // 4, 16)
+        self.proj_dim = proj_dim
+        self.proj_q = nn.Conv2d(channels, proj_dim, 1, bias=False)
+        self.proj_k = nn.Conv2d(channels, proj_dim, 1, bias=False)
+        self.tau = nn.Parameter(torch.ones(1) * 0.07)
+
+    def forward(self, center_feat: torch.Tensor,
+                neighbor_feats: torch.Tensor) -> list:
+        B, C, H, W = center_feat.shape
+        ds = max(1, min(H, W) // 4)
+        center_ds = F.adaptive_avg_pool2d(center_feat, (ds, ds))
+        neighbor_ds = F.adaptive_avg_pool2d(
+            neighbor_feats.reshape(-1, C, H, W), (ds, ds)
+        ).reshape(B, -1, C, ds, ds)
+
+        N = ds * ds
+        T_n = neighbor_ds.shape[1]
+        q = self.proj_q(center_ds)
+        q_flat = F.normalize(q.flatten(2).transpose(1, 2), dim=-1)
+        tau = self.tau.clamp(min=0.01)
+        C_omega_list = []
+        for t in range(T_n):
+            k = self.proj_k(neighbor_ds[:, t])
+            k_flat = F.normalize(k.flatten(2).transpose(1, 2), dim=-1)
+            sim = torch.bmm(q_flat, k_flat.transpose(1, 2)) / tau
+            C_omega_list.append(F.softmax(sim, dim=-1))
+        return C_omega_list
+
+
+# ============================================================
+# 5. TemporalAggregation → F_t_aligned
+# ============================================================
+class TemporalAggregation(nn.Module):
+    """用 C_omega_list 对齐邻帧到中心帧坐标系，加权聚合得到 F_t_aligned"""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.frame_gate = nn.Sequential(
+            nn.Conv2d(channels * 2, channels, 1),
+            nn.GELU(),
+            nn.Conv2d(channels, 1, 1),
+        )
+        self.out_norm = LayerNorm2d(channels)
+
+    def forward(self, center_feat: torch.Tensor,
+                neighbor_feats: torch.Tensor,
+                C_omega_list: list) -> torch.Tensor:
+        B, C, H, W = center_feat.shape
+        N = C_omega_list[0].shape[-1]
+        ds = int(N ** 0.5)  # spatial resolution of C_omega
+        T_n = neighbor_feats.shape[1]
+
+        # 降采样特征到与 C_omega 匹配的分辨率
+        center_ds = F.adaptive_avg_pool2d(center_feat, (ds, ds))
+        neighbor_ds = F.adaptive_avg_pool2d(
+            neighbor_feats.reshape(-1, C, H, W), (ds, ds)
+        ).reshape(B, T_n, C, ds, ds)
+
+        warped_list, weight_list = [], []
+        for t in range(T_n):
+            omega = C_omega_list[t]  # (B, N, N)
+            f_t = neighbor_ds[:, t].flatten(2)  # (B, C, N)
+            warped = torch.bmm(f_t, omega.transpose(1, 2))  # (B, C, N)
+            warped_2d = warped.reshape(B, C, ds, ds)
+            warped_list.append(warped_2d)
+            wt = self.frame_gate(torch.cat([center_ds, warped_2d], dim=1))
+            weight_list.append(wt)
+        warped_stack = torch.stack(warped_list, dim=1)
+        weights = F.softmax(torch.stack(weight_list, dim=1), dim=1)
+        agg = (warped_stack * weights).sum(dim=1)  # (B, C, ds, ds)
+
+        # 上采样回原始分辨率 + 残差
+        agg_up = F.interpolate(agg, size=(H, W), mode='bilinear', align_corners=False)
+        return self.out_norm(agg_up + center_feat)
+
+
+# ============================================================
+# 6. PureRWKVSACE — Charlie-Mark4 完整模块
+# ============================================================
+class PureRWKVSACE(nn.Module):
+    """Delta SACE: 空间扫描 + 时序对应
 
     Args:
         channels: 特征通道数 (默认 64)
-        lff_module: 外部传入的 DWT-LFF 或传统 LFF (None 则内部新建)
-        n_layer: RWKV 层数 (用于 fancy init)
+        num_frames: 帧数 T (默认 5)
     """
 
-    def __init__(
-        self,
-        channels: int = 64,
-        lff_module=None,
-        n_layer: int = 1,
-    ):
+    def __init__(self, channels: int = 64, num_frames: int = 5,
+                 lff_module=None, n_layer: int = 1):
         super().__init__()
         self.channels = channels
+        self.num_frames = num_frames
+        self.center_idx = num_frames // 2
 
-        # v6 Bravo P1-2: DWT-LFF 拆为中心/邻居双实例 (VSRELL + STCD)
-        # 中心帧 α=0.6 (偏 LL_ref → 干净锚定)
-        # 邻居帧 α=0.4 (偏 LL_deg → 退化诊断)
-        self.lff_center = SpatialDWTLFFAdapter(in_channels=channels, alpha_init=0.6)
-        self.lff_neighbor = SpatialDWTLFFAdapter(in_channels=channels, alpha_init=0.4)
-
-        # 兼容旧接口: lff_module 传入时仍可用
-        self._lff_external = lff_module is not None
-        if lff_module is not None:
-            self.lff_center = lff_module
-            self.lff_neighbor = lff_module
-
-        # 1️⃣ 多尺度 RWKV (ABMamba AHBS: M=3, stride=2)
-        self.rwkv_full = VRWKVStyleSpatialMix(channels, num_frames=5,
-                                                layer_id=0.0, n_layer=n_layer)
-        self.rwkv_half = VRWKVStyleSpatialMix(channels, num_frames=5,
-                                                layer_id=0.33, n_layer=n_layer)
-        self.rwkv_quarter = VRWKVStyleSpatialMix(channels, num_frames=5,
-                                                   layer_id=0.67, n_layer=n_layer)
-
-        # 2️⃣ 边缘门控 (Video RWKV LCR edge prompt)
-        self.edge_prompt = nn.Sequential(
-            nn.Conv2d(channels, channels, 3, 1, 1, groups=channels, bias=False),
+        # --- 帧内空间处理 ---
+        self.mvc_shift = MVCShift(channels)
+        self.spatial_wkv = SpatialWKV2D(channels)
+        self.channel_mix = nn.Sequential(
+            LayerNorm2d(channels),
+            nn.Conv2d(channels, channels * 4, 1),
             nn.GELU(),
-            nn.Conv2d(channels, channels, 1, 1, 0),
-            nn.Sigmoid(),
+            nn.Conv2d(channels * 4, channels, 1),
         )
+        self.spatial_gamma = nn.Parameter(torch.zeros(1, channels, 1, 1))
 
-        # 3️⃣ 多尺度融合 (Charlie3 P2: LearnableScaleFusion 替代 concat+channel_mix)
-        self.scale_fusion = LearnableScaleFusion(channels)  # ~1.5K params
+        # --- 时序对应 ---
+        self.corr_gen = TemporalCorrespondence(channels)
+        self.temporal_agg = TemporalAggregation(channels)
 
-        # LayerNorm
-        self.norm_out = LayerNorm2d(channels)
-
-    @staticmethod
-    def _bidirectional_scan(rwkv_module, x_flat, feat_shape):
-        """Otter TRM 风格双向扫描: 前向 + 反向 → 平均"""
-        fwd = rwkv_module(x_flat, feat_shape)
-        rev = rwkv_module(torch.flip(x_flat, dims=[1]), feat_shape)
-        bwd = torch.flip(rev, dims=[1])
-        return (fwd + bwd) / 2
-
-    def forward(
-        self,
-        feats: torch.Tensor,       # (B, T, C, H, W) 编码器特征
-        tfsi_out: Dict = None,    # TFSI 输出 (取 s_noise)
-        cached_lff: Dict = None,   # 推理缓存
-    ) -> Dict:
+    def forward(self, feats: torch.Tensor,
+                tfsi_out: Dict = None,
+                cached_lff: Dict = None) -> Dict:
+        """
+        feats: (B, T, C, H, W) Encoder 输出特征
+        Returns:
+            sace_out: (B, T, C, H, W) 空间增强后的多帧特征
+            C_omega_list: list of (T-1) tensors, each (B, N, N)
+            F_t_aligned: (B, C, H, W) 中心帧对齐增强特征
+            mu_t_clean / sigma_t_clean: 兼容旧接口
+        """
         B, T, C, H, W = feats.shape
         device = feats.device
 
-        # === Step 1: 逐帧 DWT-LFF (中心/邻居分支分离) ===
-        lff_feats: List[torch.Tensor] = []
-        center_idx = T // 2
-        for t in range(T):
-            if cached_lff and t in cached_lff:
-                lff_feats.append(cached_lff[t])
-            else:
-                # v6 Bravo P1-2: 中心帧走 lff_center, 邻居帧走 lff_neighbor
-                if t == center_idx:
-                    lff_out = self.lff_center(feats[:, t])
-                else:
-                    lff_out = self.lff_neighbor(feats[:, t])
-                if isinstance(lff_out, dict):
-                    lff_feats.append(lff_out["feat_sace"])
-                else:
-                    lff_feats.append(lff_out)
-        lff_stack = torch.stack(lff_feats, dim=1)  # (B, T, C, H, W)
+        # Delta: 降采样到 H/2×W/2 控制显存
+        feats_ds = F.interpolate(
+            feats.reshape(B * T, C, H, W), scale_factor=0.5, mode='bilinear', align_corners=False
+        ).reshape(B, T, C, H // 2, W // 2)
+        H_ds, W_ds = H // 2, W // 2
 
-        # 中心帧参考
-        mu_t_clean = lff_stack[:, center_idx]
-        sigma_t_clean = lff_stack.std(dim=1, unbiased=False)
-        s_noise = tfsi_out.get("s_noise") if tfsi_out else None
+        # --- Step 1: 逐帧空间处理 ---
+        x_flat = feats_ds.reshape(B * T, C, H_ds, W_ds)
+        x_shifted = self.mvc_shift(x_flat)
+        x_wkv = self.spatial_wkv(x_shifted)
+        x_cm = self.channel_mix(x_wkv)
+        sace_out_ds = x_flat + x_cm * self.spatial_gamma
 
-        # === Step 2: 展平为 token ===
-        x_flat = lff_stack.permute(0, 1, 3, 4, 2).reshape(B, T, H * W, C)
+        # 上采样回原始分辨率
+        sace_out = F.interpolate(
+            sace_out_ds, size=(H, W), mode='bilinear', align_corners=False
+        ).reshape(B, T, C, H, W)
 
-        # === Step 3: 多尺度双向 RWKV (ABMamba Eq.1) ===
-        out_full = self._bidirectional_scan(self.rwkv_full, x_flat, (H, W))
+        # --- Step 2: 统计量 ---
+        mu_t_clean = sace_out[:, self.center_idx]
+        sigma_t_clean = sace_out.std(dim=1, unbiased=False)
 
-        # 1/2 尺度
-        h2, w2 = H // 2, W // 2
-        x_half_3d = lff_stack.reshape(B, T, C, H, W)
-        x_half = F.avg_pool3d(x_half_3d, (1, 2, 2)).permute(0, 1, 3, 4, 2).reshape(B, T, h2 * w2, C)
-        out_half_flat = self._bidirectional_scan(self.rwkv_half, x_half, (h2, w2))
-        out_half = out_half_flat.reshape(B, T, h2, w2, C).permute(0, 1, 4, 2, 3)
-        out_half = F.interpolate(
-            out_half.reshape(B * T, C, h2, w2), size=(H, W), mode='bilinear', align_corners=False
-        ).reshape(B, T, C, H, W).permute(0, 1, 3, 4, 2).reshape(B, T, H * W, C)
+        # --- Step 3: 时序对应 → C_omega_list (在降采样分辨率下计算) ---
+        center_orig = feats_ds[:, self.center_idx]
+        neighbor_idx = [t for t in range(T) if t != self.center_idx]
+        neighbor_orig = feats_ds[:, neighbor_idx]
+        C_omega_list = self.corr_gen(center_orig, neighbor_orig)
 
-        # 1/4 尺度
-        h4, w4 = H // 4, W // 4
-        x_quarter = F.avg_pool3d(x_half_3d, (1, 4, 4)).permute(0, 1, 3, 4, 2).reshape(B, T, h4 * w4, C)
-        out_qtr_flat = self._bidirectional_scan(self.rwkv_quarter, x_quarter, (h4, w4))
-        out_qtr = out_qtr_flat.reshape(B, T, h4, w4, C).permute(0, 1, 4, 2, 3)
-        out_qtr = F.interpolate(
-            out_qtr.reshape(B * T, C, h4, w4), size=(H, W), mode='bilinear', align_corners=False
-        ).reshape(B, T, C, H, W).permute(0, 1, 3, 4, 2).reshape(B, T, H * W, C)
-
-        # === Step 4: 多尺度融合 (Charlie3 P2: LearnableScaleFusion) ===
-        # 各尺度输出还原为 (B,T,C,H,W) 格式
-        out_full_2d = out_full.reshape(B, T, H, W, C).permute(0, 1, 4, 2, 3)
-        out_half_2d = out_half.reshape(B, T, H, W, C).permute(0, 1, 4, 2, 3)
-        out_qtr_2d = out_qtr.reshape(B, T, H, W, C).permute(0, 1, 4, 2, 3)
-        out = self.scale_fusion([out_full_2d, out_half_2d, out_qtr_2d])
-
-        # === Step 5: 边缘门控残差 (Video RWKV LCR) ===
-        # v6 Bravo P1: V 使用 Encoder 原始中心帧 (而非 DWT-LFF 归一化后)
-        # STCD: 对齐用归一化空间, 内容融合用原始空间
-        f_raw_center = feats[:, T // 2]  # (B, C, H, W) Encoder 原始中心帧
-        edge_weight = self.edge_prompt(f_raw_center)  # ★ 在原始特征上做边缘检测
-
-        F_aligned_list: List[torch.Tensor] = []
-        for t in range(T):
-            # V raw 残差融合 (Charlie2: 移除 s_noise 调制, 噪声信息仅去 NDPN)
-            f_t = out[:, t] + f_raw_center
-            f_t = self.norm_out(f_t)
-            F_aligned_list.append(f_t)
+        # --- Step 4: 时序聚合 → F_t_aligned (在降采样分辨率下计算，然后上采样) ---
+        center_enhanced_ds = sace_out_ds.reshape(B, T, C, H_ds, W_ds)[:, self.center_idx]
+        neighbor_enhanced_ds = sace_out_ds.reshape(B, T, C, H_ds, W_ds)[:, neighbor_idx]
+        F_t_aligned_ds = self.temporal_agg(
+            center_enhanced_ds, neighbor_enhanced_ds, C_omega_list
+        )
+        # 上采样到原始分辨率 H×W
+        F_t_aligned = F.interpolate(
+            F_t_aligned_ds, size=(H, W), mode='bilinear', align_corners=False
+        )
 
         return {
-            "mu_t_clean":      mu_t_clean,
-            "sigma_t_clean":   sigma_t_clean,
-            "F_aligned_list":  F_aligned_list,
-            "lff_feats":       lff_feats,
-            "attn_maps":       [],  # v6.5: 无 DAT, 兼容旧接口
+            "sace_out":       sace_out,
+            "mu_t_clean":     mu_t_clean,
+            "sigma_t_clean":  sigma_t_clean,
+            "C_omega_list":   C_omega_list,
+            "F_t_aligned":    F_t_aligned,
+            "lff_feats":      [],
+            "attn_maps":      [],
         }

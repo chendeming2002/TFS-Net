@@ -11,6 +11,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .blocks import (
     ResBlock,
@@ -62,40 +63,53 @@ class MRPN(nn.Module):
         aligned = unpad_from_window(aligned, pad_hw)
         return aligned
 
-    def forward(self, F_aligned_list, center_idx, sigma_t_clean=None):
-        """
-        Args:
-            F_aligned_list: List[Tensor], SACE 对齐后的全帧特征, 每项 (B, C, H, W)
-            center_idx: int, 中心帧索引
-            sigma_t_clean: (B, C, H, W) or None — Charlie P1: 帧间方差 (运动感知)
-        """
-        f_t_aligned = F_aligned_list[center_idx]  # (B, C, H, W)
-
+    def forward(self, F_aligned_list, center_idx, sigma_t_clean=None,
+                C_omega_list=None, F_t_aligned=None):
+        f_t_aligned = F_aligned_list[center_idx]
         f_neighbors = torch.stack(
             [F_aligned_list[i] for i in range(len(F_aligned_list)) if i != center_idx],
             dim=1,
-        )  # (B, T-1, C, H, W)
+        )
 
         f_omega_aligned = self._aggregate_neighbors(f_t_aligned, f_neighbors)
 
-        # Charlie P1+P2: blur_mask 门控 (sigma_t_clean + 帧间差异 → 模糊感知)
+        # Delta: motion magnitude from C_omega_list
+        motion_mag = None
+        if C_omega_list is not None and len(C_omega_list) > 0:
+            diag_vals = []
+            for C_t in C_omega_list:
+                diag = C_t.diagonal(dim1=-2, dim2=-1)  # (B, N)
+                diag_vals.append(diag)
+            motion_mag = 1.0 - torch.stack(diag_vals, dim=-1).mean(dim=-1)  # (B, N)
+            ds = int(motion_mag.shape[-1] ** 0.5)
+            B_val = motion_mag.shape[0]
+            H_ref, W_ref = f_t_aligned.shape[-2:]
+            motion_mag = motion_mag.reshape(B_val, 1, ds, ds)
+            motion_mag = F.interpolate(motion_mag, size=(H_ref, W_ref),
+                                       mode='bilinear', align_corners=False)
+
+        # Delta: use F_t_aligned as alignment reference
+        if F_t_aligned is not None:
+            f_t_aligned = F_t_aligned
+
+        # blur_mask gate
         blur_mask = None
         if sigma_t_clean is not None:
-            sigma_1ch = sigma_t_clean.mean(dim=1, keepdim=True)  # (B, 1, H, W)
-            frame_diff = (f_omega_aligned - f_t_aligned).abs()   # (B, C, H, W)
-            blur_input = torch.cat([sigma_1ch, frame_diff], dim=1)  # (B, C+1, H, W)
+            sigma_1ch = sigma_t_clean.mean(dim=1, keepdim=True)
+            frame_diff = (f_omega_aligned - f_t_aligned).abs()
+            blur_input = torch.cat([sigma_1ch, frame_diff], dim=1)
             blur_mask = self.blur_estimator(blur_input)
 
-        # 门控融合: gate 决定信任对齐中心帧 vs 聚合邻帧
         z_t = torch.cat([f_t_aligned, f_omega_aligned], dim=1)
         g_t = torch.sigmoid(self.gate(z_t))
 
-        # Charlie P2: blur_mask 调制 — 模糊区域优先使用邻帧补偿
+        # Delta: motion magnitude modulates gate
         if blur_mask is not None:
-            g_t = g_t * (1.0 - blur_mask) + blur_mask * 0.3  # 模糊区 → 偏向邻帧聚合
+            g_t = g_t * (1.0 - blur_mask) + blur_mask * 0.3
+        if motion_mag is not None:
+            g_t = g_t * (1.0 - motion_mag) + motion_mag * 0.3
 
         f_t_fuse = g_t * f_t_aligned + (1.0 - g_t) * f_omega_aligned
-
         hat_f_t = self.refine(f_t_fuse) + f_t_aligned
 
         return {
