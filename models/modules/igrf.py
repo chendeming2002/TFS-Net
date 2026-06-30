@@ -176,10 +176,9 @@ class IGRF(nn.Module):
         lit_up_map_raw: torch.Tensor,
         image_center: torch.Tensor,
         A_illu: torch.Tensor = None,
-        s_noise: torch.Tensor = None,
     ) -> dict:
-        """Delta: A_illu 由 IFPN 生成传入"""
-        img_s1, delta_s1 = self.stage_noise(f_noise_out, image_center, s_intensity=s_noise)
+        """Delta: A_illu 由 IFPN 生成传入；s_noise 已移除 (NDPN 专属)"""
+        img_s1, delta_s1 = self.stage_noise(f_noise_out, image_center, s_intensity=None)
         img_s2, delta_s2 = self.stage_motion(f_motion_out, img_s1)
         res_t, lit_up_map = self.brighten(lit_up_map_raw, f_illum_feat, img_s2, A_illu=A_illu)
 

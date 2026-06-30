@@ -24,23 +24,54 @@ from .blocks import (
 
 
 class MRPN(nn.Module):
-    def __init__(self, channels=64, window_size=8):
+    def __init__(self, channels=64, window_size=8, num_frames=5):
         super().__init__()
         self.channels = channels
         self.window_size = window_size
+        self.num_frames = num_frames
         self.gate = nn.Conv2d(channels * 2, channels, 1, 1, 0)
         self.refine = ResBlock(channels)
 
-        # Charlie P2: blur_mask 估计器 (sigma_t_clean + 帧间差异 → 模糊感知)
         self.blur_estimator = nn.Sequential(
             nn.Conv2d(channels + 1, channels // 4, 3, 1, 1),
             nn.GELU(),
             nn.Conv2d(channels // 4, 1, 3, 1, 1),
             nn.Sigmoid(),
         )
-        # 零初始化最后一个 Conv2d 权重 → 初始 blur_mask=0.5, 等同原始 MRPN
         nn.init.zeros_(self.blur_estimator[-2].weight)
         nn.init.zeros_(self.blur_estimator[-2].bias)
+
+        # Delta: motion magnitude estimator from C_omega diagonals
+        self.motion_estimator = nn.Sequential(
+            nn.Conv2d(num_frames - 1, channels // 4, 1),
+            nn.GELU(),
+            nn.Conv2d(channels // 4, 1, 1),
+            nn.Sigmoid(),
+        )
+
+        # Delta: sigma projection (frame-level → channel-wise)
+        self.sigma_proj = nn.Sequential(
+            nn.Linear(num_frames, channels),
+            nn.GELU(),
+            nn.Linear(channels, channels),
+        )
+
+        # Delta: compensation gate (motion magnitude gated)
+        self.comp_gate = nn.Sequential(
+            nn.Conv2d(channels + 1, channels, 3, 1, 1),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, 1),
+            nn.Sigmoid(),
+        )
+
+        # Delta: motion refinement (F_t_aligned vs center delta)
+        self.motion_refine = nn.Sequential(
+            nn.Conv2d(channels * 2, channels, 3, 1, 1),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, 3, 1, 1),
+        )
+
+        self.gamma = nn.Parameter(torch.ones(1, channels, 1, 1) * 0.1)
 
     def _aggregate_neighbors(self, f_t, f_omega):
         """窗口 dot-product 相关聚合相邻帧（不含中心帧）。"""
@@ -71,46 +102,67 @@ class MRPN(nn.Module):
             dim=1,
         )
 
-        f_omega_aligned = self._aggregate_neighbors(f_t_aligned, f_neighbors)
+        # Delta: use F_t_aligned as alignment reference
+        f_center = F_t_aligned if F_t_aligned is not None else f_t_aligned
 
-        # Delta: motion magnitude from C_omega_list
+        f_omega_aligned = self._aggregate_neighbors(f_center, f_neighbors)
+
+        # Delta: motion magnitude from C_omega_list (full motion_estimator)
         motion_mag = None
         if C_omega_list is not None and len(C_omega_list) > 0:
             diag_vals = []
             for C_t in C_omega_list:
                 diag = C_t.diagonal(dim1=-2, dim2=-1)  # (B, N)
                 diag_vals.append(diag)
-            motion_mag = 1.0 - torch.stack(diag_vals, dim=-1).mean(dim=-1)  # (B, N)
-            ds = int(motion_mag.shape[-1] ** 0.5)
-            B_val = motion_mag.shape[0]
+            diag_stack = torch.stack(diag_vals, dim=1)  # (B, T-1, N)
+            B_val = diag_stack.shape[0]
+            ds = int(diag_stack.shape[-1] ** 0.5)
             H_ref, W_ref = f_t_aligned.shape[-2:]
-            motion_mag = motion_mag.reshape(B_val, 1, ds, ds)
+            diag_2d = diag_stack.reshape(B_val, len(C_omega_list), ds, ds)
+            motion_mag = self.motion_estimator(diag_2d)  # (B, 1, ds, ds)
             motion_mag = F.interpolate(motion_mag, size=(H_ref, W_ref),
                                        mode='bilinear', align_corners=False)
 
         # Delta: use F_t_aligned as alignment reference
-        if F_t_aligned is not None:
-            f_t_aligned = F_t_aligned
+        f_center = F_t_aligned if F_t_aligned is not None else f_t_aligned
+
+        # Delta: sigma projection (frame-level → per-channel)
+        sigma_feat = None
+        if sigma_t_clean is not None:
+            B_val = sigma_t_clean.shape[0]
+            sigma_flat = sigma_t_clean.mean(dim=(2, 3))  # (B, C)
+            sigma_feat = self.sigma_proj(sigma_flat).view(B_val, 1, self.channels, 1, 1)
 
         # blur_mask gate
         blur_mask = None
         if sigma_t_clean is not None:
             sigma_1ch = sigma_t_clean.mean(dim=1, keepdim=True)
-            frame_diff = (f_omega_aligned - f_t_aligned).abs()
+            frame_diff = (f_omega_aligned - f_center).abs()
             blur_input = torch.cat([sigma_1ch, frame_diff], dim=1)
             blur_mask = self.blur_estimator(blur_input)
 
-        z_t = torch.cat([f_t_aligned, f_omega_aligned], dim=1)
+        # Delta: motion refinement from F_t_aligned vs center delta
+        motion_delta = self.motion_refine(
+            torch.cat([f_center, f_omega_aligned], dim=1)
+        )
+
+        z_t = torch.cat([f_center, f_omega_aligned], dim=1)
         g_t = torch.sigmoid(self.gate(z_t))
 
-        # Delta: motion magnitude modulates gate
+        # Delta: compensation gate modulated by motion magnitude
+        comp = self.comp_gate(torch.cat([f_center, motion_mag], dim=1)) \
+            if motion_mag is not None else torch.sigmoid(self.gate(z_t))
+
+        # Delta: blur + motion modulated gate
         if blur_mask is not None:
             g_t = g_t * (1.0 - blur_mask) + blur_mask * 0.3
         if motion_mag is not None:
             g_t = g_t * (1.0 - motion_mag) + motion_mag * 0.3
 
-        f_t_fuse = g_t * f_t_aligned + (1.0 - g_t) * f_omega_aligned
-        hat_f_t = self.refine(f_t_fuse) + f_t_aligned
+        # Delta: gamma-scaled motion refinement + gate fusion
+        f_t_fuse = g_t * f_center + (1.0 - g_t) * f_omega_aligned \
+                   + motion_delta * comp * self.gamma
+        hat_f_t = self.refine(f_t_fuse) + f_center
 
         return {
             "f_omega_aligned": f_omega_aligned,

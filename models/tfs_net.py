@@ -59,6 +59,8 @@ class CrossFusionGate(nn.Module):
                 nn.Conv2d(channels // 4, channels, 1),
                 nn.Sigmoid(),
             )
+            nn.init.zeros_(self.gate_noise[-2].weight)
+            nn.init.ones_(self.gate_noise[-2].bias)  # sigmoid(1)≈0.73, stable start
             self.gate_motion = nn.Sequential(
                 nn.AdaptiveAvgPool2d(1),
                 nn.Conv2d(channels, channels // 4, 1),
@@ -66,6 +68,8 @@ class CrossFusionGate(nn.Module):
                 nn.Conv2d(channels // 4, channels, 1),
                 nn.Sigmoid(),
             )
+            nn.init.zeros_(self.gate_motion[-2].weight)
+            nn.init.ones_(self.gate_motion[-2].bias)
         else:
             self.scale_noise = nn.Parameter(torch.ones(1, channels, 1, 1))
             self.scale_motion = nn.Parameter(torch.ones(1, channels, 1, 1))
@@ -356,7 +360,6 @@ class TFSNet(nn.Module):
             lit_up_map_raw=lit_up_map_raw,
             image_center=image_center,
             A_illu=A_illu,
-            s_noise=s_noise,
         )
 
         return {

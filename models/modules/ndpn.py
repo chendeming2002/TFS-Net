@@ -33,9 +33,11 @@ class NDPN(nn.Module):
         channels: int = 64,
         tau_mid_init: float = 1.0,
         tau_scale_init: float = 1.0,
+        num_frames: int = 5,
     ):
         super().__init__()
         self.channels = channels
+        self.num_frames = num_frames
 
         self.tau_mid = nn.Parameter(torch.tensor(tau_mid_init))
         self.log_tau_scale = nn.Parameter(torch.tensor(float(torch.log(torch.tensor(tau_scale_init)))))
@@ -52,10 +54,34 @@ class NDPN(nn.Module):
             ConvBlock(channels, channels, kernel_size=3, stride=1, padding=1, act=True),
             ConvBlock(channels, channels, kernel_size=1, stride=1, padding=0, act=False),
         )
-        # Charlie P0-2: s_noise 条件输入 — 投影到特征空间后与去噪特征融合
         self.noise_proj = nn.Conv2d(1, channels, 1, 1, 0)
         nn.init.zeros_(self.noise_proj.weight)
         nn.init.zeros_(self.noise_proj.bias)
+
+        # Delta: correspondence confidence projector (from C_omega diagonals)
+        self.conf_proj = nn.Sequential(
+            nn.Linear(num_frames - 1, channels // 4),
+            nn.GELU(),
+            nn.Linear(channels // 4, 1),
+            nn.Sigmoid(),
+        )
+
+        # Delta: noise extraction (encoder feat vs aligned feat difference)
+        self.noise_extract = nn.Sequential(
+            nn.Conv2d(channels * 2, channels, 3, 1, 1),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, 3, 1, 1),
+        )
+
+        # Delta: confidence-guided denoising strength
+        self.denoise_strength = nn.Sequential(
+            nn.Conv2d(channels + 1, channels, 3, 1, 1),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, 1),
+            nn.Sigmoid(),
+        )
+
+        self.gamma = nn.Parameter(torch.zeros(1, channels, 1, 1))
 
     def forward(
         self,
@@ -88,14 +114,14 @@ class NDPN(nn.Module):
                 diag = C_t.diagonal(dim1=-2, dim2=-1)
                 diag_scores.append(diag)
             diag_stack = torch.stack(diag_scores, dim=-1)  # (B, N, T-1)
-            conf_map = diag_stack.mean(dim=-1)  # (B, N) avg confidence
-            ds = int(conf_map.shape[-1] ** 0.5)
-            conf_map = conf_map.reshape(B, 1, ds, ds)
+            conf_raw = self.conf_proj(diag_stack).squeeze(-1)  # (B, N)
+            ds = int(conf_raw.shape[-1] ** 0.5)
+            conf_map = conf_raw.reshape(B, 1, ds, ds)
             conf_map = F.interpolate(conf_map, size=(H, W), mode='bilinear',
-                                     align_corners=False)  # (B, 1, H, W)
+                                     align_corners=False)
 
         # Step 2: 各帧权重
-        F_t = F_t_aligned if F_t_aligned is not None else feats[:, center_idx]
+        F_ref = F_t_aligned if F_t_aligned is not None else feats[:, center_idx]
         alphas: List[torch.Tensor] = []
 
         for i in range(T):
@@ -103,28 +129,32 @@ class NDPN(nn.Module):
             if i == center_idx:
                 alpha_i = s_snr
             else:
-                resid = (F_i_aligned - F_t).abs()
+                resid = (F_i_aligned - F_ref).abs()
                 alpha_raw = torch.sigmoid(self.alpha_conv(resid))
                 alpha_i = alpha_raw * (1.0 - s_snr)
             alphas.append(alpha_i)
 
-        # Step 3: 归一化加权聚合
         alpha_sum = torch.stack(alphas, dim=1).sum(dim=1) + eps
 
-        F_denoised = torch.zeros_like(F_t)
+        F_denoised = torch.zeros_like(F_ref)
         for i in range(T):
             w_i = alphas[i] / alpha_sum
             F_denoised = F_denoised + w_i * F_aligned_list[i]
 
         F_denoised = self.refine(F_denoised)
 
-        # Delta: correspondence confidence modulates denoising
-        if conf_map is not None:
-            F_denoised = F_denoised * (0.5 + 0.5 * conf_map)
+        # Delta: noise extraction from encoder vs aligned reference
+        f_enc = feats[:, center_idx]
+        noise_feat = self.noise_extract(torch.cat([f_enc, F_ref], dim=1))
 
-        # s_noise 条件调制
-        noise_cond = self.noise_proj(s_noise)
-        f_noise_out = F_denoised + noise_cond
+        # Delta: confidence-guided denoising strength
+        if conf_map is not None:
+            strength = self.denoise_strength(torch.cat([noise_feat, conf_map], dim=1))
+        else:
+            strength = self.denoise_strength(torch.cat([noise_feat, torch.zeros_like(noise_feat[:, :1])], dim=1))
+
+        # Delta: gamma-scaled denoising
+        f_noise_out = f_enc - noise_feat * strength * self.gamma + self.noise_proj(s_noise)
 
         return {
             "f_noise_out": f_noise_out,

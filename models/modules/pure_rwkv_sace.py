@@ -60,7 +60,7 @@ class BiWKV(nn.Module):
 
     def forward(self, k: torch.Tensor, v: torch.Tensor,
                 total_tokens: int) -> torch.Tensor:
-        """WKV cumsum: S_t = Σ_{i≤t} exp(w)^{t-i}·k_i·v_i (完全向量化)"""
+        """Bi-WKV 双向扫描 — cumsum 实现 (fwd+bwd)/2"""
         B, L, C = k.shape
         w = self.spatial_decay.clamp(-8, 8)
         u = self.spatial_first.clamp(-5, 5)
@@ -69,9 +69,16 @@ class BiWKV(nn.Module):
         ek, ekv = k.exp(), k.exp() * v
         arange_L = torch.arange(L, device=k.device).float().view(1, L, 1)
         ew_pow = ew.pow(arange_L)
-        S = (ekv / ew_pow).cumsum(dim=1) * ew_pow
-        D = (ek  / ew_pow).cumsum(dim=1) * ew_pow
-        return (u_coef * ekv + S) / (u_coef * ek + D + 1e-8)
+        # forward: S_t = Σ_{i≤t} ew^{t-i}·ekv_i
+        S_fwd = (ekv / ew_pow).cumsum(dim=1) * ew_pow
+        D_fwd = (ek  / ew_pow).cumsum(dim=1) * ew_pow
+        wkv_fwd = (u_coef * ekv + S_fwd) / (u_coef * ek + D_fwd + 1e-8)
+        # backward: scan from t=L-1 to 0
+        S_bwd = (ekv.flip(1) / ew_pow).cumsum(dim=1) * ew_pow
+        D_bwd = (ek.flip(1)  / ew_pow).cumsum(dim=1) * ew_pow
+        wkv_bwd = (u_coef * ekv + S_bwd) / (u_coef * ek.flip(1) + D_bwd + 1e-8)
+        wkv_bwd = wkv_bwd.flip(1)
+        return (wkv_fwd + wkv_bwd) * 0.5
 
 
 # ============================================================
