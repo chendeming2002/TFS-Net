@@ -106,7 +106,18 @@ def infer_bump(files):
 
 
 def format_version(ver):
-    return f"v6-{ver['name']}-{ver['series']}{ver['block']}-MK{ver['mk']}-Mod{ver['mod']}"
+    """规则: MK0 和 Mod0 省略, 两者都为0时仅保留基础标识"""
+    mk = int(ver.get('mk', 0))
+    mod = int(ver.get('mod', 0))
+    base = f"v6-{ver['name']}-{ver['series']}{ver['block']}"
+    parts = []
+    if mk > 0:
+        parts.append(f"MK{mk}")
+    if mod > 0:
+        parts.append(f"Mod{mod}")
+    if parts:
+        return base + "-" + "-".join(parts)
+    return base
 
 
 def main():
@@ -141,7 +152,7 @@ def main():
     print(f"  → {format_version(ver)}")
     print()
     print(f"建议 commit message:")
-    print(f"  v6-{ver['name']}-{ver['series']}{ver['block']}-MK{ver['mk']}-Mod{ver['mod']}")
+    print(f"  {format_version(ver)}")
 
 
 if __name__ == "__main__":
