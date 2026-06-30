@@ -1106,6 +1106,8 @@ class IFPN(nn.Module):
 # ============================================================
 
 
+# Delta Flight1: noise_extract + denoise_strength + conf_proj
+# Delta Flight1: noise_extract + denoise_strength + conf_proj
 class NDPN(nn.Module):
     """
     Args:
@@ -1152,6 +1154,23 @@ class NDPN(nn.Module):
             nn.Sigmoid(),
         )
 
+        # Delta: noise extraction (encoder feat vs aligned feat difference)
+        self.noise_extract = nn.Sequential(
+            nn.Conv2d(channels * 2, channels, 3, 1, 1),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, 3, 1, 1),
+        )
+
+        # Delta: confidence-guided denoising strength
+        self.denoise_strength = nn.Sequential(
+            nn.Conv2d(channels + 1, channels, 3, 1, 1),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, 1),
+            nn.Sigmoid(),
+        )
+
+        self.gamma = nn.Parameter(torch.zeros(1, channels, 1, 1))
+
     def forward(
         self,
         feats: torch.Tensor,
@@ -1190,7 +1209,7 @@ class NDPN(nn.Module):
                                      align_corners=False)
 
         # Step 2: 各帧权重
-        F_t = F_t_aligned if F_t_aligned is not None else feats[:, center_idx]
+        F_ref = F_t_aligned if F_t_aligned is not None else feats[:, center_idx]
         alphas: List[torch.Tensor] = []
 
         for i in range(T):
@@ -1198,28 +1217,32 @@ class NDPN(nn.Module):
             if i == center_idx:
                 alpha_i = s_snr
             else:
-                resid = (F_i_aligned - F_t).abs()
+                resid = (F_i_aligned - F_ref).abs()
                 alpha_raw = torch.sigmoid(self.alpha_conv(resid))
                 alpha_i = alpha_raw * (1.0 - s_snr)
             alphas.append(alpha_i)
 
-        # Step 3: 归一化加权聚合
         alpha_sum = torch.stack(alphas, dim=1).sum(dim=1) + eps
 
-        F_denoised = torch.zeros_like(F_t)
+        F_denoised = torch.zeros_like(F_ref)
         for i in range(T):
             w_i = alphas[i] / alpha_sum
             F_denoised = F_denoised + w_i * F_aligned_list[i]
 
         F_denoised = self.refine(F_denoised)
 
-        # Delta: correspondence confidence modulates denoising
-        if conf_map is not None:
-            F_denoised = F_denoised * (0.5 + 0.5 * conf_map)
+        # Delta: noise extraction from encoder vs aligned reference
+        f_enc = feats[:, center_idx]
+        noise_feat = self.noise_extract(torch.cat([f_enc, F_ref], dim=1))
 
-        # s_noise 条件调制
-        noise_cond = self.noise_proj(s_noise)
-        f_noise_out = F_denoised + noise_cond
+        # Delta: confidence-guided denoising strength
+        if conf_map is not None:
+            strength = self.denoise_strength(torch.cat([noise_feat, conf_map], dim=1))
+        else:
+            strength = self.denoise_strength(torch.cat([noise_feat, torch.zeros_like(noise_feat[:, :1])], dim=1))
+
+        # Delta: gamma-scaled denoising
+        f_noise_out = f_enc - noise_feat * strength * self.gamma + self.noise_proj(s_noise)
 
         return {
             "f_noise_out": f_noise_out,
@@ -1227,13 +1250,7 @@ class NDPN(nn.Module):
             "snr_hat":     snr_hat,
         }
 
-
-
-# ============================================================
-# MRPN: Motion-Refining Pyramid Network
-# ============================================================
-
-
+# Delta Flight1: motion_estimator + sigma_proj + comp_gate + motion_refine
 class MRPN(nn.Module):
     def __init__(self, channels=64, window_size=8, num_frames=5):
         super().__init__()
@@ -1259,6 +1276,30 @@ class MRPN(nn.Module):
             nn.Conv2d(channels // 4, 1, 1),
             nn.Sigmoid(),
         )
+
+        # Delta: sigma projection (frame-level → channel-wise)
+        self.sigma_proj = nn.Sequential(
+            nn.Linear(num_frames, channels),
+            nn.GELU(),
+            nn.Linear(channels, channels),
+        )
+
+        # Delta: compensation gate (motion magnitude gated)
+        self.comp_gate = nn.Sequential(
+            nn.Conv2d(channels + 1, channels, 3, 1, 1),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, 1),
+            nn.Sigmoid(),
+        )
+
+        # Delta: motion refinement (F_t_aligned vs center delta)
+        self.motion_refine = nn.Sequential(
+            nn.Conv2d(channels * 2, channels, 3, 1, 1),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, 3, 1, 1),
+        )
+
+        self.gamma = nn.Parameter(torch.ones(1, channels, 1, 1) * 0.1)
 
     def _aggregate_neighbors(self, f_t, f_omega):
         """窗口 dot-product 相关聚合相邻帧（不含中心帧）。"""
@@ -1289,7 +1330,10 @@ class MRPN(nn.Module):
             dim=1,
         )
 
-        f_omega_aligned = self._aggregate_neighbors(f_t_aligned, f_neighbors)
+        # Delta: use F_t_aligned as alignment reference
+        f_center = F_t_aligned if F_t_aligned is not None else f_t_aligned
+
+        f_omega_aligned = self._aggregate_neighbors(f_center, f_neighbors)
 
         # Delta: motion magnitude from C_omega_list (full motion_estimator)
         motion_mag = None
@@ -1308,28 +1352,45 @@ class MRPN(nn.Module):
                                        mode='bilinear', align_corners=False)
 
         # Delta: use F_t_aligned as alignment reference
-        if F_t_aligned is not None:
-            f_t_aligned = F_t_aligned
+        f_center = F_t_aligned if F_t_aligned is not None else f_t_aligned
+
+        # Delta: sigma projection (frame-level → per-channel)
+        sigma_feat = None
+        if sigma_t_clean is not None:
+            B_val = sigma_t_clean.shape[0]
+            sigma_flat = sigma_t_clean.mean(dim=(2, 3))  # (B, C)
+            sigma_feat = self.sigma_proj(sigma_flat).view(B_val, 1, self.channels, 1, 1)
 
         # blur_mask gate
         blur_mask = None
         if sigma_t_clean is not None:
             sigma_1ch = sigma_t_clean.mean(dim=1, keepdim=True)
-            frame_diff = (f_omega_aligned - f_t_aligned).abs()
+            frame_diff = (f_omega_aligned - f_center).abs()
             blur_input = torch.cat([sigma_1ch, frame_diff], dim=1)
             blur_mask = self.blur_estimator(blur_input)
 
-        z_t = torch.cat([f_t_aligned, f_omega_aligned], dim=1)
+        # Delta: motion refinement from F_t_aligned vs center delta
+        motion_delta = self.motion_refine(
+            torch.cat([f_center, f_omega_aligned], dim=1)
+        )
+
+        z_t = torch.cat([f_center, f_omega_aligned], dim=1)
         g_t = torch.sigmoid(self.gate(z_t))
 
-        # Delta: motion magnitude modulates gate
+        # Delta: compensation gate modulated by motion magnitude
+        comp = self.comp_gate(torch.cat([f_center, motion_mag], dim=1)) \
+            if motion_mag is not None else torch.sigmoid(self.gate(z_t))
+
+        # Delta: blur + motion modulated gate
         if blur_mask is not None:
             g_t = g_t * (1.0 - blur_mask) + blur_mask * 0.3
         if motion_mag is not None:
             g_t = g_t * (1.0 - motion_mag) + motion_mag * 0.3
 
-        f_t_fuse = g_t * f_t_aligned + (1.0 - g_t) * f_omega_aligned
-        hat_f_t = self.refine(f_t_fuse) + f_t_aligned
+        # Delta: gamma-scaled motion refinement + gate fusion
+        f_t_fuse = g_t * f_center + (1.0 - g_t) * f_omega_aligned \
+                   + motion_delta * comp * self.gamma
+        hat_f_t = self.refine(f_t_fuse) + f_center
 
         return {
             "f_omega_aligned": f_omega_aligned,
@@ -1338,12 +1399,6 @@ class MRPN(nn.Module):
             "f_t_fuse": f_t_fuse,
             "f_motion_out": hat_f_t,
         }
-
-
-# ============================================================
-# CrossFusionGate — NDPN/MRPN 输出端交叉门控
-# ============================================================
-
 
 class CrossFusionGate(nn.Module):
     """Charlie3 P1 + Delta: NDPN/MRPN 交叉门控 (结构性重参数化)

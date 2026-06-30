@@ -26,7 +26,7 @@ docs/v6/RWKV-Delta-model/
 │   ├── __init__.py            # 导出 TFSNet
 │   ├── blocks.py              # ConvBlock, ResBlock, NAFBlock, 窗口函数 (175行)
 │   ├── dwt_lff.py             # SpatialDWTLFFAdapter + HaarDWT2D (84行)
-│   └── tfs_net.py             # TFSNet 完整模型 (1864行, 合并23个类)
+│   └── tfs_net.py             # TFSNet 完整模型 (1919行, 合并23个类)
 ├── train.py                   # 训练+推理 (259行)
 ├── README.md                  # 本文件
 └── v6-delta-diagrams.md       # 架构图 (Mermaid)
@@ -56,8 +56,8 @@ docs/v6/RWKV-Delta-model/
 | `TemporalAggregation` | SACE | C_omega-warp + frame_gate → F_t_aligned |
 | `PureRWKVSACE` | SACE | 空间扫描+时序对应, 移除DWT-LFF |
 | `IFPN` | 光照 | s_illum_proj → A_illu 输出 |
-| `NDPN` | 去噪 | C_omega conf_map + s_noise 条件 |
-| `MRPN` | 运动 | C_omega motion_mag + blur_mask |
+| `NDPN` | 去噪 | conf_proj + noise_extract + denoise_strength + s_noise |
+| `MRPN` | 运动 | motion_estimator + sigma_proj + comp_gate + motion_refine + γ |
 | `CrossFusionGate` | 交叉 | deploy 重参数化 |
 | `IGRF` | 合成 | A_illu 替代 s_illum 直接注入 |
 

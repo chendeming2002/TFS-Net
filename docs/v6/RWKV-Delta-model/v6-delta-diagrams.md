@@ -122,16 +122,20 @@ flowchart TD
             IFPN_PROJ --> IFPN_A
         end
         subgraph NDPN["NDPN 去噪"]
-            NDPN_SNR["SNR = mu/sigma → s_snr<br/>+ C_omega diag → conf_map"]
-            NDPN_AGG["双因素权重聚合<br/>+ F_t_aligned 参考<br/>+ conf_map 调制去噪<br/>+ s_noise 条件注入"]
-            NDPN_SNR --> NDPN_AGG
+            NDPN_SNR["SNR = mu/sigma → s_snr<br/>+ conf_proj(C_omega diag) → conf_map"]
+            NDPN_NOISE["★ noise_extract<br/>feat(center) vs F_t_aligned差异<br/>→ noise_feat"]
+            NDPN_STR["★ denoise_strength<br/>noise_feat + conf_map → strength<br/>→ f_enc - noise × strength × γ<br/>+ s_noise条件注入"]
+            NDPN_SNR --> NDPN_NOISE
+            NDPN_NOISE --> NDPN_STR
         end
         subgraph MRPN["MRPN 运动"]
-            MRPN_CORR["窗口相关聚合邻帧<br/>+ C_omega diag → motion_mag"]
-            MRPN_BLUR["blur_estimator(sigma,frame_diff)<br/>→ blur_mask 门控"]
-            MRPN_GATE["motion_mag 调制 gate<br/>+ F_t_aligned 参考<br/>→ f_motion_out"]
-            MRPN_CORR --> MRPN_BLUR
-            MRPN_BLUR --> MRPN_GATE
+            MRPN_CORR["窗口相关聚合邻帧<br/>+ F_t_aligned 参考"]
+            MRPN_MOTION["★ motion_estimator<br/>C_omega diag → Conv → motion_mag"]
+            MRPN_BLUR["blur_estimator(sigma,frame_diff)<br/>→ blur_mask"]
+            MRPN_COMP["★ comp_gate + motion_refine<br/>motion_delta × comp × γ<br/>+ gate×f_center + (1-gate)×f_omega"]
+            MRPN_CORR --> MRPN_MOTION
+            MRPN_MOTION --> MRPN_BLUR
+            MRPN_BLUR --> MRPN_COMP
         end
     end
 
@@ -152,16 +156,15 @@ flowchart TD
     ENC --> TFSI_FREQ
     ENC --> SACE_DS
     TFSI_HEAD -- "s_illum" --> IFPN_PROJ
-    TFSI_HEAD -- "s_noise" --> NDPN_AGG
+    TFSI_HEAD -- "s_noise" --> NDPN_STR
     TFSI_HEAD -- "s_noise" --> IGRF_S1
     SACE_UP -- "aligned_feats" --> IFPN
-    SACE_TEMPORAL -- "F_t_aligned" --> NDPN_AGG
-    SACE_TEMPORAL -- "C_omega" --> NDPN_SNR
+    SACE_TEMPORAL -- "F_t_aligned, C_omega" --> NDPN_SNR
     SACE_TEMPORAL -- "F_t_aligned, C_omega" --> MRPN_CORR
     SACE_STATS -- "sigma_t_clean" --> MRPN_BLUR
     IFPN_A -- "lit_up_map, f_illum, A_illu" --> IGRF_S3
-    NDPN_AGG -- "f_noise_out" --> CXF_NM
-    MRPN_GATE -- "f_motion_out" --> CXF_NM
+    NDPN_STR -- "f_noise_out" --> CXF_NM
+    MRPN_COMP -- "f_motion_out" --> CXF_NM
     CXF_NM -- "f_noise, f_motion" --> IGRF_S1
     CXF_NM -- "f_motion" --> IGRF_S2
     IN -- "image_center" --> IGRF_S1
