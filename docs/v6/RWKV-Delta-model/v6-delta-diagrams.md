@@ -14,11 +14,11 @@ flowchart TD
     end
 
     subgraph 对齐层["空间扫描 + 时序对应"]
-        SACE["SACE Delta<br/>MVC-Shift + SpatialWKV2D<br/>4方向空间扫描<br/>→ sace_out (B,T,C,H,W)<br/>→ C_omega (时序对应矩阵)<br/>→ F_t_aligned (对齐锚)"]
+        SACE["SACE Delta<br/>MVC-Shift + SpatialWKV2D<br/>4方向空间扫描<br/>→ sace_out (B,T,C,H,W)<br/>→ C_omega (时序对应矩阵)<br/>→ F_t_aligned (对齐锚)<br/>→ mu_t_clean, sigma_t_clean"]
     end
 
     subgraph 处理层["三源退化并行建模"]
-        IFPN["IFPN<br/>光照图估计<br/>+ s_illum_proj<br/>→ A_illu"]
+        IFPN["IFPN<br/>光照图估计<br/>+ aligned_feats, image_down<br/>+ s_illum_proj → A_illu"]
         NDPN["NDPN<br/>SNR去噪<br/>+ C_omega conf<br/>+ s_noise 条件"]
         MRPN["MRPN<br/>运动补偿<br/>+ C_omega motion<br/>+ sigma blur_mask"]
     end
@@ -39,14 +39,14 @@ flowchart TD
     TFSI -- "s_illum" --> IFPN
     TFSI -- "s_noise" --> NDPN
 
-    SACE -- "sace_out (F_aligned)" --> IFPN
-    SACE -- "F_t_aligned, C_omega" --> NDPN
-    SACE -- "F_t_aligned, C_omega, sigma" --> MRPN
+    SACE -- "F_aligned_list" --> IFPN
+    SACE -- "F_aligned_list, C_omega, F_t_aligned, mu, sigma" --> NDPN
+    SACE -- "F_aligned_list, C_omega, F_t_aligned, sigma" --> MRPN
 
     IFPN -- "lit_up_map, f_illum, A_illu" --> IGRF
     NDPN -- "f_noise" --> CXF
     MRPN -- "f_motion" --> CXF
-    CXF -- "cross-modulated" --> IGRF
+    CXF -- "f_noise, f_motion" --> IGRF
 
     IGRF --> OUT
     IN -- "img_center" --> IGRF
@@ -55,7 +55,7 @@ flowchart TD
 
 ### 框架要点
 
-- **三源分离估计**：Encoder → TFSI (s_illum/s_noise)；SACE 统计量 (σ_t_clean)
+- **三源分离估计**：Encoder → TFSI (s_illum/s_noise)；SACE (mu_t_clean, sigma_t_clean, F_t_aligned, C_omega, F_aligned_list)
 - **TFSI ↔ SACE 关系**：TFSI 进行时频域诊断 (temporal_fuse + FFT)，SACE 进行空域扫描 (MVC-Shift + 4方向 WKV)，两者平行独立，在 Encoder 输出处分叉。s_noise 仅注入 NDPN，不再传入 IGRF
 - **SACE 内部**：MVC-Shift(多尺度空洞DWConv) → SpatialWKV2D(4方向空间扫描) → Channel Mix → TemporalCorrespondence(时序对应矩阵) → TemporalAggregation(时序对齐聚合)
 - **C_omega_list**：Delta 核心创新 — 中心帧与邻帧的空间 cosine similarity 矩阵，同时注入 NDPN(conf_map) 和 MRPN(motion_mag) 作为置信度参考
@@ -101,16 +101,14 @@ flowchart TD
 
         subgraph SACE_TEMPORAL["时序对应 Delta"]
             TCORR["TemporalCorrespondence<br/>proj_qk → cosine similarity / tau<br/>→ C_omega_list (T-1)x(B,N,N)"]
-            TAGG["TemporalAggregation<br/>C_omega x neighbor → warp<br/>frame_gate → softmax加权<br/>up+residual+LN → F_t_aligned"]
+            TAGG["TemporalAggregation<br/>C_omega × neighbor(ds) → warp<br/>frame_gate → softmax加权<br/>upsample → F_t_aligned (B,C,H,W)"]
             TCORR --> TAGG
         end
 
         SACE_DS --> SACE_SPATIAL
         SACE_SPATIAL --> SACE_UP
+        SACE_SPATIAL --> TCORR
         SACE_UP --> SACE_STATS
-        SACE_DOWNSAMPLED["降采样特征 HdxWd"] --> TCORR
-        SACE_UP --> TCORR
-        TAGG --> SACE_UP
     end
 
     subgraph 三源处理["三源退化并行建模"]
@@ -157,13 +155,15 @@ flowchart TD
     TFSI_HEAD -- "s_illum" --> IFPN_PROJ
     TFSI_HEAD -- "s_noise" --> NDPN_STR
     SACE_UP -- "aligned_feats" --> IFPN
+    SACE_TEMPORAL -- "F_t_aligned" --> IFPN
+    SACE_STATS -- "mu_t_clean, sigma_t_clean" --> NDPN_SNR
     SACE_TEMPORAL -- "F_t_aligned, C_omega" --> NDPN_SNR
     SACE_TEMPORAL -- "F_t_aligned, C_omega" --> MRPN_CORR
     SACE_STATS -- "sigma_t_clean" --> MRPN_BLUR
     IFPN_A -- "lit_up_map, f_illum, A_illu" --> IGRF_S3
     NDPN_STR -- "f_noise_out" --> CXF_NM
     MRPN_COMP -- "f_motion_out" --> CXF_NM
-    CXF_NM -- "f_noise, f_motion" --> IGRF_S1
+    CXF_NM -- "f_noise" --> IGRF_S1
     CXF_NM -- "f_motion" --> IGRF_S2
     IN -- "image_center" --> IGRF_S1
     ENC -- "feat_to_img → image_down" --> IFPN
