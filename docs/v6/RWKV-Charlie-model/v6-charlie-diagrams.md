@@ -1,4 +1,4 @@
-# TFS-Net v6 Charlie2 整体架构图 (2026-06-29, 更新: Charlie2 D1-D4 实施)
+# TFS-Net v6 Charlie3 整体架构图 (2026-06-30, 更新: Charlie3 P0-P2 实施)
 
 ## 图一：最简架构（三源分离估计-三源处理-修正去噪）
 
@@ -15,17 +15,18 @@ flowchart TD
     end
 
     subgraph 对齐层
-        SACE["SACE<br/>纯 RWKV 帧间注意力<br/>多尺度双向 Bi-WKV<br/>concat+channel_mix 融合<br/>V 源 = Encoder 原始中心帧<br/>★ Charlie2: s_noise 已移除"]
+        SACE["SACE<br/>纯 RWKV 帧间注意力<br/>多尺度双向 Bi-WKV<br/>★ P2: LearnableScaleFusion<br/>V 源 = Encoder 原始中心帧<br/>s_noise 已移除"]
     end
 
     subgraph 处理层["三源退化并行建模"]
-        IFPN["IFPN<br/>光照图估计<br/>★ Charlie2: s_illum 调制 + encoder 特征输入"]
+        IFPN["IFPN<br/>光照图估计<br/>★ P0: s_illum 唯一路径 + s_illum_proj 先验注入<br/>★ encoder 特征输入"]
         NDPN["NDPN<br/>SNR自适应去噪<br/>s_noise 条件输入"]
         MRPN["MRPN<br/>运动补偿<br/>σ→MRPN 运动感知"]
+        CFG["★ P1: CrossFusionGate<br/>噪声↔运动 交叉门控"]
     end
 
     subgraph 执行层["修正去噪"]
-        IGRF["IGRF<br/>去噪→去模糊→提亮<br/>★ Charlie2: VSRELL A_illu 单一光照"]
+        IGRF["IGRF<br/>去噪→去模糊→提亮<br/>★ P0: s_illum 已移除 — 光照经 IFPN 唯一出口"]
     end
 
     OUT["输出 res_t"]
@@ -33,41 +34,43 @@ flowchart TD
     IN --> ENC
     ENC --> DWT
     ENC -- "F_t (中心帧原始)" --> SACE
-    ENC -- "encoder 特征 ★" --> IFPN
+    ENC -- "encoder 特征" --> IFPN
     DWT --> TFSI
     DWT --> SACE
-    TFSI -- "s_illum ★" --> IGRF
-    TFSI -- "s_illum ★" --> IFPN
-    TFSI -- "s_noise ★" --> NDPN
+    TFSI -- "s_illum ★ P0: 唯一路径 →" --> IFPN
+    TFSI -- "s_noise" --> NDPN
 
     SACE -- "F_aligned" --> IFPN
     SACE -- "F_aligned, μ_t_clean, σ_t_clean" --> NDPN
     SACE -- "F_aligned, σ_t_clean" --> MRPN
 
-    IFPN -- "f_illum" --> IGRF
-    NDPN -- "f_noise" --> IGRF
-    MRPN -- "f_motion" --> IGRF
+    IFPN -- "lit_up_map + f_illum_feat" --> IGRF
+    NDPN -- "f_noise" --> CFG
+    MRPN -- "f_motion" --> CFG
+    CFG -- "f_noise_gated" --> IGRF
+    CFG -- "f_motion_gated" --> IGRF
 
     IGRF --> OUT
     IN -- "img_center" --> IGRF
-    IN -- "img_center" --> IFPN
 ```
 
 ### 框架要点
 
 - **三源分离估计**：DWT-LFF + TFSI 联合诊断光照(s_illum)和噪声(s_noise)；SACE 通过帧间方差(σ_t_clean)隐式感知运动
-- **TFSI ↔ SACE 关系**：TFSI 的 FrequencyBranch 使用多帧邻居融合（Charlie P0-1）；SACE 使用 DWT-LFF 双实例（中心 α=0.6 / 邻居 α=0.4）做对齐前归一化
-- **三源并行处理**：IFPN/NDPN/MRPN 三个分支从 SACE 对齐特征各自估计修复方案
-- **SACE 纯 RWKV 注意力**：多尺度双向 Bi-WKV（full/half/quarter），concat+channel_mix 可学习融合（Charlie P1-1）
+- **s_illum 唯一路径 (P0)**：TFSI → IFPN（s_illum_proj 零初始化先验注入）→ IGRF（f_illum_feat 已蕴含光照信息）
+- **CrossFusionGate (P1)**：NDPN/MRPN 各自独立推理后，交叉门控交换互补置信度（运动剧烈去噪低、高噪运动补偿低）
+- **LearnableScaleFusion (P2)**：SACE 三尺度 softmax 加权融合，替代 concat+channel_mix（12K→1.5K 参数）
 
-### Charlie 数据流改动（vs Bravo）
+### Charlie3 vs Charlie2 核心差异
 
-| 改动 | 优先级 | 说明 |
-|------|--------|------|
-| **s_noise → NDNP (+ noise_proj)** | P0 | s_noise 从 IGRF Stage1 移除, 注入 NDPN 作为条件输入 (Conv2d 1→64, 零初始化) |
-| **σ_t_clean → MRPN (+ blur_estimator)** | P1 | σ_t_clean 从 NDPN 独占到 MRPN 共享, 用于 blur_mask 运动感知 |
-| **sigma_sace 调制 s_noise** | P2 | 高帧间方差(运动) → sigmoid(-σ×2) 降低 s_noise 置信度 |
-| **blur_mask 门控 MRPN** | P2 | σ_t_clean + 帧间差异 → blur_estimator → 模糊区偏向邻帧补偿 |
+| 维度 | Charlie2 | Charlie3 |
+|------|----------|----------|
+| **s_illum 路径** | TFSI → IFPN + TFSI → IGRF 双路径 | ★ P0: TFSI → IFPN 唯一路径 |
+| **IFPN 光照注入** | illumin_modulate × s_illum (对齐特征调制) | ★ P0: s_illum_proj (零初始化, coarse 级加法注入) |
+| **IGRF Brighten** | 接收 s_illum 做 A_illu 门控 | ★ P0: 移除 s_illum, f_illum_feat 自含光照 |
+| **NDPN↔MRPN 关系** | 无交互，各自直送 IGRF | ★ P1: CrossFusionGate 交叉门控 |
+| **SACE 多尺度融合** | concat[3C]→Linear(3C→C) (~12K) | ★ P2: LearnableScaleFusion (~1.5K) |
+| **参数量** | 1.26M | ★ 1.32M (+59K) |
 
 ---
 
@@ -101,41 +104,46 @@ flowchart TD
     subgraph SACE["SACE 纯 RWKV 帧间注意力"]
         direction TB
         SACE_DWT["DWT-LFF 逐帧<br/>center→lff_center<br/>neighbor→lff_neighbor"]
-        SACE_REF["μ_t_clean = lff_stack[center]<br/>σ_t_clean = lff_stack.std<br/>→ NDPN (SNR基线) + MRPN (运动感知) ★"]
+        SACE_REF["μ_t_clean = lff_stack[center]<br/>σ_t_clean = lff_stack.std<br/>→ NDPN (SNR基线) + MRPN (运动感知)"]
 
         subgraph SACE_RWKV["多尺度 Bi-RWKV 帧间注意力"]
             RWKV_F["full: VRWKV ×2 (双向)"]
             RWKV_H["half: avg_pool3d(×2) → VRWKV ×2 → bilinear↑"]
             RWKV_Q["quarter: avg_pool3d(×4) → VRWKV ×2 → bilinear↑"]
-            RWKV_FUSE["★ channel_mix (Charlie P1-1)<br/>concat[full,half,quarter](3C)<br/>→ Linear(3C→C) 可学习融合"]
+            RWKV_FUSE["★ P2: LearnableScaleFusion<br/>softmax 权 + 逐尺度 SE 校准<br/>→ 可学习加权融合 (1.5K params)"]
         end
 
-        SACE_GATE["边缘门控 + V raw<br/>edge_weight = edge_prompt(f_raw_center)<br/>F_aligned[t] = out[t] + (1-edge_w)·f_raw<br/>+ (1-s_noise)·f_raw"]
+        SACE_GATE["边缘门控 + V raw<br/>edge_weight = edge_prompt(f_raw_center)<br/>F_aligned[t] = out[t] + f_raw_center<br/>s_noise 已移除 — 噪声仅去 NDPN"]
     end
 
     subgraph 三源处理["三源退化并行建模"]
         direction LR
-        subgraph IFPN["IFPN 光照图估计"]
-            IFPN_F["coarse_adapter → IllumExtract×T<br/>→ L_ratio → lit_up_map_raw [1,5]<br/>→ side_head → f_illum_feat"]
+        subgraph IFPN["IFPN 光照图估计 ★P0"]
+            IFPN_ILLUM["★ s_illum_proj (零初始化)<br/>Conv2d(1→64→32)<br/>→ 注入 coarse_adapter 输出"]
+            IFPN_COARSE["coarse_adapter → + illum_prior<br/>→ IllumExtract×T → L_ratio<br/>→ lit_up_map_raw [1,5]<br/>→ side_head → f_illum_feat"]
         end
-        subgraph NDPN["NDPN 去噪 ★Charlie P0"]
+        subgraph NDPN["NDPN 去噪"]
             NDPN_SNR["SNR估计 (|μ|/σ)<br/>→ 双因素聚合权重"]
-            NDPN_COND["★ s_noise 条件输入 (noise_proj)<br/>Conv2d(1→64) → 加法注入<br/>(替代 IGRF 直接注入)"]
+            NDPN_COND["s_noise 条件输入 (noise_proj)<br/>Conv2d(1→64) → 加法注入"]
             NDPN_SNR --> NDPN_COND
         end
-        subgraph MRPN["MRPN 运动 ★Charlie P1+P2"]
+        subgraph MRPN["MRPN 运动"]
             MRPN_CORR["窗口相关 → f_omega_aligned"]
-            MRPN_BLUR["★ blur_estimator<br/>σ_t_clean + 帧间差异 → blur_mask<br/>(零初始化, 逐步学习)"]
+            MRPN_BLUR["blur_estimator<br/>σ_t_clean + 帧间差异 → blur_mask"]
             MRPN_GATE["门控融合<br/>g_t × blur_mask 调制<br/>→ Refine → f_motion"]
             MRPN_CORR --> MRPN_BLUR
             MRPN_BLUR --> MRPN_GATE
         end
+        subgraph CFG["★ P1: CrossFusionGate"]
+            CFG_NOISE["gate_noise(f_motion)<br/>运动剧烈 → 降低去噪"]
+            CFG_MOTION["gate_motion(f_noise)<br/>高噪声 → 降低运动补偿"]
+        end
     end
 
-    subgraph IGRF["IGRF 修正去噪"]
-        IGRF_S1["Stage1: δ=Fuse(f_noise,img)<br/>★ s_noise 已移除<br/>img_s1=clamp(img+δ)"]
-        IGRF_S2["Stage2: δ=Fuse(f_motion, img_s1)<br/>img_s2=clamp(img_s1+δ)"]
-        IGRF_S3["Stage3: res_t=clamp(img_s2×lit_up_map<br/>+ s_illum·corr_mag)"]
+    subgraph IGRF["IGRF 修正去噪 ★P0"]
+        IGRF_S1["Stage1: δ=Fuse(f_noise_gated, img)<br/>img_s1=clamp(img+δ)"]
+        IGRF_S2["Stage2: δ=Fuse(f_motion_gated, img_s1)<br/>img_s2=clamp(img_s1+δ)"]
+        IGRF_S3["Stage3: ★ s_illum 已移除<br/>A_illu = SigConv(f_illum_feat)<br/>res_t=clamp(img_s2×lit_up_map×(1+A_illu))"]
     end
 
     OUT["输出 res_t"]
@@ -145,47 +153,48 @@ flowchart TD
     ENC --> DWT_C
     ENC --> DWT_N
     ENC -- "F_t (中心帧原始)" --> SACE_GATE
+    ENC -- "encoder 特征" --> IFPN_COARSE
     DWT_C -- "F_lff_t, feat_tfsi" --> TFSI_FREQ
     DWT_N --> SACE_DWT
     DWT_C --> SACE_DWT
-    TFSI_HEAD -- "s_illum" --> IGRF_S3
-    TFSI_HEAD -- "s_noise + phase_conf" --> SACE_GATE
-    TFSI_HEAD -- "s_noise ★ (P0)" --> NDPN_COND
-    SACE_REF -- "σ_t_clean ★ (P1)" --> MRPN_BLUR
+    TFSI_HEAD -- "s_illum ★ P0: 唯一路径 →" --> IFPN_ILLUM
+    TFSI_HEAD -- "s_noise" --> NDPN_COND
+    SACE_REF -- "σ_t_clean" --> MRPN_BLUR
     SACE_REF -- "μ_t_clean" --> NDPN_SNR
-    SACE_GATE -- "F_aligned_list" --> IFPN_F
+    SACE_GATE -- "F_aligned_list" --> IFPN_COARSE
     SACE_GATE -- "F_aligned_list" --> NDPN_COND
     SACE_GATE -- "F_aligned_list" --> MRPN_CORR
-    IFPN_F -- "lit_up_map_raw" --> IGRF_S3
-    IFPN_F -- "f_illum_feat" --> IGRF_S3
-    NDPN_COND -- "f_noise_out" --> IGRF_S1
-    MRPN_GATE -- "f_motion_out" --> IGRF_S2
+    IFPN_COARSE -- "lit_up_map_raw" --> IGRF_S3
+    IFPN_COARSE -- "f_illum_feat" --> IGRF_S3
+    NDPN_COND -- "f_noise" --> CFG_NOISE
+    MRPN_GATE -- "f_motion" --> CFG_MOTION
+    CFG_NOISE -- "f_noise_gated" --> IGRF_S1
+    CFG_MOTION -- "f_motion_gated" --> IGRF_S2
     IN -- "image_center" --> IGRF_S1
-    IN -- "image_down" --> IFPN_F
     IGRF_S1 --> IGRF_S2 --> IGRF_S3 --> OUT
 ```
 
-### Charlie 数据流总览 (实施后)
+### Charlie3 数据流总览
 
 ```
-TFSI → s_illum ──────────────────────────────────→ IGRF Stage3 (保留)
-TFSI → s_noise ─┬─ (1-s_noise)·f_raw ──→ SACE V 残差    (保留)
-                ├─ noise_proj (★P0) ──→ NDPN 条件输入  (新增)
-                └─ 不进入 IGRF                          (P0: 移除)
+TFSI → s_noise ──→ NDPN (noise_proj 条件输入)        — 保留
+TFSI → s_illum ──→ IFPN (s_illum_proj ★P0 唯一出口)  — 新增, 替代双路径
+TFSI → s_illum ─→ IGRF                              — ★P0: 已移除
 
-SACE → σ_t_clean ─┬─ NDPN SNR 估计 (|μ|/σ)              (保留)
-                   └─ blur_estimator (★P1) → MRPN        (新增)
+SACE → σ_t_clean ─┬─ NDPN SNR 估计 (|μ|/σ)          — 保留
+                   └─ blur_estimator → MRPN           — 保留
 
-SACE → sigma_sace → sigmoid(-σ×2) → s_noise 调制 (★P2)  (新增)
+NDPN → f_noise ─┬─ CrossFusionGate.gate_motion ★P1   — 新增
+MRPN → f_motion ─┼─ CrossFusionGate.gate_noise ★P1   — 新增
+CFG → f_noise_gated, f_motion_gated → IGRF            — 替代直连
+
+SACE 三尺度 → LearnableScaleFusion ★P2               — 替代 channel_mix
 ```
 
-### Charlie vs Bravo 核心差异
+### 版本演进 (Charlie 系列)
 
-| 维度 | Bravo | Charlie (实施后) |
-|------|-------|-----------------|
-| **FrequencyBranch** | 仅中心帧 LFF | ★ 多帧 temporal_fuse |
-| **多尺度融合** | /3 等权平均 | ★ concat+channel_mix |
-| **σ_t_clean 路由** | → NDPN only | → NDPN + ★MRPN (blur_mask) |
-| **s_noise → IGRF** | ✓ Stage1 直接注入 | ★ 移除, 仅 NDPN 接收 |
-| **s_noise 调制** | phase_conf only | ★ + sigma_sace 调制 (P2) |
-| **MRPN 设计** | 简单 gate+ResBlock | ★ + blur_estimator (σ感知) |
+| 版本 | 关键改动 | 参数量 | 收敛状态 |
+|------|---------|--------|----------|
+| Charlie | 多帧 FrequencyBranch + concat fusion + NDPN s_noise + σ→MRPN + blur_mask | 1.25M | ep1 loss=0.205 |
+| Charlie2 | s_noise→NDPN only + encoder feat→IFPN + s_illum gate + VSRELL A_illu | 1.26M | 微不稳定 (loss 反升) |
+| **Charlie3** | **s_illum 单路径 + CrossFusionGate + LearnableScaleFusion** | **1.32M** | 单调下降 (ep16 loss=0.183) |

@@ -1,6 +1,6 @@
 name: pureRWKV
 series: Charlie
 block: 1
-mk: 3
-mod: 2
+mk: 4
+mod: 0
 description: "Charlie P0/P1/P2 fully implemented; s_noise→NDPN, σ→MRPN, blur_mask, σ调制"
