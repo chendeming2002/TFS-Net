@@ -38,7 +38,6 @@ flowchart TD
     ENC --> SACE
     TFSI -- "s_illum" --> IFPN
     TFSI -- "s_noise" --> NDPN
-    TFSI -- "s_noise" --> IGRF
 
     SACE -- "sace_out (F_aligned)" --> IFPN
     SACE -- "F_t_aligned, C_omega" --> NDPN
@@ -57,7 +56,7 @@ flowchart TD
 ### 框架要点
 
 - **三源分离估计**：Encoder → TFSI (s_illum/s_noise)；SACE 统计量 (σ_t_clean)
-- **TFSI ↔ SACE 关系**：TFSI 进行时频域诊断 (temporal_fuse + FFT)，SACE 进行空域扫描 (MVC-Shift + 4方向 WKV)，两者平行独立，在 Encoder 输出处分叉
+- **TFSI ↔ SACE 关系**：TFSI 进行时频域诊断 (temporal_fuse + FFT)，SACE 进行空域扫描 (MVC-Shift + 4方向 WKV)，两者平行独立，在 Encoder 输出处分叉。s_noise 仅注入 NDPN，不再传入 IGRF
 - **SACE 内部**：MVC-Shift(多尺度空洞DWConv) → SpatialWKV2D(4方向空间扫描) → Channel Mix → TemporalCorrespondence(时序对应矩阵) → TemporalAggregation(时序对齐聚合)
 - **C_omega_list**：Delta 核心创新 — 中心帧与邻帧的空间 cosine similarity 矩阵，同时注入 NDPN(conf_map) 和 MRPN(motion_mag) 作为置信度参考
 - **A_illu**：s_illum 经 IFPN s_illum_proj (零初始化) → 最终 A_illu 传入 IGRF，替代旧的 s_illum 直接注入
@@ -144,7 +143,7 @@ flowchart TD
     end
 
     subgraph IGRF["IGRF 修正去噪"]
-        IGRF_S1["Stage1: f_noise + img_center (+ s_noise)<br/>→ img_s1"]
+        IGRF_S1["Stage1: f_noise + img_center<br/>→ img_s1"]
         IGRF_S2["Stage2: f_motion + img_s1<br/>→ img_s2"]
         IGRF_S3["Stage3: img_s2 x lit_up_map x (1+A_illu)<br/>→ res_t"]
     end
@@ -157,7 +156,6 @@ flowchart TD
     ENC --> SACE_DS
     TFSI_HEAD -- "s_illum" --> IFPN_PROJ
     TFSI_HEAD -- "s_noise" --> NDPN_STR
-    TFSI_HEAD -- "s_noise" --> IGRF_S1
     SACE_UP -- "aligned_feats" --> IFPN
     SACE_TEMPORAL -- "F_t_aligned, C_omega" --> NDPN_SNR
     SACE_TEMPORAL -- "F_t_aligned, C_omega" --> MRPN_CORR
