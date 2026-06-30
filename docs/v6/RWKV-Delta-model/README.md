@@ -8,6 +8,30 @@
 > 5. **A_illu**：s_illum 经 IFPN s_illum_proj → 传入 IGRF
 > 6. **CrossFusionGate**：deploy 模式支持重参数化
 
+## 文件结构
+
+```
+docs/v6/RWKV-Delta-model/
+├── configs/
+│   ├── v6_charlie.yaml        # 训练超参
+│   └── loss_weights.yaml      # 损失权重
+├── datasets/
+│   ├── __init__.py
+│   ├── sdsd_dataset.py        # SDSD 数据集加载
+│   └── transforms.py          # 视频增强
+├── losses/
+│   ├── __init__.py
+│   └── losses.py              # Charbonnier + Perceptual + SSIM
+├── models/
+│   ├── __init__.py            # 导出 TFSNet
+│   ├── blocks.py              # ConvBlock, ResBlock, NAFBlock, 窗口函数 (175行)
+│   ├── dwt_lff.py             # SpatialDWTLFFAdapter + HaarDWT2D (84行)
+│   └── tfs_net.py             # TFSNet 完整模型 (1864行, 合并23个类)
+├── train.py                   # 训练+推理 (259行)
+├── README.md                  # 本文件
+└── v6-delta-diagrams.md       # 架构图 (Mermaid)
+```
+
 ## 整体架构概览
 
 ```
@@ -20,19 +44,22 @@
 
 > 详见: [`v6-delta-diagrams.md`](v6-delta-diagrams.md)
 
-## 核心模块
+## 核心模块 (models/tfs_net.py, 1864行, 23个类)
 
-| 组件 | 说明 | Delta 创新 |
+| 类 | 所属模块 | Delta 创新 |
 |------|------|-----------|
-| `PureRWKVSACE` | SACE 空间扫描+时序对应 | MVC-Shift + SpatialWKV2D + C_omega + F_t_aligned |
-| `MVCShift` | Token Shift | 3分支空洞DWConv(d=1,2,3) |
-| `SpatialWKV2D` | 4方向空间扫描 | 水平/垂直/主对角/副对角 Bi-WKV |
-| `TemporalCorrespondence` | 时序对应矩阵 | cosine similarity → C_omega_list |
-| `TemporalAggregation` | 时序对齐聚合 | C_omega-warp + frame_gate → F_t_aligned |
-| `CrossFusionGate` | NDPN↔MRPN 交叉门控 | deploy 模式 (重参数化) |
-| `IFPN` | 光照估计 | s_illum_proj → A_illu 输出 |
-| `NDPN` | 去噪 | C_omega conf_map 调制 |
-| `MRPN` | 运动补偿 | C_omega motion_mag 调制 |
+| `PyramidEncoder` | Encoder | 3级金字塔编码 |
+| `TFSI` | 时频诊断 | temporal_fuse 多帧 FrequencyBranch |
+| `MVCShift` | SACE | 3分支空洞DWConv 替代 Q-Shift |
+| `SpatialWKV2D` | SACE | 4方向空间 Bi-WKV 扫描 |
+| `TemporalCorrespondence` | SACE | cosine similarity → C_omega_list |
+| `TemporalAggregation` | SACE | C_omega-warp + frame_gate → F_t_aligned |
+| `PureRWKVSACE` | SACE | 空间扫描+时序对应, 移除DWT-LFF |
+| `IFPN` | 光照 | s_illum_proj → A_illu 输出 |
+| `NDPN` | 去噪 | C_omega conf_map + s_noise 条件 |
+| `MRPN` | 运动 | C_omega motion_mag + blur_mask |
+| `CrossFusionGate` | 交叉 | deploy 重参数化 |
+| `IGRF` | 合成 | A_illu 替代 s_illum 直接注入 |
 
 ## 数据流
 
@@ -43,3 +70,14 @@ SACE → C_omega_list → NDPN conf_map + MRPN motion_mag
 SACE → F_t_aligned → NDPN/MRPN 对齐参考
 CrossFusionGate → f_noise↔f_motion 交叉调制 → IGRF
 ```
+
+## 已移除 (vs 生产代码)
+
+| 移除组件 | 原因 |
+|----------|------|
+| DeformableCrossAttention | PureRWKVSACE 替代 |
+| VRWKVStyleSpatialMix | SpatialWKV2D 替代 |
+| AmpEnhance | 实验性, 未使用 |
+| LFFFeatureAdapter | DWT-LFF 替代 |
+| DWT-LFF in SACE | Delta 直接使用 Encoder 特征 |
+| edge_prompt | Delta 移除边缘门控 |

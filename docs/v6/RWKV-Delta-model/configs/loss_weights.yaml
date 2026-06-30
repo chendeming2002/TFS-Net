@@ -1,0 +1,4 @@
+"""Charlie: Bravo2 P0 配置"""
+lambda_perc: 0.04
+lambda_pix: 1.0
+lambda_ssim: 0.2
