@@ -50,7 +50,7 @@ class MVCShift(nn.Module):
 # 2. Bi-WKV (双向 WKV 注意力，单方向)
 # ============================================================
 class BiWKV(nn.Module):
-    """Vision-RWKV Bi-WKV 核心 — 空间序列版，线性复杂度 O(L×C)"""
+    """Vision-RWKV Bi-WKV — chunk-wise cumsum + forced decay < 1 (Mod1)"""
 
     def __init__(self, channels: int):
         super().__init__()
@@ -58,26 +58,47 @@ class BiWKV(nn.Module):
         self.spatial_decay = nn.Parameter(torch.randn(channels) * 0.1)
         self.spatial_first = nn.Parameter(torch.randn(channels) * 0.1)
 
+    @staticmethod
+    def _scan_cumsum(ek, ekv, u_coef, ew_pow):
+        """chunk-wise cumsum: 每 256 token 递推一次 state"""
+        CHUNK = 256
+        B, L, C = ek.shape
+        out = torch.zeros(B, L, C, device=ek.device)
+        state_num = torch.zeros(B, 1, C, device=ek.device)
+        state_den = torch.zeros(B, 1, C, device=ek.device)
+        ew_chunk = ew_pow[:, :CHUNK] * ew_pow[:, 0:1]  # relative decay within chunk
+        for s in range(0, L, CHUNK):
+            e = min(s + CHUNK, L)
+            cs = e - s
+            ek_c, ekv_c = ek[:, s:e], ekv[:, s:e]
+            # local cumsum with chunk-level precision
+            S_loc = (ekv_c / ew_pow[:, :cs].clamp(min=1e-12)).cumsum(dim=1) * ew_pow[:, :cs]
+            D_loc = (ek_c  / ew_pow[:, :cs].clamp(min=1e-12)).cumsum(dim=1) * ew_pow[:, :cs]
+            # combine with state from previous chunks
+            decay_state = ew_pow[:, cs-1:cs].expand(-1, cs, -1) / ew_pow[:, :cs].clamp(min=1e-12)
+            S = S_loc + state_num * decay_state
+            D = D_loc + state_den * decay_state
+            out[:, s:e] = (u_coef * ekv_c + S) / (u_coef * ek_c + D + 1e-8)
+            # update state for next chunk: accumulate all decayed contributions
+            state_num = ew_pow[:, cs-1:cs] * state_num + S_loc[:, -1:]
+            state_den = ew_pow[:, cs-1:cs] * state_den + D_loc[:, -1:]
+        return out
+
     def forward(self, k: torch.Tensor, v: torch.Tensor,
                 total_tokens: int) -> torch.Tensor:
-        """Bi-WKV 双向扫描 — cumsum 实现 (fwd+bwd)/2"""
         B, L, C = k.shape
-        w = self.spatial_decay.clamp(-8, 8)
+        k = k.clamp(-8, 8)
+        v = v.clamp(-8, 8)
+        # Mod1: 强制 decay ∈ (0, 1)，用 -softplus 保证 w < 0
+        w = -F.softplus(self.spatial_decay)
+        ew = (w / total_tokens).exp().view(1, 1, C)
         u = self.spatial_first.clamp(-5, 5)
-        ew = (-w.abs() / total_tokens).exp().view(1, 1, C)
         u_coef = (u / total_tokens).exp().view(1, 1, C)
         ek, ekv = k.exp(), k.exp() * v
         arange_L = torch.arange(L, device=k.device).float().view(1, L, 1)
         ew_pow = ew.pow(arange_L)
-        # forward: S_t = Σ_{i≤t} ew^{t-i}·ekv_i
-        S_fwd = (ekv / ew_pow).cumsum(dim=1) * ew_pow
-        D_fwd = (ek  / ew_pow).cumsum(dim=1) * ew_pow
-        wkv_fwd = (u_coef * ekv + S_fwd) / (u_coef * ek + D_fwd + 1e-8)
-        # backward: scan from t=L-1 to 0
-        S_bwd = (ekv.flip(1) / ew_pow).cumsum(dim=1) * ew_pow
-        D_bwd = (ek.flip(1)  / ew_pow).cumsum(dim=1) * ew_pow
-        wkv_bwd = (u_coef * ekv + S_bwd) / (u_coef * ek.flip(1) + D_bwd + 1e-8)
-        wkv_bwd = wkv_bwd.flip(1)
+        wkv_fwd = self._scan_cumsum(ek, ekv, u_coef, ew_pow)
+        wkv_bwd = self._scan_cumsum(ek.flip(1), ekv.flip(1), u_coef, ew_pow).flip(1)
         return (wkv_fwd + wkv_bwd) * 0.5
 
 
@@ -85,21 +106,31 @@ class BiWKV(nn.Module):
 # 3. SpatialWKV2D — 四方向空间扫描
 # ============================================================
 class SpatialWKV2D(nn.Module):
-    """RSRWKV 2D-WKV: 水平/垂直/主对角线/副对角线 四方向 + recep gate"""
+    """RSRWKV 2D-WKV: 4方向, 每方向独立 BiWKV + per-head LN (Mod1)"""
 
     def __init__(self, channels: int):
         super().__init__()
         assert channels % 4 == 0
         self.channels = channels
         self.head_dim = channels // 4
-        self.bi_wkv = BiWKV(self.head_dim)
+        # Mod1: 每方向独立 BiWKV
+        self.bi_wkv_list = nn.ModuleList([BiWKV(self.head_dim) for _ in range(4)])
+        # Mod1: per-head LayerNorm
+        self.head_norms = nn.ModuleList([nn.LayerNorm(self.head_dim) for _ in range(4)])
 
         self.proj_r = nn.Linear(channels, channels, bias=False)
         self.proj_k = nn.Linear(channels, channels, bias=False)
         self.proj_v = nn.Linear(channels, channels, bias=False)
         self.proj_out = nn.Linear(channels, channels, bias=False)
+        self.pre_norm = nn.LayerNorm(channels)
         self.post_norm = nn.LayerNorm(channels)
         nn.init.zeros_(self.proj_out.weight)
+
+        # Mod1: RWKV-7 风格小初始化 (±0.05/√C, ±0.5/√C)
+        import math
+        nn.init.uniform_(self.proj_k.weight, -0.05/math.sqrt(channels), 0.05/math.sqrt(channels))
+        nn.init.uniform_(self.proj_r.weight, -0.5/math.sqrt(channels), 0.5/math.sqrt(channels))
+        nn.init.uniform_(self.proj_v.weight, -0.5/math.sqrt(channels), 0.5/math.sqrt(channels))
 
     @staticmethod
     def _scan_horizontal(x: torch.Tensor) -> torch.Tensor:
@@ -152,6 +183,7 @@ class SpatialWKV2D(nn.Module):
         B, C, H, W = x_2d.shape
         N = H * W
         x_tokens = x_2d.flatten(2).transpose(1, 2)
+        x_tokens = self.pre_norm(x_tokens)  # pre-norm 防溢出
         r = self.proj_r(x_tokens)
         k = self.proj_k(x_tokens)
         v = self.proj_v(x_tokens)
@@ -168,7 +200,9 @@ class SpatialWKV2D(nn.Module):
             v_2d = v_head.transpose(1, 2).reshape(B, self.head_dim, H, W)
             k_seq = scan_fn(k_2d)
             v_seq = scan_fn(v_2d)
-            wkv_seq = self.bi_wkv(k_seq, v_seq, total_tokens=N)
+            # Mod1: per-direction BiWKV + per-head LN
+            wkv_seq = self.bi_wkv_list[i](k_seq, v_seq, total_tokens=N)
+            wkv_seq = self.head_norms[i](wkv_seq)
             inv_idx = self._inv_scan(scan_fn, (B, self.head_dim, H, W), x_2d.device)
             wkv_restored = wkv_seq[:, inv_idx[0]]
             heads.append(wkv_restored)
@@ -192,7 +226,12 @@ class TemporalCorrespondence(nn.Module):
         self.proj_dim = proj_dim
         self.proj_q = nn.Conv2d(channels, proj_dim, 1, bias=False)
         self.proj_k = nn.Conv2d(channels, proj_dim, 1, bias=False)
-        self.tau = nn.Parameter(torch.ones(1) * 0.07)
+        # Mod1: softplus tau, 下界 0.05 防除零
+        self.tau_raw = nn.Parameter(torch.zeros(1))
+
+    @property
+    def tau(self):
+        return F.softplus(self.tau_raw) + 0.05
 
     def forward(self, center_feat: torch.Tensor,
                 neighbor_feats: torch.Tensor) -> list:
@@ -207,13 +246,13 @@ class TemporalCorrespondence(nn.Module):
         T_n = neighbor_ds.shape[1]
         q = self.proj_q(center_ds)
         q_flat = F.normalize(q.flatten(2).transpose(1, 2), dim=-1)
-        tau = self.tau.clamp(min=0.01)
+        tau = self.tau  # softplus-bounded, always > 0.05
         C_omega_list = []
         for t in range(T_n):
             k = self.proj_k(neighbor_ds[:, t])
             k_flat = F.normalize(k.flatten(2).transpose(1, 2), dim=-1)
             sim = torch.bmm(q_flat, k_flat.transpose(1, 2)) / tau
-            C_omega_list.append(F.softmax(sim, dim=-1))
+            C_omega_list.append(F.softmax(sim.clamp(-20, 20), dim=-1))
         return C_omega_list
 
 

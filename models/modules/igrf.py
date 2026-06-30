@@ -133,7 +133,8 @@ class BrightenStage(nn.Module):
                                       mode='bilinear', align_corners=False)
             lit_up_map = lit_up_map * (1.0 + A_resized)
 
-        res_t = torch.clamp(img_dark * lit_up_map, 0.0, 1.0)
+        # Mod1: img_s2 暗区加 bias 防梯度消失
+        res_t = torch.clamp((img_dark + 0.01) * lit_up_map, 0.0, 1.0)
         return res_t, lit_up_map
 
 
