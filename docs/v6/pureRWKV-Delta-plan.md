@@ -1,4 +1,29 @@
 # 需求1
+
+## 实行状态 (2026-06-30)
+
+| 设计点 | 状态 | 实现文件 |
+|--------|------|----------|
+| CrossFusionGate deploy 重参数化 | ✅ | `tfs_net.py` L41-85 |
+| A_illu 移到 IFPN (illu_conv) | ✅ | `ifpn.py` L115-119 |
+| IGRF 移除 unified_illu，接收 A_illu | ✅ | `igrf.py` L120-141 |
+| edge_weight 删除 | ✅ | `pure_rwkv_sace.py` (无 edge_prompt) |
+| Bi-WKV 双向 cumsum | ✅ | `pure_rwkv_sace.py` L52-81 |
+| MVC-Shift 3 dilated DWConv | ✅ | `pure_rwkv_sace.py` L29-46 |
+| SpatialWKV2D 四方向扫描 | ✅ | `pure_rwkv_sace.py` L87-180 |
+| TemporalCorrespondence → C_omega_list | ✅ | `pure_rwkv_sace.py` L186-217 |
+| TemporalAggregation → F_t_aligned | ✅ | `pure_rwkv_sace.py` L223-264 |
+| IFPN F_t_aligned + illu_anchor_gate | ✅ | `ifpn.py` L122-127 + L248-251 |
+| NDPN conf_proj (Linear) | ✅ | `ndpn.py` L62-67 |
+| NDPN noise_extract + denoise_strength + gamma | ✅ | `ndpn.py` L69-89 |
+| MRPN motion_estimator (Conv2d) | ✅ | `mrpn.py` L45-50 |
+| MRPN sigma_proj + comp_gate + motion_refine + gamma | ✅ | `mrpn.py` L52-73 |
+| IGRF s_noise 移除 (s_intensity=None) | ✅ | `igrf.py` L178-181 |
+| tfs_net 全量数据流重连 | ✅ | `tfs_net.py` L250-360 |
+
+参数量: 1.638M，训练配置: `configs/v6_bravo.yaml`, batch=1
+
+---
 根据你最新设计修改的模型编号是Charlie-Mark4。关于你上一轮设计的CrossFusionGate噪声↔运动 交叉门控，是在训练和推理当中都保留这个机制，还是可以仅作为训练当中协调三个退化处理分支训练的一个辅助在推理阶段不采用？请结合真实论文对多分支退化处理的设计，思考这一设计的合理性
 # CrossFusionGate 在 Charlie-Mark4 中的合理设计方案
 
