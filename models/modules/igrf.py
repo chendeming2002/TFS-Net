@@ -138,7 +138,7 @@ class BrightenStage(nn.Module):
         return res_t, lit_up_map
 
 
-class IGRF(nn.Module):
+class SGRF(nn.Module):
     """
     IGRF v5.7 - Denoise -> Motion -> Brighten (sequential cascade)
 

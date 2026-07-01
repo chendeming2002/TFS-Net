@@ -23,7 +23,7 @@ from .blocks import (
 )
 
 
-class MRPN(nn.Module):
+class MCPN(nn.Module):
     def __init__(self, channels=64, window_size=8, num_frames=5):
         super().__init__()
         self.channels = channels
@@ -49,11 +49,11 @@ class MRPN(nn.Module):
             nn.Sigmoid(),
         )
 
-        # Delta: sigma projection (frame-level → channel-wise)
+        # Delta: sigma projection (channel-wise, not frame-wise)
         self.sigma_proj = nn.Sequential(
-            nn.Linear(num_frames, channels),
+            nn.Linear(channels, channels * 2),
             nn.GELU(),
-            nn.Linear(channels, channels),
+            nn.Linear(channels * 2, channels),
         )
 
         # Delta: compensation gate (motion magnitude gated)

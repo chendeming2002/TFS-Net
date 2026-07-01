@@ -1,16 +1,15 @@
 """
-PureRWKVSACE — Charlie-Mark4 (Delta): 空间扫描 + 时序对应矩阵 (2026-06-30)
-===========================================================================
-核心改动 vs Charlie3:
+TCA (Temporal Correspondence & Alignment) — Mark1: SWD 输入 (2026-07-01)
+========================================================================
+核心改动 vs Delta:
   1. 扫描轴 T→H×W：RSRWKV 2D-WKV 四方向并行空间扫描
-  2. Token shift: Q-Shift→MVC-Shift (多尺度空洞 DWConv)
+  2. Token shift: Q-Shift→MVC-Shift
   3. 输出 C_omega_list + F_t_aligned 替代 F_aligned_list
-  4. 删除 edge_weight 死代码
+  4. Mark1: 输入来自 SWD feat_tca (已是 H/2×W/2)，不再内部降采样
 
 文献依据:
   - RSRWKV (TCSVT 2025): 2D-WKV + MVC-Shift
-  - Vision-RWKV (2024): Bi-WKV bidirectional attention 基础
-  - C²-STVSR (CVPRW 2026): 4D correlation volume 引导时序对应
+  - Vision-RWKV (2024): Bi-WKV bidirectional attention
 """
 
 from __future__ import annotations
@@ -306,8 +305,8 @@ class TemporalAggregation(nn.Module):
 # ============================================================
 # 6. PureRWKVSACE — Charlie-Mark4 完整模块
 # ============================================================
-class PureRWKVSACE(nn.Module):
-    """Delta SACE: 空间扫描 + 时序对应
+class TCA(nn.Module):
+    """TCA (Mark1): 时间对应与对齐 — SWD 已降采样，无需内部再降
 
     Args:
         channels: 特征通道数 (默认 64)
@@ -347,17 +346,11 @@ class PureRWKVSACE(nn.Module):
             F_t_aligned: (B, C, H, W) 中心帧对齐增强特征
             mu_t_clean / sigma_t_clean: 兼容旧接口
         """
-        B, T, C, H, W = feats.shape
-        device = feats.device
+        B, T, C, H_ds, W_ds = feats.shape
+        H, W = H_ds * 2, W_ds * 2  # 原始分辨率 (SWD 已降采样到 H/2)
 
-        # Delta: 降采样到 H/2×W/2 控制显存
-        feats_ds = F.interpolate(
-            feats.reshape(B * T, C, H, W), scale_factor=0.5, mode='bilinear', align_corners=False
-        ).reshape(B, T, C, H // 2, W // 2)
-        H_ds, W_ds = H // 2, W // 2
-
-        # --- Step 1: 逐帧空间处理 ---
-        x_flat = feats_ds.reshape(B * T, C, H_ds, W_ds)
+        # Mark1: SWD 已输出 H/2×W/2，无需再降采样
+        x_flat = feats.reshape(B * T, C, H_ds, W_ds)
         x_shifted = self.mvc_shift(x_flat)
         x_wkv = self.spatial_wkv(x_shifted)
         x_cm = self.channel_mix(x_wkv)
@@ -372,25 +365,24 @@ class PureRWKVSACE(nn.Module):
         mu_t_clean = sace_out[:, self.center_idx]
         sigma_t_clean = sace_out.std(dim=1, unbiased=False)
 
-        # --- Step 3: 时序对应 → C_omega_list (在降采样分辨率下计算) ---
-        center_orig = feats_ds[:, self.center_idx]
+        # --- Step 3: 时序对应 → C_omega_list (在 H/2 分辨率下计算) ---
+        center_orig = feats[:, self.center_idx]
         neighbor_idx = [t for t in range(T) if t != self.center_idx]
-        neighbor_orig = feats_ds[:, neighbor_idx]
+        neighbor_orig = feats[:, neighbor_idx]
         C_omega_list = self.corr_gen(center_orig, neighbor_orig)
 
-        # --- Step 4: 时序聚合 → F_t_aligned (在降采样分辨率下计算，然后上采样) ---
+        # --- Step 4: 时序聚合 → F_t_aligned (在 H/2 计算, 上采样到 H) ---
         center_enhanced_ds = sace_out_ds.reshape(B, T, C, H_ds, W_ds)[:, self.center_idx]
         neighbor_enhanced_ds = sace_out_ds.reshape(B, T, C, H_ds, W_ds)[:, neighbor_idx]
         F_t_aligned_ds = self.temporal_agg(
             center_enhanced_ds, neighbor_enhanced_ds, C_omega_list
         )
-        # 上采样到原始分辨率 H×W
         F_t_aligned = F.interpolate(
             F_t_aligned_ds, size=(H, W), mode='bilinear', align_corners=False
         )
 
         return {
-            "sace_out":       sace_out,
+            "tca_out":        sace_out,
             "mu_t_clean":     mu_t_clean,
             "sigma_t_clean":  sigma_t_clean,
             "C_omega_list":   C_omega_list,

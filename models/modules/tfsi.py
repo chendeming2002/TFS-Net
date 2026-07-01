@@ -222,7 +222,7 @@ class IntensityHead(nn.Module):
         return {"s_illum": s_illum, "s_noise": s_noise}
 
 
-class TFSI(nn.Module):
+class TFDE(nn.Module):
     """
     TFSI 时频源指示器：整合空间分支、频域分支、拼接融合、强度输出
 

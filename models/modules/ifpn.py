@@ -61,7 +61,7 @@ class IllumExtract(nn.Module):
         return L
 
 
-class IFPN(nn.Module):
+class ISPN(nn.Module):
     """
     Illumination-Filtering Pyramid Network.
 
