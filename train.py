@@ -148,7 +148,7 @@ def build_loss(cfg, device):
     return criterion.to(device)
 
 
-def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp, logger, log_interval, grad_clip=1.0):
+def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp, logger, log_interval, epoch=0, grad_clip=1.0):
     model.train()
     meter_total = AverageMeter()
     meter_pix = AverageMeter()
@@ -170,7 +170,7 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
         with autocast(enabled=use_amp):
             outputs = model(clip)
         # 损失计算在 fp32（autocast 外），避免 SSIM/VGG 的 fp16 精度问题（§8.4 修复 A）
-        loss, loss_dict = criterion(outputs, target)
+        loss, loss_dict = criterion(outputs, target, epoch=epoch)
 
         if not torch.isfinite(loss):
             logger.warning("Skipping non-finite loss at step %d", step + 1)
@@ -360,6 +360,7 @@ def main():
             loader=train_loader,
             device=device,
             use_amp=cfg["train"]["amp"] and device.type == "cuda",
+            epoch=epoch,
             logger=logger,
             log_interval=cfg["train"]["log_interval"],
             grad_clip=grad_clip,

@@ -179,25 +179,15 @@ class BranchReconHead(nn.Module):
 
 class TFSNetLoss(nn.Module):
     """
-    TFS-Net v5.6 loss function
+    TFS-Net v6 Delta Mark2 loss function — Kendall uncertainty weighting + PE Loss
 
-    L_total = L_pix + lambda_freq * L_freq
-              + lambda_ssim * L_ssim + lambda_perc * L_perc
-              + lambda_illum * L_illum_smooth
-              + lambda_illum_sup * L_illum_sup        # v5.6 P0-2: s_illum 显式监督
-              + lambda_noise_sup * L_noise_sup        # v5.6 P0-2: s_noise 显式监督
-              + lambda_inter * L_inter                # 中间监督: img_s2 * lit_up_map (乘法路径)
-              + lambda_ifpn_sup * L_ifpn_sup          # v5.9.2: IFPN 中间感知监督 (DarkIR 风格)
+    L_total = Σ 1/(2σ²_i) * L_i + 1/2 * log(σ²_i)  (Kendall CVPR 2018)
 
-        L_pix          = Charbonnier(pred, target)
-        L_freq         = L1(|FFT(pred)|, |FFT(target)|)
-        L_ssim         = 1 - SSIM(pred, target)
-        L_perc         = PerceptualLoss(pred, target)
-        L_illum_smooth = edge-aware smoothness on s_illum  (正则, 降权到 0.001)
-        L_illum_sup    = L1(s_illum, clamp(1 - L_t/(L_ref+eps), 0, 1).detach())   # P0-2
-        L_noise_sup    = L1(s_noise, clamp(1 - SNR/tau_high, 0, 1).detach())      # P0-2
-        L_inter        = Charbonnier(clamp(img_s2 * lit_up_map, 0, 1), target)    # 乘法路径
-        L_recon        = Charbonnier(res_t, target)                                # 含加法路径
+    9项损失分为语义关联组:
+      组1 输出质量: pix, freq
+      组2 结构感知: ssim, perc
+      组3 中间监督: illum, illum_sup, inter, ifpn_sup
+      (noise_sup 权重=0 已关闭)
     """
 
     def __init__(
@@ -210,22 +200,23 @@ class TFSNetLoss(nn.Module):
         lambda_illum: float = 0.001,
         lambda_ssim: float = 0.2,
         lambda_inter: float = 0.3,
-        # 保留旧参数兼容性
         lambda_aux: float = 0.0,
         fused_channels: int = 64,
-        # v5.6 P0-2/P0-3 新增
         lambda_illum_sup: float = 0.1,
         lambda_noise_sup: float = 0.05,
         lambda_recon: float = 0.5,
         noise_tau_high: float = 5.0,
-        # v5.6 P1-3/P1-4 新增
         perc_multilayer: bool = True,
         freq_with_phase: bool = True,
         freq_phase_weight: float = 0.5,
-        # v5.9.2 新增
         lambda_ifpn_sup: float = 0.0,
-        # v6 Bravo P0-1 新增
         lambda_pix: float = 1.0,
+        # Mark2: uncertainty weighting
+        uncertainty_weighting: bool = True,
+        use_pe_charbonnier: bool = False,
+        pe_edge_weight: float = 2.0,
+        perceptual_decoupling: bool = False,
+        warmup_loss_only_pix_ssim: bool = True,
     ):
         super().__init__()
         self.use_temporal = use_temporal
@@ -236,59 +227,88 @@ class TFSNetLoss(nn.Module):
         self.lambda_ssim = lambda_ssim
         self.lambda_inter = lambda_inter
         self.lambda_recon = lambda_recon
-        # v5.6
         self.lambda_illum_sup = lambda_illum_sup
         self.lambda_noise_sup = lambda_noise_sup
         self.noise_tau_high = noise_tau_high
         self.freq_with_phase = freq_with_phase
         self.freq_phase_weight = freq_phase_weight
-        # v5.9.2
         self.lambda_ifpn_sup = lambda_ifpn_sup
-        # v6 Bravo
         self.lambda_pix = lambda_pix
+
+        # Mark2 flags
+        self.uncertainty_weighting = uncertainty_weighting
+        self.use_pe_charbonnier = use_pe_charbonnier
+        self.perceptual_decoupling = perceptual_decoupling
+        self.warmup_loss_only_pix_ssim = warmup_loss_only_pix_ssim
+
+        # Mark2: Kendall log-variance parameters
+        if uncertainty_weighting:
+            self.log_vars = nn.ParameterDict({
+                'pix':   nn.Parameter(torch.tensor(0.0)),
+                'freq':  nn.Parameter(torch.tensor(0.0)),
+                'ssim':  nn.Parameter(torch.tensor(-1.0)),
+                'perc':  nn.Parameter(torch.tensor(2.0)),  # warmup: very low weight
+                'illum': nn.Parameter(torch.tensor(0.0)),
+                'inter': nn.Parameter(torch.tensor(0.0)),
+                'ifpn':  nn.Parameter(torch.tensor(0.0)),
+            })
+
+        # Mark2: PE Charbonnier loss
+        if use_pe_charbonnier:
+            self.sob_x = nn.Conv2d(1, 1, 3, padding=1, bias=False)
+            self.sob_y = nn.Conv2d(1, 1, 3, padding=1, bias=False)
+            self.sob_x.weight.data = torch.tensor(
+                [[-1,0,1],[-2,0,2],[-1,0,1]], dtype=torch.float32
+            ).reshape(1,1,3,3)
+            self.sob_y.weight.data = torch.tensor(
+                [[-1,-2,-1],[0,0,0],[1,2,1]], dtype=torch.float32
+            ).reshape(1,1,3,3)
+            self.sob_x.weight.requires_grad = False
+            self.sob_y.weight.requires_grad = False
+            self.pe_edge_weight = pe_edge_weight
 
         self.perceptual = PerceptualLoss(pretrained=perceptual_pretrained, multilayer=perc_multilayer)
 
+    def _pe_charbonnier(self, pred, gt, eps=1e-6):
+        """PE Charbonnier: edge-weighted smooth L1"""
+        gt_gray = gt[:, :1] if gt.shape[1] == 3 else gt[:, 0:1]
+        edge_x = self.sob_x(gt_gray)
+        edge_y = self.sob_y(gt_gray)
+        edge_map = torch.sqrt(edge_x**2 + edge_y**2 + eps)
+        edge_norm = 1.0 + (self.pe_edge_weight - 1.0) * (edge_map / (edge_map.max() + eps))
+        diff = pred - gt
+        return (torch.sqrt(diff**2 + eps) * edge_norm).mean()
+
+    def _uw(self, loss, key):
+        """Kendall uncertainty weight"""
+        if not self.uncertainty_weighting:
+            return loss
+        log_var = self.log_vars[key]
+        precision = torch.exp(-log_var)
+        return 0.5 * precision * loss + 0.5 * log_var
+
     @staticmethod
     def _edge_aware_smooth(s: torch.Tensor, ref_img: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            s       : (B, 1, H, W) 单通道强度图
-            ref_img : (B, 3, H, W) RGB 参考图
-        Returns:
-            scalar loss
-        """
         grad_s_x = (s[:, :, :, 1:] - s[:, :, :, :-1]).abs()
         grad_s_y = (s[:, :, 1:, :] - s[:, :, :-1, :]).abs()
-
         grad_i_x = (ref_img[:, :, :, 1:] - ref_img[:, :, :, :-1]).abs().mean(dim=1, keepdim=True)
         grad_i_y = (ref_img[:, :, 1:, :] - ref_img[:, :, :-1, :]).abs().mean(dim=1, keepdim=True)
+        return (grad_s_x * torch.exp(-grad_i_x)).mean() + (grad_s_y * torch.exp(-grad_i_y)).mean()
 
-        loss = (grad_s_x * torch.exp(-grad_i_x)).mean() + \
-               (grad_s_y * torch.exp(-grad_i_y)).mean()
-        return loss
-
-    def forward(self, outputs: dict, target: torch.Tensor):
-        """
-        Args:
-            outputs : dict from TFSNet.forward()
-            target  : (B, 3, H, W) GT
-        Returns:
-            (loss_total, loss_dict)
-        """
+    def forward(self, outputs: dict, target: torch.Tensor, epoch: int = 0):
         pred = outputs["res_t"]
         s_illum = outputs["s_illum"]
         s_noise = outputs["s_noise"]
 
-        # (1) 空间像素重建 (Charbonnier) — P0-3: 降权，因新增 L_recon 重复监督
-        L_pix = charbonnier_loss(pred, target)
+        # Pix loss (PE or standard Charbonnier)
+        L_pix = self._pe_charbonnier(pred, target) if self.use_pe_charbonnier \
+                else charbonnier_loss(pred, target)
 
-        # (2) 频域重建 — v5.6 P1-4: 加相位项
+        # Freq loss
         if self.use_freq_loss:
             fft_pred = torch.fft.rfft2(pred, norm='ortho')
             fft_gt = torch.fft.rfft2(target, norm='ortho')
             if self.freq_with_phase:
-                # v5.6 P1-4: 幅度 + 相位
                 L_freq = F.l1_loss(fft_pred.abs(), fft_gt.abs()) + \
                          self.freq_phase_weight * F.l1_loss(fft_pred.angle(), fft_gt.angle())
             else:
@@ -296,66 +316,66 @@ class TFSNetLoss(nn.Module):
         else:
             L_freq = pred.new_tensor(0.0)
 
-        L_recon_base = self.lambda_pix * L_pix + self.lambda_freq * L_freq
+        # Mark2: perceptual decoupling — SSIM on img_s1, VGG on img_s2
+        img_s1 = outputs.get("img_s1", pred)
+        img_s2 = outputs.get("img_s2", pred)
+        if self.perceptual_decoupling:
+            L_ssim = 1.0 - ssim_map(img_s1, target).mean()
+            L_perc = self.perceptual(img_s2, target)
+        else:
+            L_ssim = 1.0 - ssim_map(pred, target).mean()
+            L_perc = self.perceptual(pred, target)
 
-        # (3) SSIM 损失
-        L_ssim = 1.0 - ssim_map(pred, target).mean()
-
-        # (4) 感知损失
-        L_perc = self.perceptual(pred, target)
-
-        # (5) 光照场边缘感知平滑 (正则, v5.6 降权)
+        # Illumination smoothness
         L_illum_smooth = self._edge_aware_smooth(s_illum, target)
 
-        # (5b) v5.6 P0-2: s_illum 显式监督 — 基于输入暗度（非 L_ratio）
-        # 物理含义: 输入比 GT 暗多少 → s_illum 越大
-        # 旧版用 L_ratio (1 - L_t/L_ref) 在 SDSD indoor (均匀光照) 上恒为 0，导致塌缩。
-        # 新版直接用输入与 GT 的亮度比，对任何数据集都有效。
+        # s_illum supervision
         L_illum_sup = pred.new_tensor(0.0)
         if self.lambda_illum_sup > 0 and "image_center" in outputs:
-            img_center = outputs["image_center"]  # (B,3,H,W) 低光输入
+            img_center = outputs["image_center"]
             eps = 1e-3
-            # 逐像素暗度: 输入越暗于 GT → s_illum 越大
-            img_gray = img_center.mean(dim=1, keepdim=True)    # (B,1,H,W)
-            gt_gray = target.mean(dim=1, keepdim=True)          # (B,1,H,W)
+            img_gray = img_center.mean(dim=1, keepdim=True)
+            gt_gray = target.mean(dim=1, keepdim=True)
             s_illum_target = torch.clamp(1.0 - img_gray / (gt_gray + eps), 0.0, 1.0).detach()
             L_illum_sup = F.l1_loss(s_illum, s_illum_target)
 
-        # (5c) v5.6 P0-2: s_noise 显式监督 — 基于 SNR
-        # 物理含义: SNR 越低 (噪声越大) → s_noise 越大
+        # s_noise supervision (disabled)
         L_noise_sup = pred.new_tensor(0.0)
-        if self.lambda_noise_sup > 0 and "tfsi_out" in outputs:
-            snr = outputs["tfsi_out"].get("snr")
-            if snr is not None:
-                snr_scalar = snr.mean(dim=1, keepdim=True)
-                s_noise_target = torch.clamp(1.0 - snr_scalar / self.noise_tau_high, 0.0, 1.0).detach()
-                L_noise_sup = F.l1_loss(s_noise, s_noise_target)
 
-        # (6) v4.3: intermediate supervision on img_s2 (乘法路径)
+        # Intermediate supervision
         L_inter = pred.new_tensor(0.0)
         if self.lambda_inter > 0 and "img_s2" in outputs and "lit_up_map" in outputs:
             img_s2_lit = torch.clamp(outputs["img_s2"] * outputs["lit_up_map"], 0.0, 1.0)
             L_inter = charbonnier_loss(img_s2_lit, target)
 
-        # (7) v5.9.2: IFPN 中间感知监督 (DarkIR EnhanceLoss 风格)
-        # 把 f_illum_feat 投影为图像 → 与 GT 下采样对齐 → 强制光照特征有意义
+        # ISPN side supervision
         L_ifpn_sup = pred.new_tensor(0.0)
         if self.lambda_ifpn_sup > 0 and "ifpn_side" in outputs:
-            ifpn_side = outputs["ifpn_side"]  # (B, 3, H, W) IFPN 侧输出
+            ifpn_side = outputs["ifpn_side"]
             tgt_down = F.interpolate(target, size=ifpn_side.shape[-2:], mode='bilinear', align_corners=False)
             L_ifpn_sup = charbonnier_loss(ifpn_side, tgt_down)
 
-        # 总损失
-        L_total = (
-            L_recon_base
-            + self.lambda_ssim * L_ssim
-            + self.lambda_perc * L_perc
-            + self.lambda_illum * L_illum_smooth
-            + self.lambda_illum_sup * L_illum_sup
-            + self.lambda_noise_sup * L_noise_sup
-            + self.lambda_inter * L_inter
-            + self.lambda_ifpn_sup * L_ifpn_sup
-        )
+        # Mark2 warmup: pix+ssim only for first 5 epochs
+        if self.warmup_loss_only_pix_ssim and epoch < 5:
+            if self.uncertainty_weighting:
+                L_total = self._uw(L_pix, 'pix') + self._uw(L_ssim, 'ssim')
+            else:
+                L_total = self.lambda_pix * L_pix + self.lambda_ssim * L_ssim
+            L_total = L_total + self.lambda_illum * L_illum_smooth
+        elif self.uncertainty_weighting:
+            L_total = (
+                self._uw(L_pix, 'pix') + self._uw(L_freq, 'freq')
+                + self._uw(L_ssim, 'ssim') + self._uw(L_perc, 'perc')
+                + self._uw(L_illum_smooth + self.lambda_illum_sup * L_illum_sup, 'illum')
+                + self._uw(L_inter, 'inter') + self._uw(L_ifpn_sup, 'ifpn')
+            )
+        else:
+            L_total = (
+                self.lambda_pix * L_pix + self.lambda_freq * L_freq
+                + self.lambda_ssim * L_ssim + self.lambda_perc * L_perc
+                + self.lambda_illum * L_illum_smooth + self.lambda_illum_sup * L_illum_sup
+                + self.lambda_inter * L_inter + self.lambda_ifpn_sup * L_ifpn_sup
+            )
 
         loss_dict = {
             "loss_total":      L_total.detach(),
