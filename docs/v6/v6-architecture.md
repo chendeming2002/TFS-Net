@@ -37,166 +37,204 @@ TFS-Net v6 是一个端到端多帧低光视频增强网络。核心思想是**�
 ### 完整数据流
 
 ```
-输入 x: (B, T=5, 3, H, W)
+输入: I_{t-2}, I_{t-1}, I_t, I_{t+1}, I_{t+2}  (T=5 窗口)
   │
-  ├─→ Encoder → F_stack (B, T, 64, H, W)
+  ├─→ Encoder → F_{t-2}...F_{t+2}  (B, T, 64, H, W)
   │
-  ├─→ SWD (逐帧 HaarDWT) → feat_tfde (B,T,C,H/2), feat_tca (B,T,C,H/2)
+  ├─→ SWD (逐帧 HaarDWT) → F_tfde (B,T,C,H/2), F_tca (B,T,C,H/2)
   │
-  ├─→ TFDE(feat_tfde) → s_illum, s_noise (↑H×W)
+  ├─→ TFDE(F_tfde) → s_illum, s_noise (↑H×W)
   │     s_illum → ISPN   s_noise → NDPN
   │
-  ├─→ TCA(feat_tca) → tca_out (B,T,C,H), C_omega_list, F_t_aligned, mu, sigma
+  ├─→ TCA(F_tca) → {F_{t'}^{\text{out}}}_{t'=0}^{T-1}, C_{t,Ω}, \hat{F}_t, μ, σ
   │
-  ├─→ ISPN(aligned, s_illum, F_t_aligned) → lit_up_map_raw, f_illum_feat, A_illu
-  ├─→ NDPN(aligned, s_noise, mu, sigma, C_omega, F_t_aligned) → f_noise_out
-  ├─→ MCPN(aligned, sigma, C_omega, F_t_aligned) → f_motion_out
+  ├─→ ISPN({F^{\text{out}}}, s_illum, \hat{F}_t) → lit_up_map_raw, f_illum_feat, A_illu
+  ├─→ NDPN({F^{\text{out}}}, s_noise, μ, σ, C_{t,Ω}, \hat{F}_t) → f_noise_out
+  ├─→ MCPN({F^{\text{out}}}, σ, C_{t,Ω}, \hat{F}_t) → f_motion_out
   │
   ├─→ CXG(f_noise_out, f_motion_out) → f_noise_gated, f_motion_gated
   │
-  └─→ SGRF(f_illum, f_noise_gated, f_motion_gated, lit_up_map, img_center, A_illu)
-        S1: img_s1 = denoise(f_noise_gated, img_center)
-        S2: img_s2 = motion(f_motion_gated, img_s1)
-        S3: res_t = clamp(img_s2 × lit_up_map × (1+A_illu))
+  └─→ SGRF(f_illum, f_noise_gated, f_motion_gated, lit_up_map, I_t, A_illu)
+        S1: I_1 = denoise(f_noise_gated, I_t)
+        S2: I_2 = motion(f_motion_gated, I_1)
+        S3: \hat{X}_t = clamp(I_2 × lit_up_map × (1+A_illu))
 ```
 
 ---
 
 ## 2. 理论动机与公式
 
+### 记号约定
+
+| 符号 | 含义 |
+|------|------|
+| $I_{t}$ | 视频中第 $t$ 帧低光输入 |
+| $F_{t} = \mathcal{E}(I_{t})$ | Encoder 输出的第 $t$ 帧特征 |
+| $\{F_{t-k},\dots,F_{t+k}\}$ | 以 $t$ 为中心、窗口 $T=2k+1$ 的帧集合 |
+| $F_{\Omega} = \{F_{t}\mid t \in \Omega\}$ | 窗口内除中心帧外的邻帧特征集，$\Omega=\{t-k,\dots,t-1,t+1,\dots,t+k\}$ |
+| $C_{t,\Omega}$ | TCA 输出的中心帧 $t$ 与邻帧集 $\Omega$ 的帧间注意力矩阵 |
+| $\hat{F}_t$ | TCA 输出对齐后增强的中心帧特征 ($F_{t,\text{aligned}}$) |
+| $s_{\text{illu}}, s_{\text{noise}}$ | TFDE 估计的光照退化强度和噪声退化强度 (均为 $[0,1]$) |
+| $A_{\text{illu}}$ | ISPN 输出的空间光照注意力图 |
+
 ### 2.1 问题建模
 
-给定多帧低光输入 $\{y_t\}_{t=0}^{T-1}$，目标是恢复干净图像 $\hat{x}$。结构化假设：
+**简化退化模型**。低光观测 $I_t$ 与干净信号 $X$ 的关系：
 
-$$y_t = x \odot \ell_t + n_t, \quad t=0,\dots,T-1$$
+$$I_t = X \odot \ell_t + n_t, \quad t = 0,\dots,T-1$$
 
-其中 $\ell_t$ 为光照退化因子，$n_t$ 为噪声。将问题分解为三步：
+其中 $\ell_t \in (0,1)$ 为逐像素光照退化因子，$n_t$ 为加性噪声。恢复目标为 $\hat{X}$。
 
-1. **退化分解** (SWD): 分离 $\ell_t$ 和 $n_t$ 的估计信号
-2. **时序对应** (TCA): 建立帧间几何映射 $C_\omega$
-3. **并行重建** (ISPN/NDPN/MCPN): 独立修复三种退化
-4. **阶段融合** (SGRF): 顺序施加去噪→去模糊→提亮
+**三分量退化展开**。低光视频中的扰动可分解为三个独立成分：
 
-### 2.2 SWD — 空域小波分流
+$$\text{Var}(I_t - X) = \sigma^2_{\text{img}} + \sigma^2_{\text{illu}} + \sigma^2_{\text{dyn}}$$
 
-**动机**: 旧 DWT-LFF 通过 IDWT 重建全分辨率，两路特征几乎相同，导致 TFDE 的 IntensityHead 输入 norm 爆炸 (60~113)。
+| 成分 | 符号 | 物理来源 | 时域特性 | 对应模块 |
+|------|------|---------|---------|---------|
+| 成像噪声 | $\sigma^2_{\text{img}}$ | 光子散粒噪声 + 传感器读出噪声 | 逐帧独立，零均值 | **NDPN** |
+| 光照扰动 | $\sigma^2_{\text{illu}}$ | 自动曝光切换、外部灯光闪烁 | 帧间缓慢变化，低频主导 | **ISPN** |
+| 动态扰动 | $\sigma^2_{\text{dyn}}$ | 物体运动、相机抖动 | 帧间空间偏移，像素级对应丢失 | **MCPN** |
 
-**方法**: 在 Haar DWT 子带级别直接分流，不做 IDWT 重建。
+**理论依据**：成像噪声满足泊松-高斯混合分布（[Foi et al., TIP 2008](https://doi.org/10.1109/TIP.2008.925361)）；光照扰动在 Retinex 模型中表现为 L 分量的时变（[Land & McCann, JOSA 1971](https://doi.org/10.1364/JOSA.61.000001)）；动态扰动等价于扭曲 $I_{t'} = I_t \circ \phi_{t'\to t} + \text{occlusion}$（[Baker et al., IJCV 2011](https://doi.org/10.1007/s11263-010-0390-2)）。
 
-Haar DWT 分解：
-$$F \xrightarrow{\text{DWT}} \{LL, LH, HL, HH\}, \quad LL \in \mathbb{R}^{B\times C\times H/2\times W/2}$$
+**核心假设**：三种扰动在信号域可分离，但通过 Encoder 后相互耦合。SWD 在子带级别重新解耦，将 $\sigma^2_{\text{img}}+\sigma^2_{\text{illu}}$ 信号导向 TFDE → ISPN/NDPN，将结构成分导向 TCA → MCPN。
 
-**低频分流** (LL 编码全局光照强度)：
-$$\text{LL}_{\text{tfde}} = \alpha(LL) \odot LL, \quad \text{LL}_{\text{tca}} = \text{IN}((1-\alpha(LL)) \odot LL)$$
+### 2.2 TCA — 时序对应对齐 (RWKV 空间扫描)
 
-其中 $\alpha(\cdot) = \sigma(\text{DWConv}_{3\times3} \to \text{GELU} \to \text{Conv}_{1\times1})$。
+**动机**。RWKV 的 WKV 扫描需要足够长的序列来建立有意义的依赖关系。旧设计沿时间轴 $T=5$ 扫描，序列过短 ($L=5$)，WKV 无法学习帧内空间结构。新设计改为沿空间轴 $H\times W$ 扫描 ($L \gg 1000$)，帧内结构由 WKV 显式建模，帧间对应由显式 $C_{t,\Omega}$ 计算。
 
-**高频分流** (LH/HL/HH 编码纹理/噪声)：
-$$E_{\text{HF}} = \frac{1}{C}\sum_{c}(LH_c^2+HL_c^2+HH_c^2), \quad g_n = \sigma(\text{Conv}(E_{\text{HF}}))$$
+**帧内空间扫描 (Bi-WKV)**。对每帧特征 $F_t$ 沿空间序列 $L=H\times W$ 做带衰减的递归：
 
-$$\text{HF}_{\text{tfde}} = g_n \odot [LH,HL,HH], \quad \text{HF}_{\text{tca}} = \text{LN}((1-g_n) \odot [LH,HL,HH])$$
+$$S_\tau = e^{w} \cdot S_{\tau-1} + e^{k_\tau} \odot v_\tau, \quad D_\tau = e^{w} \cdot D_{\tau-1} + e^{k_\tau}$$
+
+$$y_\tau^{(t)} = \frac{e^{u}\cdot e^{k_\tau}\odot v_\tau + S_\tau}{e^{u}\cdot e^{k_\tau} + D_\tau}, \quad \tau = 0,\dots,L-1$$
+
+其中 $k_\tau = \text{proj}_k(\tilde{F}_t[\tau])$，$v_\tau = \text{proj}_v(\tilde{F}_t[\tau])$，$\tilde{F}_t = \text{MVC-Shift}(F_t)$（3 支空洞 DWConv, $d=1,2,3$）。$w = -\text{softplus}(\theta_w) < 0$ 保证 $e^w < 1$ 恒衰减，$u$ 为当前 token bonus。
+
+**四方向扫描** (RSRWKV, TCSVT 2025)。通道均分为 4 组 $C/4$，每组沿一个方向展开 $(H\times W)\to L$ 序列：
+
+| 方向 | 排列方式 |
+|------|---------|
+| 水平 $h$ | 行优先 $(0,W),(0,W+1),\dots$ |
+| 垂直 $v$ | 列优先 $(0,W),(1,W),\dots$ |
+| 主对角 $d$ | 按 $i+j$ 排序 |
+| 副对角 $a$ | 按 $i-j+W-1$ 排序 |
+
+多方向融合：
+
+$$\mathbf{F}_t^{\text{out}} = \mathbf{F}_t + \gamma \cdot \text{ChannelMix}\left(\sigma(R) \odot [y^{(t)}_h; y^{(t)}_v; y^{(t)}_d; y^{(t)}_a]\right)$$
+
+**时序对应矩阵 $C_{t,\Omega}$**。中心帧与邻帧的空间 cosine similarity：
+
+$$\mathbf{q}_t = \text{proj}_q(F_t^{\text{out}}), \quad \mathbf{k}_{t'} = \text{proj}_k(F_{t'}^{\text{out}}), \quad t' \in \Omega$$
+
+$$C_{t,t'} = \text{softmax}\left(\frac{\mathbf{q}_t \cdot \mathbf{k}_{t'}^T}{\tau}\right), \quad \tau = \text{softplus}(\tau_{\text{raw}}) + 0.05$$
+
+$C_{t,t'}[i,j]$ 表示中心帧位置 $i$ 与邻帧位置 $j$ 的对齐置信度。对角线 $C_{t,t'}[i,i]$ 为静止对应（高值→静止，低值→运动）。
+
+**时序聚合 $\hat{F}_t$**。用 $C_{t,\Omega}$ 将邻帧 warp 到中心帧坐标系，加权聚合：
+
+$$\hat{F}_t = \text{LN}\left(F_t^{\text{out}} + \sum_{t' \in \Omega} w_{t'} \cdot \left(C_{t,t'} \times F_{t'}^{\text{out}}\right)\right)$$
+
+其中 $w_{t'} = \text{frame\_gate}([F_t^{\text{out}}, C_{t,t'} \times F_{t'}^{\text{out}}])$ 为数据驱动的帧级可靠性权重。
+
+### 2.3 SWD — 空域小波分流
+
+**动机**。旧 DWT-LFF 通过 IDWT 重建全分辨率特征，两条分支接收几乎相同的信息（仅 LL 略有差异），TFDE 的 IntensityHead 被全 HF 噪声压制（输入 norm 达 60~113），退化分离失效。
+
+**方法**。在 Haar DWT 子带级别直接分流，不做 IDWT 重建：
+
+$$F \xrightarrow{\text{HaarDWT}} \{LL, LH, HL, HH\}, \quad LL \in \mathbb{R}^{B\times C\times H/2\times W/2}$$
+
+**低频分流**。$LL$ 编码全局光照强度，由可学习 $\alpha$ 分配：
+
+$$\alpha = \sigma\left(\text{DWConv}_{3\times3} \to \text{GELU} \to \text{Conv}_{1\times1}\right)(LL)$$
+
+$$LL_{\text{tfde}} = \alpha \odot LL, \quad LL_{\text{tca}} = \text{IN}\left((1-\alpha) \odot LL\right)$$
+
+其中 $\text{IN}$ 为 InstanceNorm——去除通道级光照偏置，保留空间结构。
+
+**高频分流**。$LH,HL,HH$ 编码纹理和噪声，由能量门控 $g_n$ 区分：
+
+$$E_{\text{HF}} = \frac{1}{C}\sum_{c=1}^{C}\left(LH_c^2 + HL_c^2 + HH_c^2\right), \quad g_n = \sigma\left(\text{Conv}_{3\times3} \to \text{GELU} \to \text{Conv}_{1\times1}\right)(E_{\text{HF}})$$
+
+$$HF_{\text{tfde}} = g_n \odot [LH, HL, HH], \quad HF_{\text{tca}} = \text{LN}\left((1-g_n) \odot [LH, HL, HH]\right)$$
+
+高 HF 能量 → $g_n \uparrow$ → 噪声概率高 → 导向 TFDE。低 HF 能量 → $(1-g_n) \uparrow$ → 结构概率高 → 导向 TCA。
 
 **输出投影**：
-$$\text{feat}_{\text{tfde}} = \text{LN}(\text{Conv}_{1\times1}([\text{LL}_{\text{tfde}}, \text{HF}_{\text{tfde}}]))$$
-$$\text{feat}_{\text{tca}} = \text{LN}(\text{Conv}_{1\times1}([\text{LL}_{\text{tca}}, \text{HF}_{\text{tca}}]))$$
 
-### 2.3 TCA — 时序对应对齐 (RWKV)
-
-**动机**: 扫描轴从时间 (5 token) 改为空间 (H×W token)，利用 RWKV 的长序列建模能力捕捉帧内结构，帧间用显式 correspondence 替代隐式 WKV mix。
-
-**帧内空间扫描 (Bi-WKV)**：
-输入 $k_t, v_t \in \mathbb{R}^{C}$，沿空间序列 $L=H\times W$ 做带衰减的递归：
-
-$$S_t = e^{w} \cdot S_{t-1} + e^{k_t} \odot v_t, \quad D_t = e^{w} \cdot D_{t-1} + e^{k_t}$$
-
-$$y_t = \frac{e^{u}\cdot e^{k_t}\odot v_t + S_t}{e^{u}\cdot e^{k_t} + D_t}$$
-
-其中 $w = -\text{softplus}(\theta_w) < 0$ 保证 $e^w < 1$（恒衰减），$u$ 为当前 token 的 bonus。
-
-**四方向扫描** (RSRWKV)。通道分为 4 组 $(C/4)$，每组沿一个方向展开：
-
-| 方向 | 展开方式 |
-|------|---------|
-| 水平 (→) | $(H\times W) \to L$ 行优先 |
-| 垂直 (↓) | $(W\times H) \to L$ 列优先 |
-| 主对角线 (↘) | 按 $i+j$ 排序 |
-| 副对角线 (↗) | 按 $i-j+W-1$ 排序 |
-
-**TCA 完整计算**：
-
-$$\mathbf{x}_{\text{shifted}} = \text{MVC-Shift}(\mathbf{F}_{\text{tca}}) \quad\text{(3 dilated DWConv, }d=1,2,3\text{)}$$
-$$\mathbf{k}, \mathbf{v} = \text{proj}_k(\mathbf{x}), \text{proj}_v(\mathbf{x})$$
-$$\text{head}_i = \text{BiWKV}(\text{scan}_i(\mathbf{k}_i), \text{scan}_i(\mathbf{v}_i)), \quad i=0,1,2,3$$
-$$\text{WKV} = \sigma(\text{proj}_r(\mathbf{x})) \odot \text{Concat}(\text{head}_0,\dots,\text{head}_3)$$
-$$\mathbf{F}_{\text{out}} = \mathbf{F}_{\text{tca}} + \gamma \cdot \text{ChannelMix}(\text{WKV})$$
-
-**时序对应** (C_omega)：
-$$\mathbf{q} = \text{proj}_q(\mathbf{F}_{\text{center}}), \quad \mathbf{k}_t = \text{proj}_k(\mathbf{F}_t), \quad t \neq \text{center}$$
-$$C_{\omega}^{(t)} = \text{softmax}\left(\frac{\mathbf{q} \cdot \mathbf{k}_t^T}{\tau}\right), \quad \tau = \text{softplus}(\tau_{\text{raw}}) + 0.05$$
-
-**时序聚合** (F_t_aligned)：
-$$\mathbf{F}_{\text{aligned}} = \sum_{t \neq c} w_t \cdot \left(C_{\omega}^{(t)} \times \mathbf{F}_t\right), \quad w_t = \text{frame\_gate}([\mathbf{F}_c, \mathbf{F}_{\text{warped}}])$$
+$$F_{\text{tfde}} = \text{LN}\left(\text{Conv}_{1\times1}([LL_{\text{tfde}}, HF_{\text{tfde}}])\right) \in \mathbb{R}^{B\times C\times H/2\times W/2}$$
+$$F_{\text{tca}} = \text{LN}\left(\text{Conv}_{1\times1}([LL_{\text{tca}}, HF_{\text{tca}}])\right) \in \mathbb{R}^{B\times C\times H/2\times W/2}$$
 
 ### 2.4 ISPN — 光照源处理
 
-**三路输出分工**：
+ISPN 接收 $\{F_{t'}^{\text{out}}\}_{t'=0}^{T-1}$、$s_{\text{illu}}$ 和 $\hat{F}_t$，输出三路信号：
 
-$$\text{lit\_up\_map} = 1 + b_{\text{max}} \cdot \sigma\left(\text{L\_ratio} + \delta(\text{f\_illum\_feat})\right) \quad\text{(像素增亮增益, [1,1+4])}$$
-$$\text{f\_illum\_feat} = \text{refine}(s_{\text{illum}}\_ \text{proj}(s_{\text{illum}}) + \text{CoarseAdapter}(\mathbf{F}_{\text{aligned}}))$$
-$$A_{\text{illu}} = \sigma\left(\text{DWConv}_{3\times3} \to \text{Conv}_{1\times1} \to \sigma\right)(\text{f\_illum\_feat})$$
+**像素增亮增益**：
+$$\text{lit\_up\_map} = 1 + b_{\text{max}} \cdot \sigma\left(L_{\text{ratio}} + \delta(\text{f\_illum\_feat})\right) \in [1, 1+b_{\text{max}}]$$
 
-其中 $A_{\text{illu}} \in [0,1]$ 为空间光照注意力：暗区 → $A_{\text{illu}} \uparrow$ → 放大提亮；亮区 → $A_{\text{illu}} \downarrow$ → 抑制过曝。
+其中 $L_{\text{ratio}} = L_{\text{ref}} / (L_t + \epsilon)$ 为 Retinex 光照比。
 
-F_t_aligned 锚定（防帧间闪烁）：
-$$\text{f\_illum\_feat} = \text{f\_illum\_feat} + \tanh(g) \cdot \text{illu\_anchor}([\text{f\_illum\_feat}, \mathbf{F}_{\text{aligned}}])$$
+**空间光照注意力** (从 $f_{\text{illum\_feat}}$ 生成)：
+$$A_{\text{illu}} = \sigma\left(\text{DWConv}_{3\times3} \to \text{Conv}_{1\times1} \to \sigma\right)(\text{f\_illum\_feat}) \in [0,1]^{1\times H\times W}$$
 
-### 2.5 NDPN — 噪声退化处理
+$A_{\text{illu}} \uparrow$ → 暗区提亮放大；$A_{\text{illu}} \downarrow$ → 亮区过曝抑制。
+
+**时序锚定** (抑制帧间光照闪烁)：
+$$\text{f\_illum\_feat} := \text{f\_illum\_feat} + \tanh(g) \cdot \text{illu\_anchor}([\text{f\_illum\_feat}, \hat{F}_t])$$
+
+其中 $g$ 零初始化 → 初始行为不变，逐步学习。
+
+### 2.5 NDPN — 噪声退化处理 (对应 $\sigma^2_{\text{img}}$)
+
+**直觉**：$C_{t,\Omega}$ 对角线 $C_{t,t'}[i,i]$ 表示位置 $i$ 在帧 $t$ 和 $t'$ 间的对应一致性。高对应 → 时序去噪可靠 → 弱空域去噪（保留细节）；低对应 → 运动遮挡 → 强空域去噪。
 
 **置信度引导去噪**：
 
-1. 从 C_omega 对角线提取 correspondence confidence：
-$$c = \text{conf\_proj}(\text{diag}(C_\omega^{(1)}),\dots,\text{diag}(C_\omega^{(T-1)})) \quad\text{(diag → confidence)}$$
+$$c = \text{conf\_proj}\left(\text{diag}(C_{t,\Omega}^{(1)}),\dots,\text{diag}(C_{t,\Omega}^{(T-1)})\right)$$
 
-2. 噪声特征提取 (encoder vs aligned)：
-$$\mathbf{n} = \text{noise\_extract}([\mathbf{F}_{\text{enc}}, \mathbf{F}_{\text{aligned}}])$$
+$$\mathbf{n} = \text{noise\_extract}\left([F_t^{\text{enc}}, \hat{F}_t]\right) \quad\text{(encoder vs aligned 差异)}$$
 
-3. 置信度门控去噪强度：
-$$\text{strength} = \sigma(\text{denoise\_strength}([\mathbf{n}, c])), \quad \gamma_n = 0\text{-init}$$
-$$\mathbf{f}_{\text{noise}} = \mathbf{F}_{\text{enc}} - \gamma_n \cdot \mathbf{n} \odot \text{strength} + \text{noise\_proj}(s_{\text{noise}})$$
+$$\text{strength} = \sigma\left(\text{denoise\_strength}([\mathbf{n}, c])\right), \quad \gamma_n = 0$$
 
-**直觉**: $c \uparrow$ (高对应) → 时域去噪充分 → strength $\downarrow$ (保留细节)；$c \downarrow$ → 空域去噪增强。
+$$\mathbf{f}_{\text{noise}} = F_t^{\text{enc}} - \gamma_n \cdot \mathbf{n} \odot \text{strength} + \text{noise\_proj}(s_{\text{noise}})$$
 
-### 2.6 MCPN — 运动补偿处理
+### 2.6 MCPN — 运动补偿处理 (对应 $\sigma^2_{\text{dyn}}$)
+
+**直觉**：$C_{t,\Omega}$ 对角线偏离度是运动强度的逆向指标——对角线占优 → 静止 → 少补偿；对角线扩散 → 运动 → 强补偿。
 
 **运动强度补偿**：
 
-1. 从 C_omega 对角线偏离估计运动强度：
-$$m = \text{motion\_estimator}(\text{diag}(C_\omega^{(1)}),\dots,\text{diag}(C_\omega^{(T-1)}))$$
+$$m = \text{motion\_estimator}\left(\text{diag}(C_{t,\Omega}^{(1)}),\dots,\text{diag}(C_{t,\Omega}^{(T-1)})\right)$$
 
-2. 对齐邻帧 (窗口相关) + 运动修正：
-$$\mathbf{F}_{\text{omega}} = \text{window\_corr}(\mathbf{F}_{\text{aligned}}, \mathbf{F}_{\text{neighbors}})$$
-$$\mathbf{\Delta}_m = \text{motion\_refine}([\mathbf{F}_{\text{aligned}}, \mathbf{F}_{\text{omega}}])$$
+$$F_{\text{omega}} = \text{window\_corr}\left(\hat{F}_t, \{F_{t'}^{\text{out}}\}_{t' \in \Omega}\right)$$
 
-3. 运动强度门控：
-$$\text{comp} = \sigma(\text{comp\_gate}([\mathbf{F}_{\text{aligned}}, m])), \quad \gamma_m = 0.1$$
-$$\mathbf{f}_{\text{motion}} = g_t \odot \mathbf{F}_{\text{aligned}} + (1-g_t) \odot \mathbf{F}_{\text{omega}} + \gamma_m \cdot \mathbf{\Delta}_m \odot \text{comp}$$
+$$\Delta_m = \text{motion\_refine}([\hat{F}_t, F_{\text{omega}}]), \quad \text{comp} = \sigma(\text{comp\_gate}([\hat{F}_t, m]))$$
+
+$$\mathbf{f}_{\text{motion}} = g_t \odot \hat{F}_t + (1-g_t) \odot F_{\text{omega}} + \gamma_m \cdot \Delta_m \odot \text{comp}$$
+
+其中 $\gamma_m = 0.1$。$g_t = \sigma(\text{gate}([\hat{F}_t, F_{\text{omega}}]))$ 控制信任对齐中心 vs 聚合邻帧。
 
 ### 2.7 CXG — 交叉激励门
 
-**动机**: 训练时协调 NDPN/MCPN 梯度冲突（去噪 vs 运动补偿方向可能不一致），推理时融合为静态缩放（DRNet 重参数化范式）。
+**动机**。去噪和运动补偿在重叠区域（既有噪声又有运动）梯度方向可能冲突。CXG 在训练时做动态交叉调制，推理时融合为静态缩放（DRNet, CVPR 2026 重参数化范式）。
 
 $$\mathbf{f}_{\text{noise}}^{\text{out}} = \mathbf{f}_{\text{noise}} \odot \begin{cases} \sigma(\text{SE}(\mathbf{f}_{\text{motion}})) & \text{train} \\ \bar{g}_n & \text{infer (deploy)} \end{cases}$$
+
 $$\mathbf{f}_{\text{motion}}^{\text{out}} = \mathbf{f}_{\text{motion}} \odot \begin{cases} \sigma(\text{SE}(\mathbf{f}_{\text{noise}})) & \text{train} \\ \bar{g}_m & \text{infer (deploy)} \end{cases}$$
 
 ### 2.8 SGRF — 阶段式修复融合
 
-**三阶段 Retinex 修正** (Denoise → Deblur → Brighten)：
+**三阶段顺序修正** (Denoise → Deblur → Brighten)：
 
-$$\text{S1 (去噪): } \quad \mathbf{I}_1 = \text{clamp}\left(\mathbf{I}_{\text{center}} + \delta_1(\mathbf{f}_{\text{noise}}^{\text{out}}), 0, 1\right)$$
-$$\text{S2 (去模糊): } \quad \mathbf{I}_2 = \text{clamp}\left(\mathbf{I}_1 + \delta_2(\mathbf{f}_{\text{motion}}^{\text{out}}), 0, 1\right)$$
-$$\text{S3 (提亮): } \quad \mathbf{I}_3 = \text{clamp}\left((\mathbf{I}_2 + 0.01) \odot \text{lit\_up\_map} \odot (1+A_{\text{illu}}), 0, 1\right)$$
+$$\text{S1 (去噪): } \quad I_1 = \text{clamp}\left(I_t + \delta_1(\mathbf{f}_{\text{noise}}^{\text{out}}), 0, 1\right)$$
 
-其中 $\delta_1, \delta_2$ 为 ResBlock 残差。+0.01 bias 防止暗区梯度消失。
+$$\text{S2 (去模糊): } \quad I_2 = \text{clamp}\left(I_1 + \delta_2(\mathbf{f}_{\text{motion}}^{\text{out}}), 0, 1\right)$$
+
+$$\text{S3 (提亮): } \quad \hat{X}_t = \text{clamp}\left((I_2 + \varepsilon) \odot \text{lit\_up\_map} \odot (1+A_{\text{illu}}), 0, 1\right)$$
+
+其中 $\delta_1,\delta_2$ 为 ResBlock 残差模块，$\varepsilon=0.01$ 为防止暗区梯度消失的偏置。三阶段顺序保证：先去除信号无关的噪声（不影响光照），再修正帧间运动模糊，最后施加光照补偿。若提亮在前则会放大噪声。
 
 ---
 
