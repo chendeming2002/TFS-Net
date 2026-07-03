@@ -305,10 +305,82 @@ class TFSNetLoss(nn.Module):
             return {"action": "phase2_unlock_perc", "perc_log_var": -1.0, "freq_log_var": -0.5}
         return None
 
-    def forward(self, outputs: dict, target: torch.Tensor, epoch: int = 0):
+    def forward(self, outputs: dict, target: torch.Tensor, epoch: int = 0,
+                phase: str = 'phase2', unlock_ratio: float = 1.0, model=None):
         pred = outputs["res_t"]
         s_illum = outputs["s_illum"]
         s_noise = outputs["s_noise"]
+
+        # --- Mark3 Phase 1 alignment losses ---
+        losses = {}
+        L_align_warp = pred.new_tensor(0.0)
+        L_diag_prior = pred.new_tensor(0.0)
+        if "C_omega" in outputs and outputs["C_omega"] and "F_out_list" in outputs:
+            C_omega = torch.stack(outputs["C_omega"], dim=1)  # (B, T-1, N, N)
+            F_out = outputs["F_out_list"]
+            center = len(F_out) // 2
+            F_center = F_out[center]  # (B, C, H, W)
+            Bv, Cv, _, _ = F_center.shape
+            # warp consistency (downsample features to match C_omega N)
+            ds = int(C_omega.shape[-1] ** 0.5)
+            F_center_ds = F.adaptive_avg_pool2d(F_center, (ds, ds)).reshape(Bv, Cv, -1)
+            for k in range(len(F_out) - 1):
+                tp = k if k < center else k + 1
+                F_tp_ds = F.adaptive_avg_pool2d(F_out[tp], (ds, ds)).reshape(Bv, Cv, -1)
+                C_k = C_omega[:, k]
+                w = torch.bmm(F_tp_ds, C_k.transpose(-1, -2)).reshape(Bv, Cv, ds, ds)
+                L_align_warp = L_align_warp + F.l1_loss(w, F_center_ds.reshape(Bv, Cv, ds, ds))
+            L_align_warp = L_align_warp / max(len(F_out) - 1, 1)
+            # diag prior: encourage diag(C_omega)→1 (self-supervised, no GT needed)
+            # C_omega: (B, T-1, N, N) softmax-normalized per row
+            N = C_omega.shape[-1]
+            diag_C = torch.diagonal(C_omega, dim1=-2, dim2=-1)  # (B, T-1, N)
+            L_diag_prior = -torch.log(diag_C.clamp(min=1e-6)).mean()
+        losses['align_warp'] = L_align_warp
+        losses['diag_prior'] = L_diag_prior
+
+        # --- Phase 1 / Warmup: limited losses ---
+        if phase in ('phase1_warmup', 'phase1'):
+            L_pix = self._pe_charbonnier(pred, target) if self.use_pe_charbonnier else charbonnier_loss(pred, target)
+            L_ssim = 1.0 - ssim_map(pred, target).mean()
+            L_illum_smooth = self._edge_aware_smooth(s_illum, target)
+
+            # lit_up_map supervision
+            L_lit_up_sup = pred.new_tensor(0.0)
+            if "lit_up_map" in outputs and "image_center" in outputs:
+                img_c = outputs["image_center"]
+                gt_g = target.mean(dim=1, keepdim=True)
+                ic_g = img_c.mean(dim=1, keepdim=True)
+                lit_target = (gt_g / (ic_g + 1e-6)).clamp(1.0, 8.0)
+                lmap = outputs["lit_up_map"]
+                L_lit_up_sup = F.l1_loss(lmap, lit_target.expand_as(lmap))
+
+            # SWD reg: keep alpha/gate near 0.5
+            L_swd_reg = pred.new_tensor(0.0)
+            if model is not None and hasattr(model, 'swd'):
+                swd = model.swd
+                # alpha_net: DWConv→GELU→Conv1x1→Sigmoid, check Conv1x1 bias
+                try:
+                    alpha_bias = swd.alpha_net[2].bias.mean()
+                    swd._alpha_mean = alpha_bias.sigmoid()
+                    L_swd_reg = (swd._alpha_mean - 0.5)**2
+                except: pass
+
+            if self.uncertainty_weighting:
+                L = (self._uw(L_pix, 'pix') + self._uw(L_ssim, 'ssim')
+                   + self._uw(L_illum_smooth + 0.02 * L_lit_up_sup, 'illum')
+                   + self._uw(L_align_warp + L_diag_prior, 'ifpn')
+                   + 0.001 * L_swd_reg)
+            else:
+                L = self.lambda_pix * L_pix + self.lambda_ssim * L_ssim + self.lambda_illum * L_illum_smooth
+            losses.update({'loss_pix': L_pix.detach(), 'loss_ssim': L_ssim.detach(),
+                          'loss_illum': L_illum_smooth.detach(), 'loss_perc': pred.new_tensor(0.0),
+                          'loss_freq': pred.new_tensor(0.0), 'loss_illum_sup': L_lit_up_sup.detach(),
+                          'loss_noise_sup': pred.new_tensor(0.0), 'loss_inter': pred.new_tensor(0.0),
+                          'loss_ifpn_sup': L_diag_prior.detach(), 'loss_total': L.detach()})
+            return L, losses
+
+        # --- Phase 1.5 / Phase2: full loss (existing logic below) ---
 
         # Pix loss (PE or standard Charbonnier)
         L_pix = self._pe_charbonnier(pred, target) if self.use_pe_charbonnier \

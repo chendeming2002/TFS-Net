@@ -148,7 +148,7 @@ def build_loss(cfg, device):
     return criterion.to(device)
 
 
-def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp, logger, log_interval, epoch=0, grad_clip=1.0, grad_accum_steps=1):
+def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp, logger, log_interval, epoch=0, grad_clip=1.0, grad_accum_steps=1, phase='phase2', unlock_ratio=1.0):
     model.train()
     meter_total = AverageMeter()
     meter_pix = AverageMeter()
@@ -168,8 +168,9 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
 
         # gradient accumulation: scale loss so effective batch = batch × accum_steps
         with autocast(enabled=use_amp):
-            outputs = model(clip)
-        loss, loss_dict = criterion(outputs, target, epoch=epoch)
+            outputs = model(clip, phase=phase)
+        model._unlock_ratio = unlock_ratio
+        loss, loss_dict = criterion(outputs, target, epoch=epoch, phase=phase, unlock_ratio=unlock_ratio, model=model)
 
         if not torch.isfinite(loss):
             logger.warning("Skipping non-finite loss at step %d", step + 1)
@@ -279,14 +280,26 @@ def main():
     model = build_model(cfg, device)
     criterion = build_loss(cfg, device)
     optimizer = AdamW(model.parameters(), lr=cfg["train"]["lr"], weight_decay=cfg["train"]["weight_decay"])
-    warmup_epochs = cfg["train"].get("warmup_epochs", 5)
     total_epochs = cfg["train"]["epochs"] if not args.smoke else 1
-    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=max(total_epochs - warmup_epochs, 1))
-    if warmup_epochs > 0 and total_epochs > warmup_epochs:
-        warmup_scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_epochs)
-        scheduler = SequentialLR(optimizer, [warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs])
-    else:
-        scheduler = cosine_scheduler
+
+    # Mark3: Phase-based lr schedule (replaces CosineAnnealing + Linear warmup)
+    def get_phase(epoch):
+        if epoch < 5:   return 'phase1_warmup'
+        elif epoch < 20: return 'phase1'
+        elif epoch < 25: return 'phase1_5'
+        else:            return 'phase2'
+
+    def get_unlock_ratio(epoch):
+        if epoch < 20: return 0.0
+        elif epoch < 25: return (epoch - 20) / 5.0
+        else: return 1.0
+
+    def get_lr(epoch, base=cfg["train"]["lr"]):
+        if epoch < 5: return base * (0.01 + 0.99 * epoch / 5)
+        elif epoch < 20: return base * 0.75
+        elif epoch < 25: return base * 0.75 * (1 - (epoch - 20) / 5 * 0.33)
+        elif epoch < 45: return base * 0.5
+        else: return base * 0.125
     scaler = GradScaler(enabled=cfg["train"]["amp"] and device.type == "cuda")
     grad_clip = cfg["train"].get("grad_clip", 1.0)
     grad_accum_steps = cfg["train"].get("grad_accum_steps", 1)
@@ -355,18 +368,20 @@ def main():
         logger.info("Loaded pretrained weights from %s (missing=%d, unexpected=%d)", args.pretrained, len(missing_keys), len(unexpected))
 
     for epoch in range(start_epoch, total_epochs):
-        logger.info("Epoch %d / %d", epoch + 1, total_epochs)
+        phase = get_phase(epoch)
+        lr = get_lr(epoch)
+        unlock = get_unlock_ratio(epoch)
+        logger.info("Epoch %d / %d [%s] lr=%.2e unlock=%.2f", epoch + 1, total_epochs, phase, lr, unlock)
 
-        # Mark2 loss schedule (phase transitions)
-        schedule_info = criterion.schedule_loss_phase(epoch)
-        if schedule_info:
-            logger.info("Loss schedule: %s", schedule_info)
-        # Phase 3: lr multiplier 0.3 at epoch 35
-        if epoch >= 35:
-            for pg in optimizer.param_groups:
-                pg['lr'] = cfg["train"]["lr"] * 0.3
-            if epoch == 35:
-                logger.info("Phase 3: lr=%.2e (×0.3)", cfg["train"]["lr"] * 0.3)
+        # Set lr
+        for pg in optimizer.param_groups:
+            pg['lr'] = lr
+
+        # Phase transition actions
+        if epoch == 20:
+            logger.info("Phase 1.5: Unlocking NDPN/MCPN/CXG")
+        if epoch == 25:
+            logger.info("Phase 2: Full tri-source restoration")
 
         train_stats = train_one_epoch(
             model=model,
@@ -381,8 +396,11 @@ def main():
             log_interval=cfg["train"]["log_interval"],
             grad_clip=grad_clip,
             grad_accum_steps=grad_accum_steps,
+            phase=phase,
+            unlock_ratio=unlock,
         )
-        scheduler.step()
+        # Mark3: lr managed by get_lr(), scheduler disabled
+        # scheduler.step()
         logger.info("Train stats: %s", train_stats)
 
         if (epoch + 1) % cfg["train"]["val_interval"] == 0:

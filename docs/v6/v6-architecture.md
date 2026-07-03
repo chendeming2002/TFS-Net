@@ -1,7 +1,7 @@
-# TFS-Net v6 Delta Mark2 模型架构设计文档
+# TFS-Net v6 Delta Mark3 模型架构设计文档
 
-> 日期：2026-07-03 (更新: Mark2 损失调度实施)
-> 版本：v6 Delta Mark2
+> 日期：2026-07-03 (更新: Mark3 两阶段渐进训练)
+> 版本：v6 Delta Mark3
 > 训练配置：`configs/v6_bravo.yaml`，batch=1 (grad_accum=3), lr=8e-4, epochs=50, warmup=5
 > 参数量：1.688M
 
@@ -314,11 +314,12 @@ pre_norm LayerNorm 在 R/K/V 投影前
 | v6.5 | PureRWKV 移除 DAT | 1.17M | 20.36 |
 | v6 Delta | 空间扫描2D-WKV + C_omega + F_t_aligned | 1.64M | 训练崩溃 |
 | v6 Delta Mark1 | SWD子带分流 + 命名统一 + 数值稳定 | 1.69M | ep15 loss收敛 |
-| **v6 Delta Mark2** | **Kendall不确定性加权 + PE Loss + 感知解耦 + 损失调度** | **1.69M** | 训练中(ep16) |
+| **v6 Delta Mark2** | **Kendall不确定性加权 + PE Loss + 感知解耦 + 损失调度** | **1.69M** | 收敛停滞 |
+| **v6 Delta Mark3** | **两阶段渐进训练 + ISPN 隔离 + SGRF 中间监督 + 相位调度** | **1.69M** | **训练中(ep1)** |
 
 ---
 
-## 6. 损失函数设计 (Mark2)
+## 6. 损失函数设计 (Mark3)
 
 **文件**: `losses/losses.py` — `TFSNetLoss`
 
@@ -326,32 +327,81 @@ pre_norm LayerNorm 在 R/K/V 投影前
 
 $$L_{\text{total}} = \sum_{i} \frac{1}{2\exp(s_i)} L_i + \frac{1}{2}s_i$$
 
-其中 $s_i = \log\sigma_i^2$ 为可学习 log-variance。损失大的任务自动降权，损失小的任务自动提权。
+其中 $s_i = \log\sigma_i^2$ 为可学习 log-variance，损失大的任务自动降权，损失小的任务提权。
+
+| Key | 初始 log_var | 物理含义 |
+|-----|-------------|---------|
+| `pix` | 0.0 | 像素重建 |
+| `ssim` | -1.0 | 结构相似度 |
+| `illum` | 0.0 | 光照平滑 + 光照图监督 |
+| `ifpn` | 0.0 | TCA 对齐质量 (align_warp + diag_prior) |
+| `perc` | 2.0 | VGG 感知 (Phase 1 屏蔽, Phase 2→-1.0) |
+| `freq` | 0.0 | 频域纹理 |
+| `inter` | 0.0 | 中间路径监督 |
 
 ### 6.2 各损失项
 
-| 项 | 公式 | 监督对象 |
+#### 主路径损失 (所有阶段)
+
+| 项 | 公式 | 监督对象 | 路由 |
+|----|------|---------|------|
+| **L_pix** | PECharbonnier(res_t, GT) | 最终输出 | SGRF-S3 |
+| **L_ssim** | 1 - SSIM(res_t, GT) | 结构相似度 | 最终输出 |
+| **L_illum_sup** | L1(lit_up_map, GT/I̅_t) | 光照图空间分布 | ISPN→lit_up_map |
+
+#### Phase 1 专属 — TCA 对齐 & ISPN 约束
+
+| 项 | 公式 | 物理含义 |
 |----|------|---------|
-| **L_pix** | PECharbonnier(res_t, GT) | 最终输出 |
-| **L_freq** | L1(\|FFT(res)\|, \|FFT(GT)\|) | 频域纹理 |
-| **L_ssim** | 1 - SSIM(res_t, GT) | 结构相似度 |
-| **L_perc** | L1(VGG_relu3_3, VGG_relu3_3(GT)) | 感知一致性 |
-| **L_illum** | TV(s_illum)·e^{-\|\nabla I\|} (+ 0.02·L1监督) | s_illum |
-| **L_inter** | Charbonnier(img_s2×lit_up_map, GT) | 中间乘法路径 |
-| **L_ifpn_sup** | Charbonnier(ifpn_side, GT↓) | ISPN 侧输出 |
+| **L_align_warp** | L1(∑C·F_neighbor, F_center) | 时序 warp 一致性：用 C_omega 对齐邻帧特征，应与中心帧一致 |
+| **L_diag_prior** | −mean(log(diag(C_Ω)+ε)) | C_Ω 对角先验：鼓励静止区域对应 identity（无 GT 自监督） |
+| **L_illum_smooth** | TV(s_illum)·e^{−‖∇I‖} | 光照图边缘感知平滑 |
+| **L_swd_reg** | (ᾱ − 0.5)² | SWD 分流平衡正则：防 α 偏离中心 |
 
-### 6.3 损失调度 (Phase Schedule)
+#### Phase 2 专属 — 感知解耦 & 中间监督
 
-| 阶段 | Epoch | 行为 |
-|------|-------|------|
-| **Warmup** | 0-4 | 仅 L_pix + L_ssim (屏蔽 L_perc, L_freq, 中间监督) |
-| **Phase 1** | 5-14 | 全损失，perc log_var=2.0 (极低权重≈0.07) |
-| **Phase 2** | 15-34 | perc log_var reset→-1.0 (正常权重≈1.35), freq 解锁 |
-| **Phase 3** | 35-49 | lr ×0.3，所有损失自由竞争 |
+| 项 | 公式 | 监督对象 | 设计要点 |
+|----|------|---------|---------|
+| **L_ssim_s1** | 1 − SSIM(img_s1, GT) | SGRF-S1 (去噪) | 感知解耦：SSIM→S1 |
+| **L_perc_s2** | ‖VGG(img_s2) − VGG(GT)‖ | SGRF-S2 (去模糊) | 感知解耦：VGG→S2 |
+| **L_pix_s3** | Charbonnier(img_s2·lit_up_map, GT) | SGRF-S3 提亮路径 | 中间乘法监督 |
+| **L_ifpn_side** | Charbonnier(ifpn_side, GT↓) | ISPN 侧输出 | 暗图监督 |
+| **L_freq** | L1(|FFT(res)|, |FFT(GT)|) | 频域纹理 | 目标纹理细节 |
+
+#### Kendall UW 聚合规则
+
+| 阶段 | 聚合公式 |
+|------|---------|
+| Phase 1 Warmup | UW(pix) + UW(ssim) + UW(illum_smooth + 0.02·L_illum_sup) + 0.001·L_swd_reg |
+| Phase 1 Main | Phase1_Warmup + UW(align_warp + diag_prior, 'ifpn') |
+| Phase 2 | 完整损失 (perceptual_decoupling: SSIM→S1, VGG→S2, Charb→S3) |
+
+### 6.3 相位调度 (Mark3)
+
+**核心理念**：先收敛无冲突的 ISPN 路径，再逐级解锁 NDPN/MCPN 分支，避免 Mark2 的梯度冲突导致收敛停滞。
+
+| 阶段 | Epoch | 损失 | NDPN/MCPN | CXG | lr |
+|------|-------|------|-----------|-----|-----|
+| **Phase 1 Warmup** | 0–4 | pix + ssim + illum_smooth + lit_up_sup + swd_reg | **zero** (输出置零) | bypass | 8e-6→8e-4 |
+| **Phase 1 Main** | 5–19 | + align_warp + diag_prior | **zero** | bypass | 6e-4 |
+| **Phase 1.5** | 20–24 | = Phase 1 Main | 线性解锁 0→100% | ratio>0.3 时启用 | 6e-4→4e-4 |
+| **Phase 2** | 25–49 | 全损失 (感知解耦 + freq + 中间监督) | 100% | 启用 | 4e-4→1e-4 |
+
+**关键设计决策**：
+
+1. **Phase 1 NDPN/MCPN 截断**：Mark2 分析显示 NDPN/MCPN 梯度与 ISPN 冲突导致收敛停滞（ep16-22 loss=0.62 平台期）。Phase 1 隔离 ISPN+SGRF 路径，避免噪声/运动分支污染早期光照学习。
+
+2. **Phase 1.5 平滑解锁**：直接开关 NDPN/MCPN 会引入振荡。5 个 epoch 的 unlock_ratio 线性斜坡，`f_out = ratio * branch_out`，平滑过渡。
+
+3. **感知解耦** (Perceptual Decoupling)：Mark2 设计 B1 方案——SSIM 损失监督 SGRF-S1（去噪），VGG 感知损失监督 SGRF-S2（去模糊），Charbonnier 监督 S3 乘法路径。消除"同一输出接收 SSIM+感知 冲突梯度"问题。
+
+4. **L_diag_prior 自监督**：dataloader 只提供中心帧 GT，无法获取邻帧 GT。使用 C_Ω 对角线的 −log(·) 先验，无条件鼓励 identity 对应。Phase 1 无运动分支，副作用可控。Phase 2 可扩展为邻帧 GT 对应监督。
+
+5. **L_swd_reg 弱正则**：固定权重 0.001（不受 Kendall UW 控制），防止 α_net 极端分流失衡（α→0 或 α→1）。
 
 ---
 
-## 7. 训练策略
+## 7. 训练策略 (Mark3)
 
 ### 7.1 超参数
 
@@ -360,12 +410,66 @@ $$L_{\text{total}} = \sum_{i} \frac{1}{2\exp(s_i)} L_i + \frac{1}{2}s_i$$
 | batch_size | 1 | 物理 batch |
 | grad_accum_steps | **3** | 等效 batch=3 |
 | epochs | 50 | — |
-| lr | 8e-4 (Phase 1-2), **2.4e-4** (Phase 3) | Adam |
-| warmup_epochs | 5 | 线性 (0.01→1.0×lr) |
+| lr (Phase 1 Warmup) | 8e-6 → 8e-4 | 线性 warmup |
+| lr (Phase 1 Main) | 6e-4 | 固定 |
+| lr (Phase 1.5) | 6e-4 → 4e-4 | 线性过渡 |
+| lr (Phase 2) | 4e-4 → 1e-4 | Cosine annealing |
+| optimizer | AdamW | — |
 | weight_decay | 1e-4 | L2 正则 |
 | grad_clip | 0.5 | 梯度裁剪 |
 
-### 7.2 数据与评估
+### 7.2 相位判定函数
+
+**文件**: `train.py`
+
+```python
+def get_phase(epoch):
+    if epoch < 5:
+        return 'phase1_warmup'
+    elif epoch < 20:
+        return 'phase1'
+    elif epoch < 25:
+        return 'phase1_5'
+    else:
+        return 'phase2'
+
+def get_unlock_ratio(epoch):
+    if epoch < 20: return 0.0
+    if epoch >= 25: return 1.0
+    return (epoch - 20) / 5.0  # 线性 0→1
+
+def get_lr(epoch, base_lr=8e-4):
+    if epoch < 5:
+        return base_lr * (0.01 + 0.99 * epoch / 5)   # warmup
+    elif epoch < 20:
+        return 0.75 * base_lr                           # 6e-4
+    elif epoch < 25:
+        ratio = (epoch - 20) / 5.0
+        return (0.75 * (1 - ratio) + 0.5 * ratio) * base_lr  # 6e-4→4e-4
+    else:
+        progress = (epoch - 25) / 25.0
+        return 0.50 * base_lr * (0.5 + 0.5 * math.cos(math.pi * progress))  # 4e-4→1e-4
+```
+
+### 7.3 Phase-Dependent Forward
+
+**文件**: `models/tfs_net.py`
+
+```python
+if phase in ('phase1', 'phase1_warmup'):
+    f_noise_out = torch.zeros_like(F_t_aligned)      # NDPN 截断
+    f_motion_out = torch.zeros_like(F_t_aligned)      # MCPN 截断
+elif phase == 'phase1_5':
+    ratio = get_unlock_ratio(epoch)
+    f_noise_out = ndpn(...) * ratio                   # 线性解锁
+    f_motion_out = mcpn(...) * ratio
+elif phase == 'phase2':
+    f_noise_out = ndpn(...)                           # 完整版本
+    f_motion_out = mcpn(...)
+    f_noise_gated, f_motion_gated = cxg(...)
+```
+
+### 7.4 数据与评估
 
 | 项目 | 配置 |
 |------|------|
@@ -375,13 +479,25 @@ $$L_{\text{total}} = \sum_{i} \frac{1}{2\exp(s_i)} L_i + \frac{1}{2}s_i$$
 | 评估耗时 | ~40 min/eval |
 | 推理 | `infer.py`, tile_size=256, no AMP |
 
-### 7.3 训练监控
+### 7.5 训练监控
 
 ```bash
 tail -f outputs/sdsd_delta/nohup.out
 grep "Train stats" outputs/sdsd_delta/nohup.out | tail -20
 grep "non-finite\|NaN" outputs/sdsd_delta/nohup.out
 ```
+
+### 7.6 Epoch 5 过渡检查清单
+
+| 检查项 | 健康阈值 | 不健康信号 |
+|-------|---------|-----------|
+| `pix` 趋势 | 持续下降到 <0.12 | 平台期或上升 |
+| `ssim` 趋势 | 持续下降到 <0.40（即 SSIM>0.60） | 停滞在 >0.45 |
+| `lit_up_map` 值域 | 均值在 [2.0, 6.0] | <1.0 或 >10.0 |
+| `i_sup` | 下降到 <2.0 | >5.0 (lit_up 未激活) |
+| SWD α 均值 | 在 [0.3, 0.7] | <0.1 或 >0.9 |
+| `diag_prior` | 从 ~4.0 下降到 <2.0 | 上升（C_Ω 退化） |
+| 梯度 norm | Encoder/ISPN/SGRF 同数量级 | 某模块爆炸或消失 |
 
 ---
 

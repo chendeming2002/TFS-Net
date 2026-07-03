@@ -176,14 +176,14 @@ class TFSNet(nn.Module):
         self,
         x: torch.Tensor,
         frame_indices: Optional[List[int]] = None,
+        phase: str = 'phase2',
     ) -> Dict[str, torch.Tensor]:
         """
         Args:
             x: (B, T, 3, H, W) 多帧低光输入
-
-        Returns:
-            dict with keys: res_t, delta, f_fused_igrf, s_illum, s_noise, ...
+            phase: 'phase1_warmup' | 'phase1' | 'phase1_5' | 'phase2' (Mark3)
         """
+        self._phase = phase
         B, T, C_in, H, W = x.shape
         center_idx = T // 2
         image_center = x[:, center_idx]
@@ -238,37 +238,40 @@ class TFSNet(nn.Module):
             F_t_aligned=F_t_aligned,
         )
 
-        # NDPN: 去噪
-        ndpn_out = self.ndpn(
-            feats=feats,
-            F_aligned_list=F_aligned_list,
-            mu_t_clean=mu_t_clean,
-            sigma_t_clean=sigma_t_clean,
-            s_noise=s_noise,
-            center_idx=center_idx,
-            C_omega_list=C_omega_list,
-            F_t_aligned=F_t_aligned,
-        )
-
-        # MCPN: 运动补偿
-        mcpn_out = self.mcpn(
-            F_aligned_list=F_aligned_list,
-            center_idx=center_idx,
-            sigma_t_clean=sigma_t_clean,
-            C_omega_list=C_omega_list,
-            F_t_aligned=F_t_aligned,
-        )
-
-        # CXG: 交叉激励门
-        f_noise_out, f_motion_out = self.cxg(
-            ndpn_out["f_noise_out"], mcpn_out["f_motion_out"]
-        )
+        # --- Mark3: Phase-dependent NDPN/MCPN/CXG ---
+        phase = getattr(self, '_phase', 'phase2')
+        if phase in ('phase1', 'phase1_warmup'):
+            f_noise_out = torch.zeros_like(F_t_aligned)
+            f_motion_out = torch.zeros_like(F_t_aligned)
+            ndpn_out = {"f_noise_out": f_noise_out, "s_snr": torch.zeros(B, 1, H, W, device=x.device)}
+            mcpn_out = {"f_motion_out": f_motion_out, "G_t": torch.zeros(B, 64, H, W, device=x.device)}
+            f_noise_gated, f_motion_gated = f_noise_out, f_motion_out
+        elif phase == 'phase1_5':
+            unlock = getattr(self, '_unlock_ratio', 0.0)
+            ndpn_out = self.ndpn(feats=feats, F_aligned_list=F_aligned_list, mu_t_clean=mu_t_clean,
+                sigma_t_clean=sigma_t_clean, s_noise=s_noise, center_idx=center_idx,
+                C_omega_list=C_omega_list, F_t_aligned=F_t_aligned)
+            mcpn_out = self.mcpn(F_aligned_list=F_aligned_list, center_idx=center_idx,
+                sigma_t_clean=sigma_t_clean, C_omega_list=C_omega_list, F_t_aligned=F_t_aligned)
+            f_noise_out = ndpn_out["f_noise_out"] * unlock
+            f_motion_out = mcpn_out["f_motion_out"] * unlock
+            if unlock > 0.3:
+                f_noise_gated, f_motion_gated = self.cxg(f_noise_out, f_motion_out)
+            else:
+                f_noise_gated, f_motion_gated = f_noise_out, f_motion_out
+        else:  # phase2
+            ndpn_out = self.ndpn(feats=feats, F_aligned_list=F_aligned_list, mu_t_clean=mu_t_clean,
+                sigma_t_clean=sigma_t_clean, s_noise=s_noise, center_idx=center_idx,
+                C_omega_list=C_omega_list, F_t_aligned=F_t_aligned)
+            mcpn_out = self.mcpn(F_aligned_list=F_aligned_list, center_idx=center_idx,
+                sigma_t_clean=sigma_t_clean, C_omega_list=C_omega_list, F_t_aligned=F_t_aligned)
+            f_noise_gated, f_motion_gated = self.cxg(ndpn_out["f_noise_out"], mcpn_out["f_motion_out"])
 
         # SGRF: 阶段式修复融合
         sgrf_out = self.sgrf(
             f_illum_feat=ispn_out["f_illum_feat"],
-            f_noise_out=f_noise_out,
-            f_motion_out=f_motion_out,
+            f_noise_out=ndpn_out["f_noise_out"],
+            f_motion_out=mcpn_out["f_motion_out"],
             lit_up_map_raw=ispn_out["lit_up_map_raw"],
             image_center=image_center,
             A_illu=ispn_out.get("A_illu"),
@@ -293,5 +296,11 @@ class TFSNet(nn.Module):
             "mu_t_clean":     mu_t_clean,
             "s_snr":          ndpn_out["s_snr"],
             "motion_weights": mcpn_out["G_t"],
+            "lit_up_map":     ispn_out["lit_up_map_raw"],
+            "C_omega":        C_omega_list,    # Mark3: Phase 1 对齐
+            "F_out_list":     F_aligned_list,  # Mark3: 逐帧特征
+            "F_hat":          F_t_aligned,     # Mark3: 对齐中心帧
             "tfde_out":       tfde_out,
+            "phase":          phase,
+            "A_illu":         ispn_out.get("A_illu"),
         }
