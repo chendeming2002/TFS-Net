@@ -1,7 +1,7 @@
-# TFS-Net v6 Delta Mark3 模型架构设计文档
+# TSD-Net (TFS-Net v6 Delta Mark3) 模型架构设计文档
 
-> 日期：2026-07-03 (更新: Mark3 两阶段渐进训练)
-> 版本：v6 Delta Mark3
+> 日期：2026-07-03 (更新: TSDR 理论框架 + Mark3 两阶段渐进训练)
+> 版本：v6 Delta Mark3 / **TSDR Framework**
 > 训练配置：`configs/v6_bravo.yaml`，batch=1 (grad_accum=3), lr=8e-4, epochs=50, warmup=5
 > 参数量：1.688M
 
@@ -9,7 +9,7 @@
 
 ## 1. 概述
 
-TFS-Net v6 是一个端到端多帧低光视频增强网络。核心思想是**信号分流 → 退化估计 → 并行重建 → 阶段式融合**。
+TSD-Net (Tri-Source Decoupled Network) 是一个端到端多帧低光视频增强网络，基于 **TSDR (Tri-Source Decoupled Restoration)** 框架。核心思想是**时域差分引导的三源解耦 → 并行重建 → 阶段式融合**。
 
 | 模块 | 缩写 | 功能 |
 |------|------|------|
@@ -62,7 +62,7 @@ TFS-Net v6 是一个端到端多帧低光视频增强网络。核心思想是**�
 
 ---
 
-## 2. 理论动机与公式
+## 2. TSDR 理论框架与公式
 
 ### 记号约定
 
@@ -77,27 +77,49 @@ TFS-Net v6 是一个端到端多帧低光视频增强网络。核心思想是**�
 | $s_{\text{illu}}, s_{\text{noise}}$ | TFDE 估计的光照退化强度和噪声退化强度 (均为 $[0,1]$) |
 | $A_{\text{illu}}$ | ISPN 输出的空间光照注意力图 |
 
-### 2.1 问题建模
+### 2.1 问题建模：三源解耦修复 (Tri-Source Decoupled Restoration)
 
-**简化退化模型**。低光观测 $I_t$ 与干净信号 $X$ 的关系：
+**框架名**：TSDR (Tri-Source Decoupled Restoration Framework)，网络名：**TSD-Net**。
 
-$$I_t = X \odot \ell_t + n_t, \quad t = 0,\dots,T-1$$
+**主张。** 我们将低光视频增强重新表述为一个 **三源解耦修复问题**。核心洞察是：**光照退化、成像噪声与运动扰动在时域上呈现完全不同的统计行为，因此不应在早期共享同一处理路径**。
 
-其中 $\ell_t \in (0,1)$ 为逐像素光照退化因子，$n_t$ 为加性噪声。恢复目标为 $\hat{X}$。
+**单帧退化模型**。沿用低光成像的物理模型（[Foi et al., TIP 2008](https://webpages.tuni.fi/foi/papers/Foi-PoissonianGaussianClippedRaw-2007-IEEE_TIP.pdf)；[Wang et al., ICCV 2019](https://openaccess.thecvf.com/content_ICCV_2019/papers/Wang_Enhancing_Low_Light_Videos_by_Exploring_High_Sensitivity_Camera_Noise_ICCV_2019_paper.pdf)），观测帧 $I_t$ 与潜在干净信号 $X_t$ 之间满足：
 
-**三分量退化展开**。低光视频中的扰动可分解为三个独立成分：
+$$I_t = X_t \cdot \ell_t + n_t, \quad n_t \sim \mathcal{P}(\alpha \cdot X_t\ell_t) + \mathcal{N}(0, \sigma_r^2) \tag{1}$$
 
-$$\text{Var}(I_t - X) = \sigma^2_{\text{img}} + \sigma^2_{\text{illu}} + \sigma^2_{\text{dyn}}$$
+其中 $\ell_t \in (0,1)$ 为逐像素光照衰减系数，$n_t$ 服从泊松-高斯混合分布——泊松部分来自光子散粒噪声（signal-dependent），高斯部分来自读出噪声（signal-independent）。
 
-| 成分 | 符号 | 物理来源 | 时域特性 | 对应模块 |
-|------|------|---------|---------|---------|
-| 成像噪声 | $\sigma^2_{\text{img}}$ | 光子散粒噪声 + 传感器读出噪声 | 逐帧独立，零均值 | **NDPN** |
-| 光照扰动 | $\sigma^2_{\text{illu}}$ | 自动曝光切换、外部灯光闪烁 | 帧间缓慢变化，低频主导 | **ISPN** |
-| 动态扰动 | $\sigma^2_{\text{dyn}}$ | 物体运动、相机抖动 | 帧间空间偏移，像素级对应丢失 | **MCPN** |
+**时域差分揭示的三源结构**。视频任务的关键差异在于时域。引入时域差分算子 $\Delta_t I_t = I_t - I_{t-1}$：
 
-**理论依据**：成像噪声满足泊松-高斯混合分布（[Foi et al., TIP 2008](https://doi.org/10.1109/TIP.2008.925361)）；光照扰动在 Retinex 模型中表现为 L 分量的时变（[Land & McCann, JOSA 1971](https://doi.org/10.1364/JOSA.61.000001)）；动态扰动等价于扭曲 $I_{t'} = I_t \circ \phi_{t'\to t} + \text{occlusion}$（[Baker et al., IJCV 2011](https://doi.org/10.1007/s11263-010-0390-2)）。
+$$\Delta_t I_t = \underbrace{X_t\cdot(\ell_t - \ell_{t-1})}_{\Delta^{\text{illu}}_t\ \text{(光照源)}} + \underbrace{(n_t - n_{t-1})}_{\Delta^{\text{img}}_t\ \text{(成像源)}} + \underbrace{(X_t - X_{t-1})\cdot \ell_t}_{\Delta^{\text{dyn}}_t\ \text{(动态源)}} \tag{2}$$
 
-**核心假设**：三种扰动在信号域可分离，但通过 Encoder 后相互耦合。SWD 在子带级别重新解耦，将 $\sigma^2_{\text{img}}+\sigma^2_{\text{illu}}$ 信号导向 TFDE → ISPN/NDPN，将结构成分导向 TCA → MCPN。
+三个差分分量在**时空统计特性**上有本质区别，见 Table 1。
+
+**Table 1. 三源扰动的时空统计特性对比**
+
+| 分量 | 空间分布 | 时域特性 | 频域主导 | 物理来源 | 对应模块 |
+|------|---------|---------|---------|---------|---------|
+| $\Delta^{\text{illu}}_t$ | 全局或大块区域 | 慢变，均值非零 | 低频 (LL 子带) | 自动曝光切换、光源闪烁 [Land & McCann 1971](https://doi.org/10.1364/JOSA.61.000001) | **ISPN** |
+| $\Delta^{\text{img}}_t$ | 逐像素独立 | 帧间独立，零均值 | 全频段，HF 显著 | 光子散粒 + 读出噪声 [Foi et al. 2008](https://webpages.tuni.fi/foi/papers/Foi-PoissonianGaussianClippedRaw-2007-IEEE_TIP.pdf) | **NDPN** |
+| $\Delta^{\text{dyn}}_t$ | 空间稀疏，运动边界集中 | 非零均值，方向性 | 中高频 | 物体运动、相机抖动 [Baker et al. 2011](https://doi.org/10.1007/s11263-010-0390-2) | **MCPN** |
+
+**核心可分性假设 (工程层面)**。在像素域，$\Delta^{\text{illu}}$、$\Delta^{\text{img}}$、$\Delta^{\text{dyn}}$ 三者**不可解析分离**——它们通过 $X_t$ 和 $\ell_t$ 相互耦合。我们主张：**通过合适的表征变换 $\mathcal{T}$，可以构造出三路先验信号，使得每路先验以某一扰动为主导**：
+
+$$\mathcal{T}: \{I_{t-k},\ldots,I_{t+k}\} \mapsto \{p_{\text{illu}}, p_{\text{img}}, p_{\text{dyn}}\} \tag{3}$$
+
+**TSDR 框架的具体实现**。我们将 $\mathcal{T}$ 分解为两个协同变换：
+
+- **SWD (空域小波分流)**：利用 Haar DWT 频域分离，LL 子带天然对应 $\Delta^{\text{illu}}$ 的低频主导性，HF 子带对应 $\Delta^{\text{img}}$ 与结构成分的高频分布。与 [AFD-LLIE (2024)](https://doi.org/10.48550/arxiv.2409.01641) 的 Laplace 金字塔二源解耦一致，但我们扩展到三源。
+
+- **TCA (时序对应矩阵 $C_{t,\Omega}$)**：构造帧间空间对应关系，$C_{t,t'}$ 的对角线占优程度直接指示 $\Delta^{\text{dyn}}_t$ 的强度——对角线扩散越严重，运动越剧烈。与 [IJCAI 2025 LLVE](https://www.cse.cuhk.edu.hk/~byu/papers/C275-IJCAI2025-LLVE.pdf) 的 cross-frame correspondence 约束同源。
+
+由此得到三路先验：
+
+$$p_{\text{illu}} = \text{SWD}_{\text{LL}}(F_t), \quad p_{\text{img}} = \text{diag}(C_{t,\Omega}) \oplus \text{SWD}_{\text{HF}}(F_t), \quad p_{\text{dyn}} = \text{off-diag}(C_{t,\Omega}) \tag{4}$$
+
+三路先验分别输入 ISPN、NDPN、MCPN，每个专用网络在**接近单一主导扰动**的信号上进行处理，避免了梯度冲突（与 [PDHAT (TMM 2024)](https://doi.org/10.1109/tmm.2024.3355634) 的感知解耦思想一致——不同退化属性分配到异构分支，独立损失独立回传）。
+
+**为什么 SGRF 采用 "去噪 → 去模糊 → 提亮" 顺序**。由式 (1)，若先施加提亮变换 $I_t / \ell_t$，则噪声 $n_t / \ell_t$ 会被同比放大——在暗区 $\ell_t \to 0$ 时噪声爆炸。因此正确顺序必须是：先在原始亮度域抑制 $\Delta^{\text{img}}$（NDPN → S1），再修正帧间 $\Delta^{\text{dyn}}$ 引起的对齐偏差（MCPN → S2），最后施加光照补偿 $\ell_t^{-1}$（ISPN → S3）。与 [DP3DF (AAAI 2023)](https://ojs.aaai.org/index.php/AAAI/article/view/25409/25181) 的处理顺序一致，但我们通过显式的三阶段 SGRF 使这一物理约束成为**架构级归纳偏置**。
 
 ### 2.2 TCA — 时序对应对齐 (RWKV 空间扫描)
 
@@ -226,6 +248,8 @@ $$\mathbf{f}_{\text{motion}}^{\text{out}} = \mathbf{f}_{\text{motion}} \odot \be
 
 ### 2.8 SGRF — 阶段式修复融合
 
+SGRF 的三阶段顺序由 §2.1 的物理推导确定：先去噪（抑制 $\Delta^{\text{img}}$）、再去模糊（修正 $\Delta^{\text{dyn}}$）、最后提亮（补偿 $\ell_t^{-1}$），避免先提亮导致的噪声爆炸。
+
 **三阶段顺序修正** (Denoise → Deblur → Brighten)：
 
 $$\text{S1 (去噪): } \quad I_1 = \text{clamp}\left(I_t + \delta_1(\mathbf{f}_{\text{noise}}^{\text{out}}), 0, 1\right)$$
@@ -234,7 +258,7 @@ $$\text{S2 (去模糊): } \quad I_2 = \text{clamp}\left(I_1 + \delta_2(\mathbf{f
 
 $$\text{S3 (提亮): } \quad \hat{X}_t = \text{clamp}\left((I_2 + \varepsilon) \odot \text{lit\_up\_map} \odot (1+A_{\text{illu}}), 0, 1\right)$$
 
-其中 $\delta_1,\delta_2$ 为 ResBlock 残差模块，$\varepsilon=0.01$ 为防止暗区梯度消失的偏置。三阶段顺序保证：先去除信号无关的噪声（不影响光照），再修正帧间运动模糊，最后施加光照补偿。若提亮在前则会放大噪声。
+其中 $\delta_1,\delta_2$ 为 ResBlock 残差模块，$\varepsilon=0.01$ 为防止暗区梯度消失的偏置。
 
 ---
 
