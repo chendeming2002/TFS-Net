@@ -148,7 +148,7 @@ def build_loss(cfg, device):
     return criterion.to(device)
 
 
-def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp, logger, log_interval, epoch=0, grad_clip=1.0):
+def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp, logger, log_interval, epoch=0, grad_clip=1.0, grad_accum_steps=1):
     model.train()
     meter_total = AverageMeter()
     meter_pix = AverageMeter()
@@ -166,10 +166,9 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
         clip = clip.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
 
-        optimizer.zero_grad(set_to_none=True)
+        # gradient accumulation: scale loss so effective batch = batch × accum_steps
         with autocast(enabled=use_amp):
             outputs = model(clip)
-        # 损失计算在 fp32（autocast 外），避免 SSIM/VGG 的 fp16 精度问题（§8.4 修复 A）
         loss, loss_dict = criterion(outputs, target, epoch=epoch)
 
         if not torch.isfinite(loss):
@@ -177,11 +176,15 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
             optimizer.zero_grad(set_to_none=True)
             continue
 
+        loss = loss / grad_accum_steps
         scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
+
+        if (step + 1) % grad_accum_steps == 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
 
         meter_total.update(loss_dict["loss_total"].item(), clip.size(0))
         meter_pix.update(loss_dict["loss_pix"].item(), clip.size(0))
@@ -286,6 +289,7 @@ def main():
         scheduler = cosine_scheduler
     scaler = GradScaler(enabled=cfg["train"]["amp"] and device.type == "cuda")
     grad_clip = cfg["train"].get("grad_clip", 1.0)
+    grad_accum_steps = cfg["train"].get("grad_accum_steps", 1)
 
     best_psnr = -1.0
     start_epoch = 0
@@ -352,6 +356,18 @@ def main():
 
     for epoch in range(start_epoch, total_epochs):
         logger.info("Epoch %d / %d", epoch + 1, total_epochs)
+
+        # Mark2 loss schedule (phase transitions)
+        schedule_info = criterion.schedule_loss_phase(epoch)
+        if schedule_info:
+            logger.info("Loss schedule: %s", schedule_info)
+        # Phase 3: lr multiplier 0.3 at epoch 35
+        if epoch >= 35:
+            for pg in optimizer.param_groups:
+                pg['lr'] = cfg["train"]["lr"] * 0.3
+            if epoch == 35:
+                logger.info("Phase 3: lr=%.2e (×0.3)", cfg["train"]["lr"] * 0.3)
+
         train_stats = train_one_epoch(
             model=model,
             criterion=criterion,
@@ -364,6 +380,7 @@ def main():
             logger=logger,
             log_interval=cfg["train"]["log_interval"],
             grad_clip=grad_clip,
+            grad_accum_steps=grad_accum_steps,
         )
         scheduler.step()
         logger.info("Train stats: %s", train_stats)

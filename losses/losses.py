@@ -295,6 +295,16 @@ class TFSNetLoss(nn.Module):
         grad_i_y = (ref_img[:, :, 1:, :] - ref_img[:, :, :-1, :]).abs().mean(dim=1, keepdim=True)
         return (grad_s_x * torch.exp(-grad_i_x)).mean() + (grad_s_y * torch.exp(-grad_i_y)).mean()
 
+    def schedule_loss_phase(self, epoch: int):
+        """Mark2 训练阶段调度 (epoch 边界调用)"""
+        if epoch == 15 and self.uncertainty_weighting:
+            # Phase2: 解锁感知损失 log_var 2.0→-1.0
+            with torch.no_grad():
+                self.log_vars['perc'].fill_(-1.0)
+                self.log_vars['freq'].fill_(-0.5)
+            return {"action": "phase2_unlock_perc", "perc_log_var": -1.0, "freq_log_var": -0.5}
+        return None
+
     def forward(self, outputs: dict, target: torch.Tensor, epoch: int = 0):
         pred = outputs["res_t"]
         s_illum = outputs["s_illum"]
