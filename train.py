@@ -399,6 +399,7 @@ def main():
         # scheduler.step()
         logger.info("Train stats: %s", train_stats)
 
+        val_stats = None
         if (epoch + 1) % cfg["train"]["val_interval"] == 0:
             val_stats = validate(
                 model,
@@ -411,15 +412,17 @@ def main():
                 phase=phase,
             )
             logger.info("Val stats: %s", val_stats)
-            save_checkpoint(
-                {
-                    "epoch": epoch + 1,
-                    "model": model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "config": cfg,
-                },
-                os.path.join(output_dir, "latest.pth"),
-            )
+
+        save_checkpoint(
+            {
+                "epoch": epoch + 1,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "config": cfg,
+            },
+            os.path.join(output_dir, "latest.pth"),
+        )
+        if val_stats is not None:
             if val_stats["psnr"] > best_psnr:
                 best_psnr = val_stats["psnr"]
                 save_checkpoint(
