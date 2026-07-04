@@ -5,7 +5,7 @@ import torch
 import yaml
 from torch.cuda.amp import GradScaler, autocast
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+
 from torch.utils.data import DataLoader, Subset
 
 try:
@@ -232,7 +232,7 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
 
 
 @torch.no_grad()
-def validate(model, loader, device, tile_size, tile_overlap, use_amp, val_crop_size=None):
+def validate(model, loader, device, tile_size, tile_overlap, use_amp, val_crop_size=None, phase='phase2'):
     model.eval()
     psnr_meter = AverageMeter()
     ssim_meter = AverageMeter()
@@ -254,6 +254,7 @@ def validate(model, loader, device, tile_size, tile_overlap, use_amp, val_crop_s
             tile_size=tile_size,
             tile_overlap=tile_overlap,
             use_amp=use_amp,
+            phase=phase,
         )
         loss = torch.mean(torch.abs(pred - target))
         psnr_meter.update(tensor_psnr(pred, target), clip.size(0))
@@ -335,11 +336,6 @@ def main():
                 optimizer.load_state_dict(ckpt["optimizer"])
             except Exception:
                 logger.warning("Optimizer state load failed, starting fresh optimizer")
-        if "scheduler" in ckpt:
-            try:
-                scheduler.load_state_dict(ckpt["scheduler"])
-            except Exception:
-                logger.warning("Scheduler state load failed, starting fresh scheduler")
         start_epoch = ckpt["epoch"]
         best_psnr = ckpt.get("best_psnr", -1.0)
         logger.info("Resumed from %s (epoch %d, best_psnr=%.4f)", args.resume, start_epoch, best_psnr)
@@ -412,6 +408,7 @@ def main():
                 tile_overlap=cfg["eval"]["tile_overlap"],
                 use_amp=cfg["eval"]["amp"] and device.type == "cuda",
                 val_crop_size=cfg["dataset"].get("val_crop_size", None),
+                phase=phase,
             )
             logger.info("Val stats: %s", val_stats)
             save_checkpoint(
@@ -419,7 +416,6 @@ def main():
                     "epoch": epoch + 1,
                     "model": model.state_dict(),
                     "optimizer": optimizer.state_dict(),
-                    "scheduler": scheduler.state_dict(),
                     "config": cfg,
                 },
                 os.path.join(output_dir, "latest.pth"),
@@ -431,7 +427,6 @@ def main():
                         "epoch": epoch + 1,
                         "model": model.state_dict(),
                         "optimizer": optimizer.state_dict(),
-                        "scheduler": scheduler.state_dict(),
                         "config": cfg,
                         "best_psnr": best_psnr,
                     },
