@@ -1,9 +1,9 @@
-# TSD-Net (TFS-Net v6 Delta Mark3) 模型架构设计文档
+# TFS-Net v6 Delta Mark4 模型架构设计文档
 
-> 日期：2026-07-03 (更新: TSDR 理论框架 + Mark3 两阶段渐进训练)
-> 版本：v6 Delta Mark3 / **TSDR Framework**
-> 训练配置：`configs/v6_bravo.yaml`，batch=1 (grad_accum=3), lr=8e-4, epochs=50, warmup=5
-> 参数量：1.688M
+> 日期：2026-07-06 (更新: Mark4 三部保险 + TFDE/ISPN 简化)
+> 版本：v6 Delta Mark4
+> 训练配置：`configs/v6_bravo.yaml`，batch=4, lr=8e-4, epochs=50, warmup=5
+> 参数量：1.45M
 
 ---
 
@@ -14,13 +14,13 @@ TSD-Net (Tri-Source Decoupled Network) 是一个端到端多帧低光视频增�
 | 模块 | 缩写 | 功能 |
 |------|------|------|
 | **SWD** | Spatial Wavelet Diverter | Haar DWT 子带级分流 (LL→光照/噪声, HF→结构) |
-| **TFDE** | Temporal-Frequency Degradation Estimator | 时频退化估计 → s_illum, s_noise |
+| **TFDE_v2** | Temporal Feature Degradation Estimator | 时域统计 + 多尺度空洞卷积 → s_illum, s_noise (Mark4 简化) |
 | **TCA** | Temporal Correspondence & Alignment | 4方向空间 WKV 扫描 + C_omega 时序矩阵 |
-| **ISPN** | Illumination-Source Processing Network | 光照图估计 + A_illu 生成 |
-| **NDPN** | Noise Degradation Processing Network | C_omega 置信度引导去噪 |
-| **MCPN** | Motion Compensation Processing Network | C_omega 运动强度补偿 |
+| **ISPN_v2** | Illumination-Source Processing Network | Retinex gain/bias 头 → gain_map, bias_map (Mark4 简化) |
+| **NDPN** | Noise Degradation Processing Network | C_omega 置信度引导去噪 (γ=0, noise_proj=0 → pass-through init) |
+| **MCPN** | Motion Compensation Processing Network | C_omega 运动强度补偿 (Mark4: gamma=0, refine=0, startup_gate=1 → pass-through init) |
 | **CXG** | Cross-eXcitation Gate | 去噪↔运动 交叉激励门 (deploy 重参数化) |
-| **SGRF** | Stage-wise Guided Restoration & Fusion | S1:去噪 → S2:去模糊 → S3:提亮 |
+| **SGRF** | Stage-wise Guided Restoration & Fusion | S1:去噪 → S2:去模糊 → S3:gain×img+bias (Mark4: zero-gate StageBlock) |
 
 ### 命名变更总表
 
@@ -34,7 +34,7 @@ TSD-Net (Tri-Source Decoupled Network) 是一个端到端多帧低光视频增�
 | IGRF | **SGRF** | 阶段式引导修复融合 |
 | CrossFusionGate | **CXG** | 交叉激励门 |
 
-### 完整数据流
+### 完整数据流 (Mark4)
 
 ```
 输入: I_{t-2}, I_{t-1}, I_t, I_{t+1}, I_{t+2}  (T=5 窗口)
@@ -43,21 +43,21 @@ TSD-Net (Tri-Source Decoupled Network) 是一个端到端多帧低光视频增�
   │
   ├─→ SWD (逐帧 HaarDWT) → F_tfde (B,T,C,H/2), F_tca (B,T,C,H/2)
   │
-  ├─→ TFDE(F_tfde) → s_illum, s_noise (↑H×W)
-  │     s_illum → ISPN   s_noise → NDPN
+  ├─→ TFDE_v2(F_tfde) → s_illum, s_noise
+  │     s_illum → ISPN_v2   s_noise → NDPN
   │
   ├─→ TCA(F_tca) → {F_{t'}^{\text{out}}}_{t'=0}^{T-1}, C_{t,Ω}, \hat{F}_t, μ, σ
   │
-  ├─→ ISPN({F^{\text{out}}}, s_illum, \hat{F}_t) → lit_up_map_raw, f_illum_feat, A_illu
+  ├─→ ISPN_v2(f_enc, s_illum) → gain_map, bias_map
   ├─→ NDPN({F^{\text{out}}}, s_noise, μ, σ, C_{t,Ω}, \hat{F}_t) → f_noise_out
   ├─→ MCPN({F^{\text{out}}}, σ, C_{t,Ω}, \hat{F}_t) → f_motion_out
   │
   ├─→ CXG(f_noise_out, f_motion_out) → f_noise_gated, f_motion_gated
   │
-  └─→ SGRF(f_illum, f_noise_gated, f_motion_gated, lit_up_map, I_t, A_illu)
-        S1: I_1 = denoise(f_noise_gated, I_t)
-        S2: I_2 = motion(f_motion_gated, I_1)
-        S3: \hat{X}_t = clamp(I_2 × lit_up_map × (1+A_illu))
+  └─→ SGRF(gain, bias, f_noise_gated, f_motion_gated, I_t)
+        S1: I_1 = I_t + StageBlock_1(f_noise_gated, gate=0)
+        S2: I_2 = I_1 + StageBlock_2(f_motion_gated, gate=0)
+        S3: \hat{X}_t = clamp(I_2 × gain + bias, 0, 1)
 ```
 
 ---
@@ -189,24 +189,28 @@ $$HF_{\text{tfde}} = g_n \odot [LH, HL, HH], \quad HF_{\text{tca}} = \text{LN}\l
 $$F_{\text{tfde}} = \text{LN}\left(\text{Conv}_{1\times1}([LL_{\text{tfde}}, HF_{\text{tfde}}])\right) \in \mathbb{R}^{B\times C\times H/2\times W/2}$$
 $$F_{\text{tca}} = \text{LN}\left(\text{Conv}_{1\times1}([LL_{\text{tca}}, HF_{\text{tca}}])\right) \in \mathbb{R}^{B\times C\times H/2\times W/2}$$
 
-### 2.4 ISPN — 光照源处理
+### 2.4 ISPN_v2 — 光照源处理 (Mark4 简化)
 
-ISPN 接收 $\{F_{t'}^{\text{out}}\}_{t'=0}^{T-1}$、$s_{\text{illu}}$ 和 $\hat{F}_t$，输出三路信号：
+ISPN_v2 接收编码器中心帧特征 $F_t^{\text{enc}}$ 和 TFDE 的光照先验 $s_{\text{illum}}$，输出 Retinex 风格的增益-偏置对。移除 Mark3 的多帧 cosine attention 和 L_ratio 锚定逻辑。
 
-**像素增亮增益**：
-$$\text{lit\_up\_map} = 1 + b_{\text{max}} \cdot \sigma\left(L_{\text{ratio}} + \delta(\text{f\_illum\_feat})\right) \in [1, 1+b_{\text{max}}]$$
+**Retinex 物理模型**：
+$$\hat{X}_t = I_t \cdot G + B$$
 
-其中 $L_{\text{ratio}} = L_{\text{ref}} / (L_t + \epsilon)$ 为 Retinex 光照比。
+其中：
+- $G$ (gain_map): 乘法提亮，≈ $1/L_{\text{estimated}}$, 补偿光照不足
+- $B$ (bias_map): 加法修正，补偿暗电流、色偏等系统偏差
 
-**空间光照注意力** (从 $f_{\text{illum\_feat}}$ 生成)：
-$$A_{\text{illu}} = \sigma\left(\text{DWConv}_{3\times3} \to \text{Conv}_{1\times1} \to \sigma\right)(\text{f\_illum\_feat}) \in [0,1]^{1\times H\times W}$$
+**网络结构**：
+$$h = \text{Conv}_{3\times3} \to \text{GELU} \to \text{Conv}_{3\times3}([F_t^{\text{enc}}, s_{\text{illum}}])$$
 
-$A_{\text{illu}} \uparrow$ → 暗区提亮放大；$A_{\text{illu}} \downarrow$ → 亮区过曝抑制。
+$$\log G = \text{Conv}_{1\times1} \to \text{GELU} \to \text{Conv}_{1\times1}(h), \quad G = \exp(\log G) \cdot \text{clamp}(1, G_{\text{max}})$$
 
-**时序锚定** (抑制帧间光照闪烁)：
-$$\text{f\_illum\_feat} := \text{f\_illum\_feat} + \tanh(g) \cdot \text{illu\_anchor}([\text{f\_illum\_feat}, \hat{F}_t])$$
+$$B = \tanh\left(\text{Conv}_{1\times1} \to \text{GELU} \to \text{Conv}_{1\times1}(h)\right) \cdot B_{\text{range}}$$
 
-其中 $g$ 零初始化 → 初始行为不变，逐步学习。
+**零初始化策略**：
+- `gain_head[-1]` (weight, bias) = 0 → $\log G = 0$ → $G = \exp(0) = 1$ (恒等)
+- `bias_head[-1]` (weight, bias) = 0 → $B = 0$ (无偏置)
+- Phase 1 初始行为：增强图像 = 原图 (不改变亮度)，渐进学习提亮
 
 ### 2.5 NDPN — 噪声退化处理 (对应 $\sigma^2_{\text{img}}$)
 
@@ -246,25 +250,68 @@ $$\mathbf{f}_{\text{noise}}^{\text{out}} = \mathbf{f}_{\text{noise}} \odot \begi
 
 $$\mathbf{f}_{\text{motion}}^{\text{out}} = \mathbf{f}_{\text{motion}} \odot \begin{cases} \sigma(\text{SE}(\mathbf{f}_{\text{noise}})) & \text{train} \\ \bar{g}_m & \text{infer (deploy)} \end{cases}$$
 
-### 2.8 SGRF — 阶段式修复融合
+### 2.8 SGRF — 阶段式修复融合 (Mark4)
 
-SGRF 的三阶段顺序由 §2.1 的物理推导确定：先去噪（抑制 $\Delta^{\text{img}}$）、再去模糊（修正 $\Delta^{\text{dyn}}$）、最后提亮（补偿 $\ell_t^{-1}$），避免先提亮导致的噪声爆炸。
+SGRF 的三阶段顺序由 §2.1 的物理推导确定。Mark4 将 Stage3 替换为 gain/bias 公式，StageBlock 增加 zero-gate 以保证 Phase 2 无扰动启动。
 
-**三阶段顺序修正** (Denoise → Deblur → Brighten)：
+**Zero-gate StageBlock**：
+$$\delta = \text{ConvBlock}([f_{\text{branch}}, \text{proj}(I_{\text{current}})]) \cdot \gamma_{\text{gate}}, \quad \gamma_{\text{gate}} \xrightarrow{\text{init}} 0$$
 
-$$\text{S1 (去噪): } \quad I_1 = \text{clamp}\left(I_t + \delta_1(\mathbf{f}_{\text{noise}}^{\text{out}}), 0, 1\right)$$
+gate=0 → $\delta = 0$ → 主路径不受扰动（Phase 1 安全）。gate 可学习上升，等价于 LoRA B=0 初始化策略。
 
-$$\text{S2 (去模糊): } \quad I_2 = \text{clamp}\left(I_1 + \delta_2(\mathbf{f}_{\text{motion}}^{\text{out}}), 0, 1\right)$$
+**三阶段公式 (Denoise → Deblur → Brighten)**：
 
-$$\text{S3 (提亮): } \quad \hat{X}_t = \text{clamp}\left((I_2 + \varepsilon) \odot \text{lit\_up\_map} \odot (1+A_{\text{illu}}), 0, 1\right)$$
+$$\text{S1 (去噪): } \quad I_1 = \text{clamp}\left(I_t + \delta_1(\mathbf{f}_{\text{noise}}^{\text{out}}) \cdot \gamma_1, 0, 1\right)$$
 
-其中 $\delta_1,\delta_2$ 为 ResBlock 残差模块，$\varepsilon=0.01$ 为防止暗区梯度消失的偏置。
+$$\text{S2 (去模糊): } \quad I_2 = \text{clamp}\left(I_1 + \delta_2(\mathbf{f}_{\text{motion}}^{\text{out}}) \cdot \gamma_2, 0, 1\right)$$
+
+$$\text{S3 (提亮): } \quad \hat{X}_t = \text{clamp}\left(I_2 \odot G + B + \delta_3(I_2G+B) \cdot \gamma_3, 0, 1\right)$$
+
+其中 $\gamma_1 = \gamma_2 = \gamma_3 = 0$ (初始) → Phase 1 完全等效于纯 ISPN_v2 提亮。$\gamma_i$ 在 Phase 1.5/2 渐进释放。
 
 ---
 
 ## 3. 核心模块详解
 
 ### 3.1 SWD — 空域小波分流器
+
+**文件**: `models/modules/swd.py`
+
+子带级分流（不做 inverse DWT），显式分离"光照+噪声"和"光照无关结构"。
+
+```
+Encoder feat → [HaarDWT] → LL, LH, HL, HH
+  ├─ alpha_net(LL) → α ∈ (0,1)
+  ├─ LL_tfde = α × LL          (光照估计信号)
+  ├─ LL_tca = IN((1-α) × LL)   (去光照, 保结构)
+  ├─ noise_gate(HF_energy) → n_gate ∈ (0,1)
+  ├─ HF_tfde = n_gate × HF_cat  (噪声相关高频)
+  ├─ HF_tca = LN((1-n_gate) × HF_cat)  (结构高频, 归一化)
+  └─ proj(4C→C)+LN → feat_tfde, feat_tca
+```
+
+### 3.2 TFDE_v2 — 时域退化估计器 (Mark4)
+
+**文件**: `models/modules/tfsi_v2.py`
+
+Mark4 移除 FrequencyBranch/LFF/phase_conf，用多尺度空洞卷积替代频域分析。
+
+```
+feat_tfde (B,T,C,H/2,W/2) from SWD
+  │
+  ├─ GroupNorm (逐帧)
+  ├─ 时域统计: soft-median(μ), var(σ), μ/σ(SNR) 沿 T 维
+  ├─ Concat [μ, σ, SNR] → (B, 3C, H/2, W/2)
+  │
+  ├─ MultiScaleSpatialBranch
+  │     ├─ 3×3 (d=1): 局部纹理 → mid ch
+  │     ├─ 3×3 (d=2): 中尺度光照 → mid ch
+  │     └─ 3×3 (d=4): 大尺度区域 → wide ch
+  │
+  └─ Conv(→2ch) → Sigmoid → s_illum[:,0:1], s_noise[:,1:2]
+```
+
+**简化收益**: 移除 LFFFeatureAdapter/SpatialDWTLFFAdapter/phase_conf_head 等模块；梯度路径缩短；参数量减少。
 
 **文件**: `models/modules/swd.py`
 
@@ -318,15 +365,15 @@ pre_norm LayerNorm 在 R/K/V 投影前
 |------|--------|
 | Encoder | ~320K |
 | SWD | ~25K |
-| TFDE | ~120K |
+| TFDE_v2 | ~50K |
 | TCA (MVCShift + WKV + Corr + Agg) | ~300K |
-| ISPN (含 s_illum_proj + illu_conv + illu_anchor) | ~160K |
+| ISPN_v2 | ~50K |
 | NDPN (含 conf_proj + noise_extract + denoise_strength) | ~85K |
 | MCPN (含 motion_estimator + comp_gate + motion_refine) | ~80K |
 | CXG | ~8K |
 | SGRF | ~120K |
-| 其他 | ~70K |
-| **总计** | **~1.69M** |
+| 其他 | ~10K |
+| **总计** | **~1.45M** |
 
 ---
 
@@ -339,11 +386,12 @@ pre_norm LayerNorm 在 R/K/V 投影前
 | v6 Delta | 空间扫描2D-WKV + C_omega + F_t_aligned | 1.64M | 训练崩溃 |
 | v6 Delta Mark1 | SWD子带分流 + 命名统一 + 数值稳定 | 1.69M | ep15 loss收敛 |
 | **v6 Delta Mark2** | **Kendall不确定性加权 + PE Loss + 感知解耦 + 损失调度** | **1.69M** | 收敛停滞 |
-| **v6 Delta Mark3** | **两阶段渐进训练 + ISPN 隔离 + SGRF 中间监督 + 相位调度** | **1.69M** | **训练中(ep1)** |
+| **v6 Delta Mark3** | **两阶段渐进训练 + ISPN 隔离 + SGRF 中间监督 + 相位调度** | **1.69M** | PSNR 18→8.7 |
+| **v6 Delta Mark4** | **三部保险 (zero-gate) + TFDE/ISPN 简化 + 延长的 Phase 1.5** | **1.45M** | **训练中(ep1)** |
 
 ---
 
-## 6. 损失函数设计 (Mark3)
+## 6. 损失函数设计 (Mark4)
 
 **文件**: `losses/losses.py` — `TFSNetLoss`
 
@@ -400,7 +448,7 @@ $$L_{\text{total}} = \sum_{i} \frac{1}{2\exp(s_i)} L_i + \frac{1}{2}s_i$$
 | Phase 1 Main | Phase1_Warmup + UW(align_warp + diag_prior, 'ifpn') |
 | Phase 2 | 完整损失 (perceptual_decoupling: SSIM→S1, VGG→S2, Charb→S3) |
 
-### 6.3 相位调度 (Mark3)
+### 6.3 相位调度 (Mark4)
 
 **核心理念**：先收敛无冲突的 ISPN 路径，再逐级解锁 NDPN/MCPN 分支，避免 Mark2 的梯度冲突导致收敛停滞。
 
@@ -408,14 +456,14 @@ $$L_{\text{total}} = \sum_{i} \frac{1}{2\exp(s_i)} L_i + \frac{1}{2}s_i$$
 |------|-------|------|-----------|-----|-----|
 | **Phase 1 Warmup** | 0–4 | pix + ssim + illum_smooth + lit_up_sup + swd_reg | **zero** (输出置零) | bypass | 8e-6→8e-4 |
 | **Phase 1 Main** | 5–19 | + align_warp + diag_prior | **zero** | bypass | 6e-4 |
-| **Phase 1.5** | 20–24 | = Phase 1 Main | 线性解锁 0→100% | ratio>0.3 时启用 | 6e-4→4e-4 |
-| **Phase 2** | 25–49 | 全损失 (感知解耦 + freq + 中间监督) | 100% | 启用 | 4e-4→1e-4 |
+| **Phase 1.5** | 20–29 | = Phase 1 Main | 线性解锁 0→100% | ratio>0.3 时启用 | 6e-4→4e-4 |
+| **Phase 2** | 30–49 | 全损失 (感知解耦 + freq + 中间监督) | 100% | 启用 | 4e-4→1e-4 |
 
 **关键设计决策**：
 
-1. **Phase 1 NDPN/MCPN 截断**：Mark2 分析显示 NDPN/MCPN 梯度与 ISPN 冲突导致收敛停滞（ep16-22 loss=0.62 平台期）。Phase 1 隔离 ISPN+SGRF 路径，避免噪声/运动分支污染早期光照学习。
+1. **Phase 1 NDPN/MCPN/SGRF 截断 (Mark4 三部保险)**：Mark3 仅截断 NDPN/MCPN，但 SGRF StageBlock 在 Phase 1 被训练为处理零输入。Phase 2 激活时，StageBlock 收到非零特征后产生任意输出 → PSNR 18→8.7。Mark4 增加三重零保证：NDPN (gamma=0, noise_proj=0) + MCPN (gamma=0, refine=0, startup_gate=1, out_scale=0) + SGRF StageBlock (gate=0)。任一层独立保底。
 
-2. **Phase 1.5 平滑解锁**：直接开关 NDPN/MCPN 会引入振荡。5 个 epoch 的 unlock_ratio 线性斜坡，`f_out = ratio * branch_out`，平滑过渡。
+2. **Phase 1.5 延长到 10 epoch (20→30)**：Mark3 的 5 epoch 斜坡不足以让 SGRF StageBlock 适应非零输入。延长到 10 epoch，配合 zero-gate 渐进释放，确保 Phase 2 启动平稳。
 
 3. **感知解耦** (Perceptual Decoupling)：Mark2 设计 B1 方案——SSIM 损失监督 SGRF-S1（去噪），VGG 感知损失监督 SGRF-S2（去模糊），Charbonnier 监督 S3 乘法路径。消除"同一输出接收 SSIM+感知 冲突梯度"问题。
 
@@ -425,14 +473,14 @@ $$L_{\text{total}} = \sum_{i} \frac{1}{2\exp(s_i)} L_i + \frac{1}{2}s_i$$
 
 ---
 
-## 7. 训练策略 (Mark3)
+## 7. 训练策略 (Mark4)
 
 ### 7.1 超参数
 
 | 参数 | 值 | 说明 |
 |------|-----|------|
-| batch_size | 1 | 物理 batch |
-| grad_accum_steps | **3** | 等效 batch=3 |
+| batch_size | 4 | 物理 batch |
+| grad_accum_steps | **1** | 等效 batch=4 |
 | epochs | 50 | — |
 | lr (Phase 1 Warmup) | 8e-6 → 8e-4 | 线性 warmup |
 | lr (Phase 1 Main) | 6e-4 | 固定 |
@@ -448,31 +496,27 @@ $$L_{\text{total}} = \sum_{i} \frac{1}{2\exp(s_i)} L_i + \frac{1}{2}s_i$$
 
 ```python
 def get_phase(epoch):
-    if epoch < 5:
-        return 'phase1_warmup'
-    elif epoch < 20:
-        return 'phase1'
-    elif epoch < 25:
-        return 'phase1_5'
-    else:
-        return 'phase2'
+    if epoch < 5:   return 'phase1_warmup'
+    elif epoch < 20: return 'phase1'
+    elif epoch < 30: return 'phase1_5'   # Mark4: 10-epoch unlock ramp
+    else:            return 'phase2'
 
 def get_unlock_ratio(epoch):
     if epoch < 20: return 0.0
-    if epoch >= 25: return 1.0
-    return (epoch - 20) / 5.0  # 线性 0→1
+    if epoch >= 30: return 1.0
+    return (epoch - 20) / 10.0  # 线性 0→1
 
 def get_lr(epoch, base_lr=8e-4):
     if epoch < 5:
-        return base_lr * (0.01 + 0.99 * epoch / 5)   # warmup
+        return base_lr * (0.01 + 0.99 * epoch / 5)
     elif epoch < 20:
-        return 0.75 * base_lr                           # 6e-4
-    elif epoch < 25:
-        ratio = (epoch - 20) / 5.0
-        return (0.75 * (1 - ratio) + 0.5 * ratio) * base_lr  # 6e-4→4e-4
+        return 0.75 * base_lr
+    elif epoch < 30:
+        ratio = (epoch - 20) / 10.0
+        return (0.75 * (1 - ratio) + 0.5 * ratio) * base_lr
     else:
-        progress = (epoch - 25) / 25.0
-        return 0.50 * base_lr * (0.5 + 0.5 * math.cos(math.pi * progress))  # 4e-4→1e-4
+        progress = (epoch - 30) / 20.0
+        return 0.50 * base_lr * (0.5 + 0.5 * math.cos(math.pi * progress))
 ```
 
 ### 7.3 Phase-Dependent Forward
@@ -531,8 +575,9 @@ grep "non-finite\|NaN" outputs/sdsd_delta/nohup.out
 |------|------|
 | `models/modules/swd.py` | SWD (SpatialWaveletDiverter, HaarDWT2D) |
 | `models/modules/pure_rwkv_sace.py` | TCA, BiWKV, SpatialWKV2D, MVCShift, TemporalCorrespondence, TemporalAggregation |
-| `models/modules/tfsi.py` | TFDE |
-| `models/modules/ifpn.py` | ISPN |
+| `models/modules/tfsi_v2.py` | TFDE_v2 (MultiScaleSpatialBranch) |
+| `models/modules/ispn_v2.py` | ISPN_v2 |
+| `models/modules/ifpn.py` | ISPN (legacy, Mark3) |
 | `models/modules/ndpn.py` | NDPN |
 | `models/modules/mrpn.py` | MCPN |
 | `models/modules/igrf.py` | SGRF |

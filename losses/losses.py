@@ -345,15 +345,15 @@ class TFSNetLoss(nn.Module):
             L_ssim = 1.0 - ssim_map(pred, target).mean()
             L_illum_smooth = self._edge_aware_smooth(s_illum, target)
 
-            # lit_up_map supervision
-            L_lit_up_sup = pred.new_tensor(0.0)
-            if "lit_up_map" in outputs and "image_center" in outputs:
+            # gain_map supervision (Mark4: replaces lit_up_map)
+            L_gain_sup = pred.new_tensor(0.0)
+            if "gain_map" in outputs and "image_center" in outputs:
                 img_c = outputs["image_center"]
                 gt_g = target.mean(dim=1, keepdim=True)
                 ic_g = img_c.mean(dim=1, keepdim=True)
-                lit_target = (gt_g / (ic_g + 1e-6)).clamp(1.0, 8.0)
-                lmap = outputs["lit_up_map"]
-                L_lit_up_sup = F.l1_loss(lmap, lit_target.expand_as(lmap))
+                gain_target = (gt_g / (ic_g + 1e-6)).clamp(1.0, 8.0)
+                gain_pred = outputs["gain_map"]
+                L_gain_sup = F.l1_loss(gain_pred, gain_target.expand_as(gain_pred))
 
             # SWD reg: keep alpha/gate near 0.5
             L_swd_reg = pred.new_tensor(0.0)
@@ -368,14 +368,14 @@ class TFSNetLoss(nn.Module):
 
             if self.uncertainty_weighting:
                 L = (self._uw(L_pix, 'pix') + self._uw(L_ssim, 'ssim')
-                   + self._uw(L_illum_smooth + 0.02 * L_lit_up_sup, 'illum')
+                   + self._uw(L_illum_smooth + 0.02 * L_gain_sup, 'illum')
                    + self._uw(L_align_warp + L_diag_prior, 'ifpn')
                    + 0.001 * L_swd_reg)
             else:
                 L = self.lambda_pix * L_pix + self.lambda_ssim * L_ssim + self.lambda_illum * L_illum_smooth
             losses.update({'loss_pix': L_pix.detach(), 'loss_ssim': L_ssim.detach(),
                           'loss_illum': L_illum_smooth.detach(), 'loss_perc': pred.new_tensor(0.0),
-                          'loss_freq': pred.new_tensor(0.0), 'loss_illum_sup': L_lit_up_sup.detach(),
+                          'loss_freq': pred.new_tensor(0.0), 'loss_illum_sup': L_gain_sup.detach(),
                           'loss_noise_sup': pred.new_tensor(0.0), 'loss_inter': pred.new_tensor(0.0),
                           'loss_ifpn_sup': L_diag_prior.detach(), 'loss_total': L.detach()})
             return L, losses
@@ -424,18 +424,16 @@ class TFSNetLoss(nn.Module):
         # s_noise supervision (disabled)
         L_noise_sup = pred.new_tensor(0.0)
 
-        # Intermediate supervision
+        # Intermediate supervision (Mark4: gain_map instead of lit_up_map)
         L_inter = pred.new_tensor(0.0)
-        if self.lambda_inter > 0 and "img_s2" in outputs and "lit_up_map" in outputs:
-            img_s2_lit = torch.clamp(outputs["img_s2"] * outputs["lit_up_map"], 0.0, 1.0)
+        if self.lambda_inter > 0 and "img_s2" in outputs and "gain_map" in outputs:
+            gain = F.interpolate(outputs["gain_map"], size=outputs["img_s2"].shape[-2:],
+                                  mode='bilinear', align_corners=False)
+            img_s2_lit = torch.clamp(outputs["img_s2"] * gain, 0.0, 1.0)
             L_inter = charbonnier_loss(img_s2_lit, target)
 
-        # ISPN side supervision
+        # ISPN side supervision (Mark4: removed — ISPN_v2 has no side head)
         L_ifpn_sup = pred.new_tensor(0.0)
-        if self.lambda_ifpn_sup > 0 and "ifpn_side" in outputs:
-            ifpn_side = outputs["ifpn_side"]
-            tgt_down = F.interpolate(target, size=ifpn_side.shape[-2:], mode='bilinear', align_corners=False)
-            L_ifpn_sup = charbonnier_loss(ifpn_side, tgt_down)
 
         # Mark2 warmup: pix+ssim only for first 5 epochs
         if self.warmup_loss_only_pix_ssim and epoch < 5:

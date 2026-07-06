@@ -21,10 +21,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.modules.encoder import PyramidEncoder
-from models.modules.tfsi import TFDE
+from models.modules.tfsi_v2 import TFDE_v2
 from models.modules.swd import SpatialWaveletDiverter
 from models.modules.pure_rwkv_sace import TCA
-from models.modules.ifpn import ISPN
+from models.modules.ispn_v2 import ISPN_v2
 from models.modules.ndpn import NDPN
 from models.modules.mrpn import MCPN
 from models.modules.igrf import SGRF
@@ -137,23 +137,20 @@ class TFSNet(nn.Module):
         )
 
         # Mark1: ISPN 输入投影 (encoder 特征 → 3ch 图像)
-        self.feat_to_img = nn.Conv2d(fused_channels, in_channels, 3, 1, 1)
-
         # Mark1: SWD 空域小波分流 (替代 DWT-LFF)
         self.swd = SpatialWaveletDiverter(channels=fused_channels, alpha_init=0.6)
 
-        # Stage 1: TFDE 时频退化估计
-        self.tfde = TFDE(
+        # Stage 1: TFDE 时频退化估计 (Mark4: simplified spatial-only)
+        self.tfde = TFDE_v2(
             channels=fused_channels, fused_channels=fused_channels, eps=eps,
             use_soft_median=use_soft_median,
         )
 
-        # Stage 2: TCA 时序对应对齐 (Mark1: 输入来自 SWD feat_tca, 已是 H/2)
+        # Stage 2: TCA 时序对应对齐
         self.tca = TCA(channels=fused_channels)
 
-        # Stage 3: 三源恢复分支
-        self.ispn = ISPN(fused_channels=fused_channels, coarse_channels=coarse_channels,
-                         img_channels=in_channels)
+        # Stage 3: 三源恢复分支 (Mark4: ISPN_v2 — gain/bias output)
+        self.ispn = ISPN_v2(channels=fused_channels, img_channels=in_channels)
         self.ndpn = NDPN(channels=fused_channels)
         self.mcpn = MCPN(channels=fused_channels)
 
@@ -219,24 +216,11 @@ class TFSNet(nn.Module):
 
         aligned_feats = torch.stack(F_aligned_list, dim=1)
 
-        # ISPN 输入投影: Encoder 特征 → 图像 (64→3)
-        h_c, w_c = H // 4, W // 4
-        image_down = F.interpolate(
-            self.feat_to_img(feats[:, center_idx]),
-            size=(h_c, w_c), mode='bilinear', align_corners=False
-        )
-        imgs_proj = self.feat_to_img(feats.reshape(B * T, -1, H, W))
-        imgs_down = F.interpolate(
-            imgs_proj, size=(h_c, w_c), mode='bilinear', align_corners=False
-        ).view(B, T, self.in_channels, h_c, w_c)
-        ispn_out = self.ispn(
-            I_t_down=image_down,
-            aligned_feats=aligned_feats,
-            center_idx=center_idx,
-            imgs_down=imgs_down,
-            s_illum=s_illum,
-            F_t_aligned=F_t_aligned,
-        )
+        f_enc_center = feats[:, center_idx]
+        ispn_out = self.ispn(f_enc_center, s_illum)
+        gain_map = ispn_out["gain_map"]
+        bias_map = ispn_out["bias_map"]
+        f_illum_feat = ispn_out["f_illum_feat"]
 
         # --- Mark3: Phase-dependent NDPN/MCPN/CXG ---
         phase = getattr(self, '_phase', 'phase2')
@@ -267,14 +251,13 @@ class TFSNet(nn.Module):
                 sigma_t_clean=sigma_t_clean, C_omega_list=C_omega_list, F_t_aligned=F_t_aligned)
             f_noise_gated, f_motion_gated = self.cxg(ndpn_out["f_noise_out"], mcpn_out["f_motion_out"])
 
-        # SGRF: 阶段式修复融合
+        # SGRF: 阶段式修复融合 (Mark4: gain/bias interface)
         sgrf_out = self.sgrf(
-            f_illum_feat=ispn_out["f_illum_feat"],
+            gain_map=gain_map,
+            bias_map=bias_map,
             f_noise_out=ndpn_out["f_noise_out"],
             f_motion_out=mcpn_out["f_motion_out"],
-            lit_up_map_raw=ispn_out["lit_up_map_raw"],
             image_center=image_center,
-            A_illu=ispn_out.get("A_illu"),
         )
 
         return {
@@ -282,25 +265,20 @@ class TFSNet(nn.Module):
             "img_s1":         sgrf_out["img_s1"],
             "img_s2":         sgrf_out["img_s2"],
             "lit_up_map":     sgrf_out["lit_up_map"],
+            "gain_map":       gain_map,
+            "bias_map":       bias_map,
             "image_center":   image_center,
             "s_illum":        s_illum,
             "s_noise":        s_noise,
-            "f_illum_feat":   ispn_out["f_illum_feat"],
-            "A_illu":         ispn_out.get("A_illu"),
+            "f_illum_feat":   f_illum_feat,
             "f_noise_out":    ndpn_out["f_noise_out"],
             "f_motion_out":   mcpn_out["f_motion_out"],
-            "L_t":            ispn_out["L_t"],
-            "L_ref":          ispn_out["L_ref"],
-            "L_ratio":        ispn_out["L_ratio"],
-            "ifpn_side":      ispn_out.get("ifpn_side"),
             "mu_t_clean":     mu_t_clean,
             "s_snr":          ndpn_out["s_snr"],
             "motion_weights": mcpn_out["G_t"],
-            "lit_up_map":     ispn_out["lit_up_map_raw"],
-            "C_omega":        C_omega_list,    # Mark3: Phase 1 对齐
-            "F_out_list":     F_aligned_list,  # Mark3: 逐帧特征
-            "F_hat":          F_t_aligned,     # Mark3: 对齐中心帧
+            "C_omega":        C_omega_list,
+            "F_out_list":     F_aligned_list,
+            "F_hat":          F_t_aligned,
             "tfde_out":       tfde_out,
             "phase":          phase,
-            "A_illu":         ispn_out.get("A_illu"),
         }

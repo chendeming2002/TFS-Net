@@ -43,12 +43,10 @@ def _make_res_blocks(channels: int, n: int, use_nafblock: bool = False):
 
 
 class StageBlock(nn.Module):
-    """Single-stage restoration block: branch feature + current image + optional intensity -> delta -> restored image
+    """Single-stage restoration block with zero-gate (Mark4).
 
-    v5.5: When use_intensity=True, s_intensity (s_noise) is injected as additive correction
-    to delta via intensity_corr (Conv2d 1->img_channels, zero-initialized).
-    v5.6 P0-4: use_soft_clamp controls whether intermediate stages use soft clamp (default True).
-    v5.6 P1-7: use_nafblock controls whether to use NAFBlock instead of ResBlock in fuse.
+    gate starts at 0 → StageBlock(any_input) ≈ 0 → no perturbation to main path.
+    Physically: equivalent to LoRA B=0 initialization — new branch starts silently.
     """
 
     def __init__(self, channels: int, img_channels: int = 3, use_intensity: bool = False,
@@ -65,8 +63,9 @@ class StageBlock(nn.Module):
             *[Block(channels) for _ in range(num_res_blocks)],
             nn.Conv2d(channels, img_channels, 3, 1, 1),
         )
+        # Mark4: zero-gate — starts at 0, progressive release
+        self.gate = nn.Parameter(torch.zeros(1))
         if use_intensity:
-            # v5.5: s_noise direct injection — zero-init so initial delta unchanged
             self.intensity_corr = nn.Conv2d(1, img_channels, kernel_size=3, padding=1, bias=True)
             nn.init.zeros_(self.intensity_corr.weight)
             nn.init.zeros_(self.intensity_corr.bias)
@@ -75,11 +74,9 @@ class StageBlock(nn.Module):
                 s_intensity: torch.Tensor = None):
         img_feat = self.img_proj(img_current)
         combined = torch.cat([f_branch, img_feat], dim=1)
-        delta = self.fuse(combined)
-        # v5.5: additive intensity correction (zero-init -> initial behavior unchanged)
+        delta = self.fuse(combined) * self.gate
         if self.use_intensity and s_intensity is not None:
             delta = delta + self.intensity_corr(s_intensity)
-        # v5.6 P0-4: soft clamp for intermediate stages (gradient non-zero in dark/bright regions)
         if self.use_soft_clamp:
             img_next = soft_clamp(img_current + delta)
         else:
@@ -88,68 +85,43 @@ class StageBlock(nn.Module):
 
 
 class BrightenStage(nn.Module):
-    """
-    Hybrid brightening stage (v5.5, restored from v5.7 gating experiment).
+    """Mark4: Retinex-style brightening — img_enhanced = img × gain + bias.
 
-    v5.7 gating (lit_up_map = 1 + s_illum * (lit_up_map_full - 1)) solved s_illum collapse
-    but reduced PSNR by 0.6 dB (constrains per-channel freedom). Reverted to v5.5 additive.
-
-    Multiplicative base (Retinex):
-        lit_up_map = lit_up_map_raw * (1 + tanh(delta) * max_delta)
-        brighten_base = img_dark * lit_up_map
-
-    Additive s_illum correction:
-        corr_mag = illum_corr(f_illum_feat)           # 64->3, zero-init
-        illum_residual = s_illum * corr_mag
-        res_t = clamp(brighten_base + illum_residual, 0, 1)
+    No delta_refine, no A_illu modulation — ISPN_v2 outputs gain/bias directly.
     """
 
-    def __init__(self, channels: int, img_channels: int = 3, max_delta: float = 0.5,
+    def __init__(self, channels: int, img_channels: int = 3,
                  use_nafblock: bool = False):
         super().__init__()
-        self.max_delta = max_delta
-        self.feat_proj = nn.Conv2d(channels, img_channels, 3, 1, 1)
-        self.img_proj = nn.Conv2d(img_channels, img_channels, 3, 1, 1)
         Block = NAFBlock if use_nafblock else ResBlock
-        self.delta_refine = nn.Sequential(
-            nn.Conv2d(img_channels * 2, img_channels, 1, 1, 0),
-            nn.GELU(),
-            Block(img_channels),
+        self.final_refine = nn.Sequential(
             nn.Conv2d(img_channels, img_channels, 3, 1, 1),
         )
-        # Delta: unified_illu 已移除 — A_illu 改由 IFPN 生成并传入
+        nn.init.zeros_(self.final_refine[0].weight)
+        nn.init.zeros_(self.final_refine[0].bias)
+        self.refine_gate = nn.Parameter(torch.zeros(1))
 
-    def forward(self, lit_up_map_raw: torch.Tensor, f_illum_feat: torch.Tensor,
-                img_dark: torch.Tensor, A_illu: torch.Tensor = None):
-        """Delta: A_illu 由 IFPN 传入，不再内部生成"""
-        feat_cond = self.feat_proj(f_illum_feat)
-        img_cond = self.img_proj(img_dark)
-        delta = self.delta_refine(torch.cat([feat_cond, img_cond], dim=1))
-        lit_up_map = lit_up_map_raw * (1.0 + torch.tanh(delta) * self.max_delta)
-        lit_up_map = lit_up_map.clamp(min=0.5)
+    def forward(self, gain_map: torch.Tensor, bias_map: torch.Tensor,
+                img_dark: torch.Tensor) -> tuple:
+        gain = F.interpolate(gain_map, size=img_dark.shape[-2:],
+                              mode='bilinear', align_corners=False)
+        bias = F.interpolate(bias_map, size=img_dark.shape[-2:],
+                              mode='bilinear', align_corners=False)
 
-        if A_illu is not None:
-            A_resized = F.interpolate(A_illu, size=lit_up_map.shape[-2:],
-                                      mode='bilinear', align_corners=False)
-            lit_up_map = lit_up_map * (1.0 + A_resized)
-
-        # Mod1: img_s2 暗区加 bias 防梯度消失
-        res_t = torch.clamp((img_dark + 0.01) * lit_up_map, 0.0, 1.0)
-        return res_t, lit_up_map
+        img_bright = img_dark * gain + bias
+        img_bright = img_bright + self.final_refine(img_bright) * self.refine_gate
+        img_bright = torch.clamp(img_bright, 0.0, 1.0)
+        return img_bright, gain
 
 
 class SGRF(nn.Module):
-    """
-    IGRF v5.7 - Denoise -> Motion -> Brighten (sequential cascade)
+    """Mark4: Stage-wise Guided Restoration & Fusion.
 
-    Stage 1 (denoise):   img_s1 = clamp(img_center + delta_noise(f_noise, img, s_noise))
-                          s_noise 作为 additive correction 直接参与 delta
-    Stage 2 (motion):    img_s2 = clamp(img_s1 + delta_motion(f_motion, img_s1))
-    Stage 3 (brighten):  lit_up_map = 1 + s_illum * (lit_up_map_full - 1)   (v5.7 乘法门控)
-                          res_t = clamp(img_s2 * lit_up_map, 0, 1)
-                          s_illum 门控 lit_up_map: s_illum=0→无提亮, s_illum=1→完全提亮
-                          (NO .detach(): L_recon gradient flows through to NDPN/MRPN/IFPN)
-    v5.7: 移除加法修正路径, 改用乘法门控, 消除 s_illum 功能冗余
+    Stage 1 (Denoise):  img_s1 = img_center + StageBlock_1(f_noise_out, img_center)
+    Stage 2 (Deblur):   img_s2 = img_s1 + StageBlock_2(f_motion_out, img_s1)
+    Stage 3 (Brighten): res_t = img_s2 × gain_map + bias_map
+
+    StageBlock uses zero-gate: gate=0 at init → no perturbation to Phase 1 output.
     """
 
     def __init__(self, channels: int = 64, out_channels: int = 3, use_soft_clamp: bool = False,
@@ -158,36 +130,32 @@ class SGRF(nn.Module):
         self.channels = channels
         self.out_channels = out_channels
 
-        self.stage_noise = StageBlock(channels, out_channels, use_intensity=True,
-                                       use_soft_clamp=use_soft_clamp,
-                                       use_nafblock=use_nafblock,
-                                       num_res_blocks=num_res_blocks)
+        self.stage_noise = StageBlock(channels, out_channels, use_intensity=False,
+                                        use_soft_clamp=use_soft_clamp,
+                                        use_nafblock=use_nafblock,
+                                        num_res_blocks=num_res_blocks)
         self.stage_motion = StageBlock(channels, out_channels, use_intensity=False,
-                                       use_soft_clamp=use_soft_clamp,
-                                       use_nafblock=use_nafblock,
-                                       num_res_blocks=num_res_blocks)
+                                        use_soft_clamp=use_soft_clamp,
+                                        use_nafblock=use_nafblock,
+                                        num_res_blocks=num_res_blocks)
         self.brighten = BrightenStage(channels, out_channels,
-                                      use_nafblock=use_nafblock)    # hybrid brighten + s_illum (final hard clamp)
+                                       use_nafblock=use_nafblock)
 
     def forward(
         self,
-        f_illum_feat: torch.Tensor,
+        gain_map: torch.Tensor,
+        bias_map: torch.Tensor,
         f_noise_out: torch.Tensor,
         f_motion_out: torch.Tensor,
-        lit_up_map_raw: torch.Tensor,
         image_center: torch.Tensor,
-        A_illu: torch.Tensor = None,
     ) -> dict:
-        """Delta: A_illu 由 IFPN 生成传入；s_noise 已移除 (NDPN 专属)"""
-        img_s1, delta_s1 = self.stage_noise(f_noise_out, image_center, s_intensity=None)
-        img_s2, delta_s2 = self.stage_motion(f_motion_out, img_s1)
-        res_t, lit_up_map = self.brighten(lit_up_map_raw, f_illum_feat, img_s2, A_illu=A_illu)
+        img_s1, _ = self.stage_noise(f_noise_out, image_center)
+        img_s2, _ = self.stage_motion(f_motion_out, img_s1)
+        res_t, lit_up = self.brighten(gain_map, bias_map, img_s2)
 
         return {
             "res_t":       res_t,
             "img_s1":      img_s1,
             "img_s2":      img_s2,
-            "lit_up_map":  lit_up_map,
-            "delta_s1":    delta_s1,
-            "delta_s2":    delta_s2,
+            "lit_up_map":  lit_up,
         }
