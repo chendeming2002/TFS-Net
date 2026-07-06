@@ -235,7 +235,7 @@ class TemporalCorrespondence(nn.Module):
     def forward(self, center_feat: torch.Tensor,
                 neighbor_feats: torch.Tensor) -> list:
         B, C, H, W = center_feat.shape
-        ds = max(1, min(H, W) // 4)
+        ds = max(1, min(min(H, W) // 4, 96))  # cap N≤9216 → C_omega≤340MB, safe for 4K
         center_ds = F.adaptive_avg_pool2d(center_feat, (ds, ds))
         neighbor_ds = F.adaptive_avg_pool2d(
             neighbor_feats.reshape(-1, C, H, W), (ds, ds)

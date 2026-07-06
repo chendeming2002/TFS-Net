@@ -71,7 +71,24 @@ class MCPN(nn.Module):
             nn.Conv2d(channels, channels, 3, 1, 1),
         )
 
-        self.gamma = nn.Parameter(torch.ones(1, channels, 1, 1) * 0.1)
+        self.gamma = nn.Parameter(torch.zeros(1, channels, 1, 1))
+
+        # Mark3: smooth startup — bias g_t toward 1.0 (favor f_center)
+        #         and suppress outer residual at Phase 2 entry
+        self.startup_gate = nn.Parameter(torch.ones(1))
+        self.out_scale = nn.Parameter(torch.zeros(1, channels, 1, 1))
+
+        # Zero-init refine conv2 → pass-through at init
+        nn.init.zeros_(self.refine.conv2.weight)
+        nn.init.zeros_(self.refine.conv2.bias)
+
+    def reset_startup(self):
+        """Mark3: 从旧 checkpoint 续训时重置 MCPN 平滑启动参数"""
+        self.gamma.data.zero_()
+        self.startup_gate.data.fill_(1.0)
+        self.out_scale.data.zero_()
+        nn.init.zeros_(self.refine.conv2.weight)
+        nn.init.zeros_(self.refine.conv2.bias)
 
     def _aggregate_neighbors(self, f_t, f_omega):
         """窗口 dot-product 相关聚合相邻帧（不含中心帧）。"""
@@ -159,10 +176,15 @@ class MCPN(nn.Module):
         if motion_mag is not None:
             g_t = g_t * (1.0 - motion_mag) + motion_mag * 0.3
 
+        # Mark3: startup gate — bias toward f_center at Phase 2 entry
+        startup = self.startup_gate.clamp(0, 1)
+        g_t = g_t * (1 - startup) + startup
+
         # Delta: gamma-scaled motion refinement + gate fusion
         f_t_fuse = g_t * f_center + (1.0 - g_t) * f_omega_aligned \
                    + motion_delta * comp * self.gamma
-        hat_f_t = self.refine(f_t_fuse) + f_center
+        # Mark3: out_scale removes outer +f_center at startup (refine already has skip)
+        hat_f_t = self.refine(f_t_fuse) + f_center * self.out_scale
 
         return {
             "f_omega_aligned": f_omega_aligned,

@@ -287,18 +287,18 @@ def main():
     def get_phase(epoch):
         if epoch < 5:   return 'phase1_warmup'
         elif epoch < 20: return 'phase1'
-        elif epoch < 25: return 'phase1_5'
+        elif epoch < 30: return 'phase1_5'   # Mark3: extended 10-epoch unlock ramp
         else:            return 'phase2'
 
     def get_unlock_ratio(epoch):
         if epoch < 20: return 0.0
-        elif epoch < 25: return (epoch - 20) / 5.0
+        elif epoch < 30: return (epoch - 20) / 10.0   # 10-epoch linear ramp
         else: return 1.0
 
     def get_lr(epoch, base=cfg["train"]["lr"]):
         if epoch < 5: return base * (0.01 + 0.99 * epoch / 5)
         elif epoch < 20: return base * 0.75
-        elif epoch < 25: return base * 0.75 * (1 - (epoch - 20) / 5 * 0.33)
+        elif epoch < 30: return base * 0.75 * (1 - (epoch - 20) / 10 * 0.33)  # 6e-4→4e-4
         elif epoch < 45: return base * 0.5
         else: return base * 0.125
     scaler = GradScaler(enabled=cfg["train"]["amp"] and device.type == "cuda")
@@ -331,6 +331,10 @@ def main():
                     continue
             filtered[k] = v
         model.load_state_dict(filtered, strict=False)
+        # Mark3: reset MCPN startup params after loading old checkpoint
+        if hasattr(model, 'mcpn') and hasattr(model.mcpn, 'reset_startup'):
+            model.mcpn.reset_startup()
+            logger.info("MCPN startup params reset (gamma=0, startup_gate=1, out_scale=0, refine zero-init)")
         if "optimizer" in ckpt:
             try:
                 optimizer.load_state_dict(ckpt["optimizer"])
