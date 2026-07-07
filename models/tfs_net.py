@@ -21,10 +21,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.modules.encoder import PyramidEncoder
-from models.modules.tfsi_v2 import TFDE_v2
-from models.modules.swd import SpatialWaveletDiverter
+from models.modules.tfsi_v2 import DIE
+from models.modules.swd import WSD
 from models.modules.pure_rwkv_sace import TCA
-from models.modules.ispn_v2 import ISPN_v2
+from models.modules.ispn_v2 import ISPN
 from models.modules.ndpn import NDPN
 from models.modules.mrpn import MCPN
 from models.modules.igrf import SGRF
@@ -138,19 +138,16 @@ class TFSNet(nn.Module):
 
         # Mark1: ISPN 输入投影 (encoder 特征 → 3ch 图像)
         # Mark1: SWD 空域小波分流 (替代 DWT-LFF)
-        self.swd = SpatialWaveletDiverter(channels=fused_channels, alpha_init=0.6)
+        self.wsd = WSD(channels=fused_channels, alpha_init=0.6)
 
-        # Stage 1: TFDE 时频退化估计 (Mark4: simplified spatial-only)
-        self.tfde = TFDE_v2(
+        self.die = DIE(
             channels=fused_channels, fused_channels=fused_channels, eps=eps,
             use_soft_median=use_soft_median,
         )
 
-        # Stage 2: TCA 时序对应对齐
         self.tca = TCA(channels=fused_channels)
 
-        # Stage 3: 三源恢复分支 (Mark4: ISPN_v2 — gain/bias output)
-        self.ispn = ISPN_v2(channels=fused_channels, img_channels=in_channels)
+        self.ispn = ISPN(channels=fused_channels, img_channels=in_channels)
         self.ndpn = NDPN(channels=fused_channels)
         self.mcpn = MCPN(channels=fused_channels)
 
@@ -194,20 +191,19 @@ class TFSNet(nn.Module):
 
         # Stage 1: SWD 小波分流 (逐帧 → B*T,C,H,W → DWT → feat_tfde/feat_tca)
         feats_flat = feats.reshape(B * T, -1, H, W)
-        swd_out = self.swd(feats_flat)
-        feat_tfde = swd_out["feat_tfde"].reshape(B, T, -1, H // 2, W // 2)
-        feat_tca = swd_out["feat_tca"].reshape(B, T, -1, H // 2, W // 2)
+        wsd_out = self.wsd(feats_flat)
+        feat_tfde = wsd_out["feat_tfde"].reshape(B, T, -1, H // 2, W // 2)
+        feat_tca = wsd_out["feat_tca"].reshape(B, T, -1, H // 2, W // 2)
 
-        # Stage 2: TFDE 时频退化估计 → s_illum, s_noise (H/2 分辨率)
-        tfde_out = self.tfde(feat_tfde)
-        s_illum = tfde_out["s_illum"]
-        s_noise_orig = tfde_out["s_noise"]
+        die_out = self.die(feat_tfde)
+        s_illum = die_out["s_illum"]
+        s_noise_orig = die_out["s_noise"]
         # 上采样到 H×W (NDPN/ISPN 需要全分辨率)
         s_illum = F.interpolate(s_illum, size=(H, W), mode='bilinear', align_corners=False)
         s_noise = F.interpolate(s_noise_orig, size=(H, W), mode='bilinear', align_corners=False)
 
         # Stage 3: TCA 时序对应对齐
-        tca_out = self.tca(feat_tca, tfde_out)
+        tca_out = self.tca(feat_tca, die_out)
         F_aligned_list = [tca_out["tca_out"][:, t] for t in range(T)]
         C_omega_list = tca_out.get("C_omega_list", [])
         F_t_aligned = tca_out["F_t_aligned"]
@@ -279,6 +275,6 @@ class TFSNet(nn.Module):
             "C_omega":        C_omega_list,
             "F_out_list":     F_aligned_list,
             "F_hat":          F_t_aligned,
-            "tfde_out":       tfde_out,
+            "die_out":        die_out,
             "phase":          phase,
         }

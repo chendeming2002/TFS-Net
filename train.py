@@ -287,19 +287,19 @@ def main():
     def get_phase(epoch):
         if epoch < 5:   return 'phase1_warmup'
         elif epoch < 20: return 'phase1'
-        elif epoch < 30: return 'phase1_5'   # Mark3: extended 10-epoch unlock ramp
+        elif epoch < 40: return 'phase1_5'   # Mark4: extended 20-epoch unlock ramp
         else:            return 'phase2'
 
     def get_unlock_ratio(epoch):
         if epoch < 20: return 0.0
-        elif epoch < 30: return (epoch - 20) / 10.0   # 10-epoch linear ramp
+        elif epoch < 40: return (epoch - 20) / 20.0   # 20-epoch linear ramp
         else: return 1.0
 
     def get_lr(epoch, base=cfg["train"]["lr"]):
         if epoch < 5: return base * (0.01 + 0.99 * epoch / 5)
         elif epoch < 20: return base * 0.75
-        elif epoch < 30: return base * 0.75 * (1 - (epoch - 20) / 10 * 0.33)  # 6e-4→4e-4
-        elif epoch < 45: return base * 0.5
+        elif epoch < 40: return base * 0.75 * (1 - (epoch - 20) / 20 * 0.33)  # 6e-4→4e-4 over 20 epochs
+        elif epoch < 55: return base * 0.5
         else: return base * 0.125
     scaler = GradScaler(enabled=cfg["train"]["amp"] and device.type == "cuda")
     grad_clip = cfg["train"].get("grad_clip", 1.0)

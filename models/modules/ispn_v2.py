@@ -1,5 +1,5 @@
 """
-ISPN_v2 (Mark4) — Simplified Illumination-Source Processing Network.
+ISPN (Illumination-Source Processing Network) — Mark4 simplified Retinex head.
 
 Retinex-inspired: enhanced = input × gain + bias
 - gain_map: multiplicative brightening (≈ 1 / L_estimated)
@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class ISPN_v2(nn.Module):
+class ISPN(nn.Module):
     def __init__(self, channels: int = 64, img_channels: int = 3,
                  max_gain: float = 10.0, bias_range: float = 0.1):
         super().__init__()

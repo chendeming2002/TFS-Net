@@ -1,9 +1,6 @@
 """
-TFDE_v2 (Mark4) — Simplified Temporal-Frequency Degradation Estimator.
+DIE (Degradation Intensity Estimator) — Mark4 simplified TFDE.
 Replaces complex FrequencyBranch/LFF/phase_conf with multi-scale dilated convolutions.
-
-Design:
-    feats (B,T,C,H,W) → temporal statistics [μ,σ,SNR] → MultiScaleSpatialBranch → Head → s_illum, s_noise
 """
 import torch
 import torch.nn as nn
@@ -48,8 +45,8 @@ class MultiScaleSpatialBranch(nn.Module):
         return self.fuse(torch.cat([f_local, f_mid, f_wide], dim=1))
 
 
-class TFDE_v2(nn.Module):
-    """Simplified TFDE: pure spatial, no frequency branch.
+class DIE(nn.Module):
+    """DIE (Degradation Intensity Estimator): simplified TFDE — pure spatial.
 
     Args:
         channels: feature channels (default 64)

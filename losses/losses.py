@@ -355,22 +355,22 @@ class TFSNetLoss(nn.Module):
                 gain_pred = outputs["gain_map"]
                 L_gain_sup = F.l1_loss(gain_pred, gain_target.expand_as(gain_pred))
 
-            # SWD reg: keep alpha/gate near 0.5
-            L_swd_reg = pred.new_tensor(0.0)
-            if model is not None and hasattr(model, 'swd'):
-                swd = model.swd
+            # WSD reg: keep alpha/gate near 0.5
+            L_wsd_reg = pred.new_tensor(0.0)
+            if model is not None and hasattr(model, 'wsd'):
+                wsd = model.wsd
                 # alpha_net: DWConv→GELU→Conv1x1→Sigmoid, check Conv1x1 bias
                 try:
-                    alpha_bias = swd.alpha_net[2].bias.mean()
-                    swd._alpha_mean = alpha_bias.sigmoid()
-                    L_swd_reg = (swd._alpha_mean - 0.5)**2
+                    alpha_bias = wsd.alpha_net[2].bias.mean()
+                    wsd._alpha_mean = alpha_bias.sigmoid()
+                    L_wsd_reg = (wsd._alpha_mean - 0.5)**2
                 except: pass
 
             if self.uncertainty_weighting:
                 L = (self._uw(L_pix, 'pix') + self._uw(L_ssim, 'ssim')
                    + self._uw(L_illum_smooth + 0.02 * L_gain_sup, 'illum')
                    + self._uw(L_align_warp + L_diag_prior, 'ifpn')
-                   + 0.001 * L_swd_reg)
+                   + 0.001 * L_wsd_reg)
             else:
                 L = self.lambda_pix * L_pix + self.lambda_ssim * L_ssim + self.lambda_illum * L_illum_smooth
             losses.update({'loss_pix': L_pix.detach(), 'loss_ssim': L_ssim.detach(),

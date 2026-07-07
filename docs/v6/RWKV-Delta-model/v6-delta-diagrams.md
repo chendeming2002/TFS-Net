@@ -10,11 +10,11 @@ flowchart TD
 
     subgraph 编码分流["编码 + 小波分流"]
         ENC["Encoder<br/>3级金字塔编码 → F_stack"]
-        SWD["SWD 空域小波分流器<br/>HaarDWT → alpha(LL) + noise_gate(HF)<br/>→ feat_tfde (光照+噪声) H/2<br/>→ feat_tca (光照无关+结构) H/2"]
+        SWD["WSD 基于小波的源分流器<br/>HaarDWT → alpha(LL) + noise_gate(HF)<br/>→ feat_tfde (光照+噪声) H/2<br/>→ feat_tca (光照无关+结构) H/2"]
     end
 
     subgraph 诊断["退化估计 (Mark4: 纯空域多尺度)"]
-        TFDE["TFDE_v2<br/>多尺度空洞卷积 (d=1,2,4)<br/>时域统计 [μ,σ,SNR] → s_illum + s_noise"]
+        TFDE["DIE<br/>多尺度空洞卷积 (d=1,2,4)<br/>时域统计 [μ,σ,SNR] → s_illum + s_noise"]
     end
 
     subgraph 对齐["时序对应对齐"]
@@ -22,7 +22,7 @@ flowchart TD
     end
 
     subgraph 处理层["三源退化并行建模<br/>Phase 1: NDPN/MCPN 截断=0"]
-        ISPN["ISPN_v2 光照源处理<br/>f_enc + s_illum → gain + bias<br/>gain=exp(log_gain)∈[1,max], bias=tanh·range"]
+        ISPN["ISPN 光照源处理<br/>f_enc + s_illum → gain + bias<br/>gain=exp(log_gain)∈[1,max], bias=tanh·range"]
         NDPN["NDPN 噪声处理 (Phase 1 = zero)"]
         MCPN["MCPN 运动补偿 (Phase 1 = zero)<br/>Mark4: gamma=0, refine=0, startup_gate=1"]
     end
@@ -59,9 +59,9 @@ flowchart TD
 
 ### 框架要点
 
-- **SWD 子带分流**：HaarDWT 在子带级分离 LL→光照/噪声 (TFDE), HF→结构 (TCA)。alpha_net(LL) 可学习 α ∈ (0,1) 分配 LL 子带, noise_gate(HF_energy) 门控 HF 子带。输出 LayerNorm。
-- **TFDE_v2 (Mark4 简化)**：移除 FrequencyBranch/LFF/phase_conf，用多尺度空洞卷积 (d=1,2,4) 提取时域统计量 [μ,σ,SNR] 的空域特征。梯度路径从 `feats→LFF→DWT→phase→s_noise` 简化为 `feats→统计量→Conv→head`。
-- **ISPN_v2 (Mark4 简化)**：移除多帧 cosine attention + L_ratio 锚定，直接用 `f_enc + s_illum` 生成 gain_map (乘法提亮) + bias_map (加法修正)。零初始化 → gain≈1, bias≈0 → Phase 1 友好。
+- **WSD 子带分流**：HaarDWT 在子带级分离 LL→光照/噪声 (TFDE), HF→结构 (TCA)。alpha_net(LL) 可学习 α ∈ (0,1) 分配 LL 子带, noise_gate(HF_energy) 门控 HF 子带。输出 LayerNorm。
+- **DIE (Mark4 简化)**：移除 FrequencyBranch/LFF/phase_conf，用多尺度空洞卷积 (d=1,2,4) 提取时域统计量 [μ,σ,SNR] 的空域特征。梯度路径从 `feats→LFF→DWT→phase→s_noise` 简化为 `feats→统计量→Conv→head`。
+- **ISPN (Mark4 简化)**：移除多帧 cosine attention + L_ratio 锚定，直接用 `f_enc + s_illum` 生成 gain_map (乘法提亮) + bias_map (加法修正)。零初始化 → gain≈1, bias≈0 → Phase 1 友好。
 - **TCA 空间扫描**：输入 SWD 的 H/2 特征。MVC-Shift(3 dilated DWConv) → 4方向 Bi-WKV → Channel Mix → H 上采样。C_omega 行 softmax 归一化，L_diag_prior 自监督。
 - **三部保险 (Mark4)**：Phase 2 启动时 NDPN (gamma=0, noise_proj=0) + MCPN (gamma=0, refine=0, startup_gate=1, out_scale=0) + SGRF StageBlock (gate=0) — 任一层都能独立保证无扰动。
 
@@ -86,7 +86,7 @@ flowchart TD
         ENC["PyramidEncoder<br/>[32,64,96] → 64ch<br/>→ F_stack (B,T,64,H,W)"]
     end
 
-    subgraph SWD["SWD 空域小波分流器"]
+    subgraph SWD["WSD 基于小波的源分流器"]
         direction TB
         DWT["HaarDWT2D<br/>→ LL, LH, HL, HH (H/2×W/2)"]
         ALPHA["alpha_net(LL)<br/>DWConv3x3 → GELU → Conv1x1 → Sigmoid<br/>α ∈ (0,1) — 光照分配比"]
@@ -101,7 +101,7 @@ flowchart TD
         HF_DIV --> PROJ
     end
 
-    subgraph TFDE["TFDE_v2 退化估计器 (Mark4: 纯空域)"]
+    subgraph TFDE["DIE 退化估计器 (Mark4: 纯空域)"]
         direction TB
         TFDE_STATS["时域统计量<br/>GroupNorm → soft-median(μ), var(σ), μ/σ(SNR)<br/>→ concat[μ,σ,SNR] (B, 3C, H, W)"]
         TFDE_MS["MultiScaleSpatialBranch<br/>3×3(d=1): 局部纹理 → mid ch<br/>3×3(d=2): 中尺度光照 → mid ch<br/>3×3(d=4): 大尺度区域 → wide ch<br/>Concat + 1×1 fuse → F_fused"]
@@ -129,7 +129,7 @@ flowchart TD
         TCA_SPATIAL --> TCORR
     end
 
-    subgraph ISPN["ISPN_v2 光照源处理 (Mark4: Retinex gain/bias)"]
+    subgraph ISPN["ISPN 光照源处理 (Mark4: Retinex gain/bias)"]
         direction TB
         ISPN_REFINE["refine: Conv(f_enc + s_illum, 65→64)<br/>→ GELU → Conv(64→64) → GELU → h"]
         ISPN_GAIN["gain_head: Conv(64→16)→GELU→Conv(16→1)<br/>→ exp(log_gain) → clamp[1, max_gain]<br/>零初始化 → gain≈1 (恒等)"]

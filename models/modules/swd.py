@@ -57,8 +57,8 @@ class HaarDWT2D(nn.Module):
         return out
 
 
-class SpatialWaveletDiverter(nn.Module):
-    """SWD: 子带级分流，不做 inverse DWT (Mark1)
+class WSD(nn.Module):
+    """WSD (Wavelet-based Source Diverter): 子带级分流，不做 inverse DWT
 
     Args:
         channels: encoder 特征通道数
