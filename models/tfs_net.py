@@ -21,8 +21,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.modules.encoder import PyramidEncoder
-from models.modules.tfsi_v2 import DIE
-from models.modules.swd import WSD
+from models.modules.tfsi_v2 import DPE
+from models.modules.swd import WFR
 from models.modules.pure_rwkv_sace import TCA
 from models.modules.ispn_v2 import ISPN
 from models.modules.ndpn import NDPN
@@ -138,9 +138,9 @@ class TFSNet(nn.Module):
 
         # Mark1: ISPN 输入投影 (encoder 特征 → 3ch 图像)
         # Mark1: SWD 空域小波分流 (替代 DWT-LFF)
-        self.wsd = WSD(channels=fused_channels, alpha_init=0.6)
+        self.wfr = WFR(channels=fused_channels, alpha_init=0.6)
 
-        self.die = DIE(
+        self.dpe = DPE(
             channels=fused_channels, fused_channels=fused_channels, eps=eps,
             use_soft_median=use_soft_median,
         )
@@ -191,19 +191,19 @@ class TFSNet(nn.Module):
 
         # Stage 1: SWD 小波分流 (逐帧 → B*T,C,H,W → DWT → feat_tfde/feat_tca)
         feats_flat = feats.reshape(B * T, -1, H, W)
-        wsd_out = self.wsd(feats_flat)
-        feat_tfde = wsd_out["feat_tfde"].reshape(B, T, -1, H // 2, W // 2)
-        feat_tca = wsd_out["feat_tca"].reshape(B, T, -1, H // 2, W // 2)
+        wfr_out = self.wfr(feats_flat)
+        feat_tfde = wfr_out["feat_tfde"].reshape(B, T, -1, H // 2, W // 2)
+        feat_tca = wfr_out["feat_tca"].reshape(B, T, -1, H // 2, W // 2)
 
-        die_out = self.die(feat_tfde)
-        s_illum = die_out["s_illum"]
-        s_noise_orig = die_out["s_noise"]
+        dpe_out = self.dpe(feat_tfde)
+        s_illum = dpe_out["s_illum"]
+        s_noise_orig = dpe_out["s_noise"]
         # 上采样到 H×W (NDPN/ISPN 需要全分辨率)
         s_illum = F.interpolate(s_illum, size=(H, W), mode='bilinear', align_corners=False)
         s_noise = F.interpolate(s_noise_orig, size=(H, W), mode='bilinear', align_corners=False)
 
         # Stage 3: TCA 时序对应对齐
-        tca_out = self.tca(feat_tca, die_out)
+        tca_out = self.tca(feat_tca, dpe_out)
         F_aligned_list = [tca_out["tca_out"][:, t] for t in range(T)]
         C_omega_list = tca_out.get("C_omega_list", [])
         F_t_aligned = tca_out["F_t_aligned"]
@@ -275,6 +275,6 @@ class TFSNet(nn.Module):
             "C_omega":        C_omega_list,
             "F_out_list":     F_aligned_list,
             "F_hat":          F_t_aligned,
-            "die_out":        die_out,
+            "dpe_out":        dpe_out,
             "phase":          phase,
         }

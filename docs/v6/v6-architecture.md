@@ -13,8 +13,8 @@ TSD-Net (Tri-Source Decoupled Network) 是一个端到端多帧低光视频增�
 
 | 模块 | 缩写 | 功能 |
 |------|------|------|
-| **WSD** | Wavelet-based Source Diverter | Haar DWT 子带级分流 (LL→光照/噪声, HF→结构) |
-| **DIE** | Degradation Intensity Estimator | 时域统计 + 多尺度空洞卷积 → s_illum, s_noise (Mark4 简化) |
+| **WFR** | Wavelet Feature Router | Haar DWT 子带级分流 (LL→光照/噪声, HF→结构) |
+| **DPE** | Degradation Prior Estimator | 时域统计 + 多尺度空洞卷积 → s_illum, s_noise (Mark4 简化) |
 | **TCA** | Temporal Correspondence & Alignment | 4方向空间 WKV 扫描 + C_omega 时序矩阵 |
 | **ISPN** | Illumination-Source Processing Network | Retinex gain/bias 头 → gain_map, bias_map (Mark4 简化) |
 | **NDPN** | Noise Degradation Processing Network | C_omega 置信度引导去噪 (γ=0, noise_proj=0 → pass-through init) |
@@ -26,8 +26,8 @@ TSD-Net (Tri-Source Decoupled Network) 是一个端到端多帧低光视频增�
 
 | 原缩写 | 新缩写 | 中文全名 |
 |--------|--------|----------|
-| DWT-LFF | **WSD** | 基于小波的源分流器 |
-| TFSI | **DIE** | 退化强度估计器 |
+| DWT-LFF | **WFR** | 小波特征路由器 |
+| TFSI | **DPE** | 退化先验估计器 |
 | SACE | **TCA** | 时序对应对齐 |
 | IFPN | **ISPN** | 光照源处理网络 |
 | MRPN | **MCPN** | 运动补偿处理网络 |
@@ -41,9 +41,9 @@ TSD-Net (Tri-Source Decoupled Network) 是一个端到端多帧低光视频增�
   │
   ├─→ Encoder → F_{t-2}...F_{t+2}  (B, T, 64, H, W)
   │
-  ├─→ WSD (逐帧 HaarDWT) → F_tfde (B,T,C,H/2), F_tca (B,T,C,H/2)
+  ├─→ WFR (逐帧 HaarDWT) → F_tfde (B,T,C,H/2), F_tca (B,T,C,H/2)
   │
-  ├─→ DIE(F_tfde) → s_illum, s_noise
+  ├─→ DPE(F_tfde) → s_illum, s_noise
   │     s_illum → ISPN   s_noise → NDPN
   │
   ├─→ TCA(F_tca) → {F_{t'}^{\text{out}}}_{t'=0}^{T-1}, C_{t,Ω}, \hat{F}_t, μ, σ
@@ -160,7 +160,7 @@ $$\hat{F}_t = \text{LN}\left(F_t^{\text{out}} + \sum_{t' \in \Omega} w_{t'} \cdo
 
 其中 $w_{t'} = \text{frame\_gate}([F_t^{\text{out}}, C_{t,t'} \times F_{t'}^{\text{out}}])$ 为数据驱动的帧级可靠性权重。
 
-### 2.3 WSD — 空域小波分流
+### 2.3 WFR — 空域小波分流
 
 **动机**。旧 DWT-LFF 通过 IDWT 重建全分辨率特征，两条分支接收几乎相同的信息（仅 LL 略有差异），TFDE 的 IntensityHead 被全 HF 噪声压制（输入 norm 达 60~113），退化分离失效。
 
@@ -273,7 +273,7 @@ $$\text{S3 (提亮): } \quad \hat{X}_t = \text{clamp}\left(I_2 \odot G + B + \de
 
 ## 3. 核心模块详解
 
-### 3.1 WSD — 空域小波分流器
+### 3.1 WFR — 空域小波分流器
 
 **文件**: `models/modules/swd.py (legacy)`
 
@@ -290,7 +290,7 @@ Encoder feat → [HaarDWT] → LL, LH, HL, HH
   └─ proj(4C→C)+LN → feat_tfde, feat_tca
 ```
 
-### 3.2 DIE — 时域退化估计器 (Mark4)
+### 3.2 DPE — 时域退化估计器 (Mark4)
 
 **文件**: `models/modules/tfsi_v2.py`
 
@@ -354,7 +354,7 @@ pre_norm LayerNorm 在 R/K/V 投影前
 | BiWKV | chunk-wise cumsum (CHUNK=256) |
 | SpatialWKV2D | `pre_norm` LayerNorm 在 R/K/V 投影前 |
 | SpatialWKV2D | R/K/V RWKV-7 小初始化 |
-| WSD | `proj_tfde/proj_tca` 后 LayerNorm → norm≈1 |
+| WFR | `proj_tfde/proj_tca` 后 LayerNorm → norm≈1 |
 | Tau | `F.softplus(tau_raw) + 0.05` → 下界 0.05 |
 
 ---
@@ -364,8 +364,8 @@ pre_norm LayerNorm 在 R/K/V 投影前
 | 模块 | 参数量 |
 |------|--------|
 | Encoder | ~320K |
-| WSD | ~25K |
-| DIE | ~50K |
+| WFR | ~25K |
+| DPE | ~50K |
 | TCA (MVCShift + WKV + Corr + Agg) | ~300K |
 | ISPN | ~50K |
 | NDPN (含 conf_proj + noise_extract + denoise_strength) | ~85K |
@@ -428,7 +428,7 @@ $$L_{\text{total}} = \sum_{i} \frac{1}{2\exp(s_i)} L_i + \frac{1}{2}s_i$$
 | **L_align_warp** | L1(∑C·F_neighbor, F_center) | 时序 warp 一致性：用 C_omega 对齐邻帧特征，应与中心帧一致 |
 | **L_diag_prior** | −mean(log(diag(C_Ω)+ε)) | C_Ω 对角先验：鼓励静止区域对应 identity（无 GT 自监督） |
 | **L_illum_smooth** | TV(s_illum)·e^{−‖∇I‖} | 光照图边缘感知平滑 |
-| **L_swd_reg** | (ᾱ − 0.5)² | WSD 分流平衡正则：防 α 偏离中心 |
+| **L_swd_reg** | (ᾱ − 0.5)² | WFR 分流平衡正则：防 α 偏离中心 |
 
 #### Phase 2 专属 — 感知解耦 & 中间监督
 
@@ -563,7 +563,7 @@ grep "non-finite\|NaN" outputs/sdsd_delta/nohup.out
 | `ssim` 趋势 | 持续下降到 <0.40（即 SSIM>0.60） | 停滞在 >0.45 |
 | `lit_up_map` 值域 | 均值在 [2.0, 6.0] | <1.0 或 >10.0 |
 | `i_sup` | 下降到 <2.0 | >5.0 (lit_up 未激活) |
-| WSD α 均值 | 在 [0.3, 0.7] | <0.1 或 >0.9 |
+| WFR α 均值 | 在 [0.3, 0.7] | <0.1 或 >0.9 |
 | `diag_prior` | 从 ~4.0 下降到 <2.0 | 上升（C_Ω 退化） |
 | 梯度 norm | Encoder/ISPN/SGRF 同数量级 | 某模块爆炸或消失 |
 
@@ -575,7 +575,7 @@ grep "non-finite\|NaN" outputs/sdsd_delta/nohup.out
 |------|------|
 | `models/modules/swd.py (legacy)` | SWD (SpatialWaveletDiverter, HaarDWT2D) |
 | `models/modules/pure_rwkv_sace.py` | TCA, BiWKV, SpatialWKV2D, MVCShift, TemporalCorrespondence, TemporalAggregation |
-| `models/modules/tfsi_v2.py` | DIE (MultiScaleSpatialBranch) |
+| `models/modules/tfsi_v2.py` | DPE (MultiScaleSpatialBranch) |
 | `models/modules/ispn_v2.py` | ISPN |
 | `models/modules/ifpn.py` | ISPN (legacy, Mark3) |
 | `models/modules/ndpn.py` | NDPN |

@@ -9,7 +9,7 @@ from .reconstruction import FinalReconstruction
 
 # Mark4 模块
 from .tfsi import TFDE
-from .tfsi_v2 import DIE
+from .tfsi_v2 import DPE
 from .igrf import SGRF
 from .lff import RadialBasisFilter, LFFFeatureAdapter
 from .ifpn import ISPN as ISPN_legacy, IllumExtract
@@ -17,7 +17,7 @@ from .ispn_v2 import ISPN
 from .ndpn import NDPN
 from .mrpn import MCPN
 from .pure_rwkv_sace import TCA
-from .swd import WSD
+from .swd import WFR
 
 # v5.6 block
 from .blocks import ConvBlock, ResBlock, NAFBlock, LayerNorm2d
@@ -29,12 +29,12 @@ __all__ = [
     # v1
     "PyramidEncoder", "MINSBlock", "MSPN", "FinalReconstruction",
     # Mark4
-    "TFDE", "DIE", "SGRF",
+    "TFDE", "DPE", "SGRF",
     "RadialBasisFilter", "LFFFeatureAdapter",
     "TCA",
     "ISPN", "ISPN_legacy", "IllumExtract",
     "NDPN", "MCPN",
-    "WSD",
+    "WFR",
     # blocks
     "ConvBlock", "ResBlock", "NAFBlock", "LayerNorm2d",
     # v5.9

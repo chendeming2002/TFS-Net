@@ -1,5 +1,5 @@
 """
-DIE (Degradation Intensity Estimator) — Mark4 simplified TFDE.
+DPE (Degradation Prior Estimator) — Mark4 simplified TFDE.
 Replaces complex FrequencyBranch/LFF/phase_conf with multi-scale dilated convolutions.
 """
 import torch
@@ -45,8 +45,8 @@ class MultiScaleSpatialBranch(nn.Module):
         return self.fuse(torch.cat([f_local, f_mid, f_wide], dim=1))
 
 
-class DIE(nn.Module):
-    """DIE (Degradation Intensity Estimator): simplified TFDE — pure spatial.
+class DPE(nn.Module):
+    """DPE (Degradation Prior Estimator): simplified TFDE — pure spatial.
 
     Args:
         channels: feature channels (default 64)

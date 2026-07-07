@@ -298,9 +298,11 @@ def main():
     def get_lr(epoch, base=cfg["train"]["lr"]):
         if epoch < 5: return base * (0.01 + 0.99 * epoch / 5)
         elif epoch < 20: return base * 0.75
-        elif epoch < 40: return base * 0.75 * (1 - (epoch - 20) / 20 * 0.33)  # 6e-4→4e-4 over 20 epochs
+        elif epoch < 40: return base * 0.75 * (1 - (epoch - 20) / 20 * 0.33)
         elif epoch < 55: return base * 0.5
-        else: return base * 0.125
+        elif epoch < 70: return base * 0.125
+        elif epoch < 80: return base * 0.05
+        else: return base * 0.02
     scaler = GradScaler(enabled=cfg["train"]["amp"] and device.type == "cuda")
     grad_clip = cfg["train"].get("grad_clip", 1.0)
     grad_accum_steps = cfg["train"].get("grad_accum_steps", 1)
