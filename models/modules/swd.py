@@ -79,14 +79,8 @@ class WFR(nn.Module):
         )
         self.ll_tca_norm = nn.InstanceNorm2d(channels, affine=True)
 
-        # === 高频分流 ===
-        self.noise_gate = nn.Sequential(
-            nn.Conv2d(1, 16, 3, 1, 1),
-            nn.GELU(),
-            nn.Conv2d(16, 1, 1, 1, 0),
-            nn.Sigmoid(),
-        )
-        self.hf_tca_norm = LayerNorm2d(channels * 3)
+        # === 高频处理 (Flight3: 取消噪声门控, proj 层隐式分化) ===
+        # noise_gate 和 hf_tca_norm 已移除 — 两路共享完整 HF
 
         # === 输出投影 (子带→统一通道) ===
         self.proj_tfde = nn.Sequential(
@@ -127,22 +121,15 @@ class WFR(nn.Module):
         ll_tfde = alpha * LL
         ll_tca = self.ll_tca_norm((1 - alpha) * LL)
 
-        # --- 高频分流 ---
+        # --- 高频处理 (Flight3: 取消噪声门控, 两路共享完整 HF) ---
         hf_cat = torch.cat([LH, HL, HH], dim=1)
-        hf_energy = (LH.pow(2) + HL.pow(2) + HH.pow(2)).mean(dim=1, keepdim=True)
-        n_gate = self.noise_gate(hf_energy)
-        s_gate = 1.0 - n_gate
 
-        hf_tfde = n_gate * hf_cat
-        hf_tca = self.hf_tca_norm(s_gate * hf_cat)
-
-        # --- 投影到统一通道 ---
-        feat_tfde = self.proj_tfde(torch.cat([ll_tfde, hf_tfde], dim=1))
-        feat_tca = self.proj_tca(torch.cat([ll_tca, hf_tca], dim=1))
+        # 各自 proj 层 (独立权重) 隐式学到不同的 HF 关注模式
+        feat_tfde = self.proj_tfde(torch.cat([ll_tfde, hf_cat], dim=1))
+        feat_tca = self.proj_tca(torch.cat([ll_tca, hf_cat], dim=1))
 
         return {
             "feat_tfde": feat_tfde,
             "feat_tca": feat_tca,
             "alpha": alpha,
-            "noise_gate": n_gate,
         }

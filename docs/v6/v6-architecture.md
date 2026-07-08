@@ -1,8 +1,8 @@
-# TFS-Net v6 Delta Mark4 模型架构设计文档
+# TFS-Net v6 Delta Flight3 模型架构设计文档
 
-> 日期：2026-07-08 (更新: 损失重构 + ISPN初始化 + 相位调度延展)
-> 版本：v6 Delta Mark4
-> 训练配置：`configs/v6_bravo.yaml`，batch=4, lr=8e-4, epochs=90
+> 日期：2026-07-08 (更新: Flight3 — DPE反饱和 + softplus gain + WFR取消噪声门控 + max_gain调度)
+> 版本：v6 Delta Flight3
+> 训练配置：`configs/delta_flight3.yaml`，batch=4 (accum=2→eff=8), lr=8e-4, epochs=90
 > 参数量：1.45M
 
 ---
@@ -160,57 +160,53 @@ $$\hat{F}_t = \text{LN}\left(F_t^{\text{out}} + \sum_{t' \in \Omega} w_{t'} \cdo
 
 其中 $w_{t'} = \text{frame\_gate}([F_t^{\text{out}}, C_{t,t'} \times F_{t'}^{\text{out}}])$ 为数据驱动的帧级可靠性权重。
 
-### 2.3 WFR — 空域小波分流
+### 2.3 WFR — 空域小波分流 (Flight3: 取消 HF 噪声门控)
 
-**动机**。旧 DWT-LFF 通过 IDWT 重建全分辨率特征，两条分支接收几乎相同的信息（仅 LL 略有差异），TFDE 的 IntensityHead 被全 HF 噪声压制（输入 norm 达 60~113），退化分离失效。
+**动机**。旧 DWT-LFF 通过 IDWT 重建全分辨率特征，两条分支接收几乎相同的信息（仅 LL 略有差异），退化分离失效。
 
-**方法**。在 Haar DWT 子带级别直接分流，不做 IDWT 重建：
+**方法**。在 Haar DWT 子带级别直接分流。
+
+**LL 低频分流 (物理动机强，保留)**：
 
 $$F \xrightarrow{\text{HaarDWT}} \{LL, LH, HL, HH\}, \quad LL \in \mathbb{R}^{B\times C\times H/2\times W/2}$$
 
-**低频分流**。$LL$ 编码全局光照强度，由可学习 $\alpha$ 分配：
-
 $$\alpha = \sigma\left(\text{DWConv}_{3\times3} \to \text{GELU} \to \text{Conv}_{1\times1}\right)(LL)$$
 
-$$LL_{\text{tfde}} = \alpha \odot LL, \quad LL_{\text{tca}} = \text{IN}\left((1-\alpha) \odot LL\right)$$
+$$LL_{\text{DPE}} = \alpha \odot LL, \quad LL_{\text{TCA}} = \text{IN}\left((1-\alpha) \odot LL\right)$$
 
-其中 $\text{IN}$ 为 InstanceNorm——去除通道级光照偏置，保留空间结构。
+**HF 高频处理 (Flight3: 取消噪声门控)**。旧设计的 `noise_gate(HF_energy)` 基于"高能量=噪声"的物理假设，但在纹理丰富的正常区域会误判。Flight3 取消噪声门控——DPE 和 TCA 共享完整 HF，仅通过各自独立的 `proj_tfde/proj_tca` 层 (Conv(4C→C)+GELU+LN) 隐式学习不同的 HF 关注模式：
 
-**高频分流**。$LH,HL,HH$ 编码纹理和噪声，由能量门控 $g_n$ 区分：
+$$F_{\text{DPE}} = \text{LN}\left(\text{Conv}_{1\times1}([LL_{\text{DPE}}, \text{cat}(LH,HL,HH)])\right)$$
 
-$$E_{\text{HF}} = \frac{1}{C}\sum_{c=1}^{C}\left(LH_c^2 + HL_c^2 + HH_c^2\right), \quad g_n = \sigma\left(\text{Conv}_{3\times3} \to \text{GELU} \to \text{Conv}_{1\times1}\right)(E_{\text{HF}})$$
+$$F_{\text{TCA}} = \text{LN}\left(\text{Conv}_{1\times1}([LL_{\text{TCA}}, \text{cat}(LH,HL,HH)])\right)$$
 
-$$HF_{\text{tfde}} = g_n \odot [LH, HL, HH], \quad HF_{\text{tca}} = \text{LN}\left((1-g_n) \odot [LH, HL, HH]\right)$$
+删除 `noise_gate` 和 `hf_tca_norm` 两个子模块，简化 WFR 并消除误分流的归纳偏置。
 
-高 HF 能量 → $g_n \uparrow$ → 噪声概率高 → 导向 TFDE。低 HF 能量 → $(1-g_n) \uparrow$ → 结构概率高 → 导向 TCA。
+### 2.4 ISPN — 光照源处理 (Flight3: softplus gain + 动态 max_gain)
 
-**输出投影**：
-
-$$F_{\text{tfde}} = \text{LN}\left(\text{Conv}_{1\times1}([LL_{\text{tfde}}, HF_{\text{tfde}}])\right) \in \mathbb{R}^{B\times C\times H/2\times W/2}$$
-$$F_{\text{tca}} = \text{LN}\left(\text{Conv}_{1\times1}([LL_{\text{tca}}, HF_{\text{tca}}])\right) \in \mathbb{R}^{B\times C\times H/2\times W/2}$$
-
-### 2.4 ISPN — 光照源处理 (Mark4 简化)
-
-ISPN 接收编码器中心帧特征 $F_t^{\text{enc}}$ 和 TFDE 的光照先验 $s_{\text{illum}}$，输出 Retinex 风格的增益-偏置对。移除 Mark3 的多帧 cosine attention 和 L_ratio 锚定逻辑。
+ISPN 接收编码器中心帧特征 $F_t^{\text{enc}}$ 和 DPE 的光照先验 $s_{\text{illum}}$，输出 Retinex 风格的增益-偏置对。
 
 **Retinex 物理模型**：
 $$\hat{X}_t = I_t \cdot G + B$$
 
-其中：
-- $G$ (gain_map): 乘法提亮，≈ $1/L_{\text{estimated}}$, 补偿光照不足
-- $B$ (bias_map): 加法修正，补偿暗电流、色偏等系统偏差
-
 **网络结构**：
 $$h = \text{Conv}_{3\times3} \to \text{GELU} \to \text{Conv}_{3\times3}([F_t^{\text{enc}}, s_{\text{illum}}])$$
 
-$$\log G = \text{Conv}_{1\times1} \to \text{GELU} \to \text{Conv}_{1\times1}(h), \quad G = \exp(\log G) \cdot \text{clamp}(1, G_{\text{max}})$$
+$$\text{raw} = \text{Conv}_{1\times1} \to \text{GELU} \to \text{Conv}_{1\times1}(h), \quad G = 1 + \frac{\text{softplus}(\text{raw})}{\text{softplus}(4)} \cdot (G_{\text{max}} - 1)$$
 
 $$B = \tanh\left(\text{Conv}_{1\times1} \to \text{GELU} \to \text{Conv}_{1\times1}(h)\right) \cdot B_{\text{range}}$$
 
-**初始化策略**：
-- `gain_head[-1].weight` = 0, `gain_head[-1].bias` = **0.8** → $\log G = 0.8$ → $G = \exp(0.8) \approx 2.23$ (中等提亮)
-- `bias_head[-1]` (weight, bias) = 0 → $B = 0$ (无偏置)
-- Phase 1 初始行为：增强图像 = 输入 × 2.23（约 2 档曝光补偿），渐进学习空间变化
+**Flight3 C: softplus 参数化**。替代 `exp(log_gain).clamp()`，用 softplus 提供稳定梯度——导数始终 ∈ (0,1)，不会在极端值时消失或爆炸。raw=0 → G≈2.55；raw=0.8 → G≈3.62。
+
+**Flight3 I: max_gain 动态调度**。$G_{\text{max}}$ 从 4.0 线性 ramp 到 16.0（40 epoch），配合 softplus 上限防止早期梯度爆炸：
+
+| Epoch | $G_{\text{max}}$ | raw=0 → G |
+|-------|-----------------|-----------|
+| 0 | 4.0 | 2.55× |
+| 20 | 10.0 | 5.17× |
+| 40+ | 16.0 | 7.78× |
+
+**初始化**：`gain_head[-1].weight`=0, `gain_head[-1].bias`=**0.8**；`bias_head` 零初始化。
 
 ### 2.5 NDPN — 噪声退化处理 (对应 $\sigma^2_{\text{img}}$)
 
@@ -273,28 +269,27 @@ $$\text{S3 (提亮): } \quad \hat{X}_t = \text{clamp}\left(I_2 \odot G + B + \de
 
 ## 3. 核心模块详解
 
-### 3.1 WFR — 空域小波分流器
+### 3.1 WFR — 空域小波分流器 (Flight3)
 
-**文件**: `models/modules/swd.py (legacy)`
+**文件**: `models/modules/swd.py`
 
-子带级分流（不做 inverse DWT），显式分离"光照+噪声"和"光照无关结构"。
+LL 低频分流 (保留) + HF 高频共享 (取消噪声门控)：
 
 ```
 Encoder feat → [HaarDWT] → LL, LH, HL, HH
   ├─ alpha_net(LL) → α ∈ (0,1)
-  ├─ LL_tfde = α × LL          (光照估计信号)
-  ├─ LL_tca = IN((1-α) × LL)   (去光照, 保结构)
-  ├─ noise_gate(HF_energy) → n_gate ∈ (0,1)
-  ├─ HF_tfde = n_gate × HF_cat  (噪声相关高频)
-  ├─ HF_tca = LN((1-n_gate) × HF_cat)  (结构高频, 归一化)
-  └─ proj(4C→C)+LN → feat_tfde, feat_tca
+  ├─ LL_dpe = α × LL                (光照信号)
+  ├─ LL_tca = IN((1-α) × LL)        (去光照, 保结构)
+  ├─ HF_cat = cat(LH, HL, HH)        (完整高频, Flight3: 两路共享)
+  └─ proj_dpe(LL_dpe + HF_cat) → feat_tfde    (Conv(4C→C)+GELU+LN)
+  └─ proj_tca(LL_tca + HF_cat) → feat_tca     (独立权重, 隐式分化)
 ```
 
-### 3.2 DPE — 时域退化估计器 (Mark4)
+**Flight3 简化**: 已删除 `noise_gate` (Conv→Sigmoid) 和 `hf_tca_norm` (LayerNorm)——消除 "高能量=噪声" 的归纳偏置误判。
+
+### 3.2 DPE — 退化先验估计器 (Flight3)
 
 **文件**: `models/modules/tfsi_v2.py`
-
-Mark4 移除 FrequencyBranch/LFF/phase_conf，用多尺度空洞卷积替代频域分析。
 
 ```
 feat_tfde (B,T,C,H/2,W/2) from WFR
@@ -308,25 +303,15 @@ feat_tfde (B,T,C,H/2,W/2) from WFR
   │     ├─ 3×3 (d=2): 中尺度光照 → mid ch
   │     └─ 3×3 (d=4): 大尺度区域 → wide ch
   │
-  └─ Conv(→2ch) → Sigmoid → s_illum[:,0:1], s_noise[:,1:2]
+  ├─ Concat + 1×1 fuse → F_fused
+  │
+  ├─ Flight3 A: LayerNorm2d → 归一化幅值 (anti-saturation)
+  └─ Conv(→2ch, 零初始化) → Sigmoid → s_illum[:,0:1], s_noise[:,1:2]
+   初始输出 s_illum≈0.5, s_noise≈0.5 (居中, 有上下学习空间)
 ```
 
-**简化收益**: 移除 LFFFeatureAdapter/SpatialDWTLFFAdapter/phase_conf_head 等模块；梯度路径缩短；参数量减少。
-
-**文件**: `models/modules/swd.py (legacy)`
-
-子带级分流（不做 inverse DWT），显式分离"光照+噪声"和"光照无关结构"。
-
-```
-Encoder feat → [HaarDWT] → LL, LH, HL, HH
-  ├─ alpha_net(LL) → α ∈ (0,1)
-  ├─ LL_tfde = α × LL          (光照估 计信号)
-  ├─ LL_tca = IN((1-α) × LL)   (去光照, 保结构)
-  ├─ noise_gate(HF_energy) → n_gate ∈ (0,1)
-  ├─ HF_tfde = n_gate × HF_cat  (噪声相关高频)
-  ├─ HF_tca = LN((1-n_gate) × HF_cat)  (结构高频, 归一化)
-  └─ proj(4C→C)+LN → feat_tfde, feat_tca
-```
+**Mark4 问题**: Sigmoid 前无归一化 → F_fused 幅值失控 → s_illum=1.0 饱和。
+**Flight3 修复**: LayerNorm + head 零初始化 → 初始输出 0.5，训练中可自由学习。
 
 ### 3.2 TCA — 时序对应对齐
 
@@ -356,6 +341,9 @@ pre_norm LayerNorm 在 R/K/V 投影前
 | SpatialWKV2D | R/K/V RWKV-7 小初始化 |
 | WFR | `proj_tfde/proj_tca` 后 LayerNorm → norm≈1 |
 | Tau | `F.softplus(tau_raw) + 0.05` → 下界 0.05 |
+| DPE head | LayerNorm2d + 零初始化 → s_illum≈0.5 (居中, 防饱和) |
+| ISPN gain | softplus → dG/draw ∈ (0,1), 梯度不消失不爆炸 |
+| max_gain | 动态调度 4→16 → 防止早期梯度爆炸，后期扩大范围 |
 
 ---
 
@@ -387,7 +375,7 @@ pre_norm LayerNorm 在 R/K/V 投影前
 | v6 Delta Mark1 | WFR子带分流 + 命名统一 + 数值稳定 | 1.69M | ep15 loss收敛 |
 | **v6 Delta Mark2** | **Kendall不确定性加权 + PE Loss + 感知解耦 + 损失调度** | **1.69M** | 收敛停滞 |
 | **v6 Delta Mark3** | **两阶段渐进训练 + ISPN 隔离 + SGRF 中间监督 + 相位调度** | **1.69M** | PSNR 18→8.7 |
-| **v6 Delta Mark4** | **三部保险 (zero-gate) + DPE/ISPN 简化 + 损失重构 + 延展相位** | **1.45M** | **收敛中** |
+| **v6 Delta Flight3** | **DPE反饱和 + softplus gain + WFR取消噪声门控 + max_gain调度 + eff_batch=8** | **1.45M** | **训练中** |
 
 ---
 
@@ -478,8 +466,8 @@ $$L_{\text{total}} = \sum_{i} \frac{1}{2\exp(s_i)} L_i + \frac{1}{2}s_i$$
 
 | 参数 | 值 | 说明 |
 |------|-----|------|
-| batch_size | 4 | 物理 batch |
-| grad_accum_steps | **1** | 等效 batch=4 |
+| batch_size | 4 (accum=2) | eff batch=8 |
+| grad_accum_steps | **2** | 等效 batch=8 |
 | epochs | 90 | — |
 | lr (Phase 1 Warmup) | 8e-6 → 8e-4 | 线性 warmup |
 | lr (Phase 1 Main) | 6e-4 | 固定 |
@@ -546,9 +534,9 @@ elif phase == 'phase2':
 ### 7.5 训练监控
 
 ```bash
-tail -f outputs/sdsd_delta/nohup.out
-grep "Train stats" outputs/sdsd_delta/nohup.out | tail -20
-grep "non-finite\|NaN" outputs/sdsd_delta/nohup.out
+tail -f outputs/sdsd_flight3/nohup.out
+grep "Train stats" outputs/sdsd_flight3/nohup.out | tail -20
+grep "non-finite\|NaN" outputs/sdsd_flight3/nohup.out
 ```
 
 ### 7.6 Epoch 5 过渡检查清单
@@ -580,4 +568,4 @@ grep "non-finite\|NaN" outputs/sdsd_delta/nohup.out
 | `models/tfs_net.py` | CXG, TFSNet (数据流编排) |
 | `losses/losses.py` | TFSNetLoss (Kendall UW + gain_sup + Phase Schedule) |
 | `train.py` | 训练循环 (grad accum + phase lr + metric logging) |
-| `configs/v6_bravo.yaml` | 训练配置 (batch=4, epochs=90) |
+| `configs/delta_flight3.yaml` | 训练配置 (batch=4, epochs=90) |

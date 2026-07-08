@@ -1,5 +1,5 @@
 seed: 42
-output_dir: outputs/sdsd_ablation_D
+output_dir: outputs/sdsd_flight3
 dataset:
   train_input_root: /home/a1005/yzy/dataset/SDSD/indoor/input
   train_target_root: /home/a1005/yzy/dataset/SDSD/indoor/GT
@@ -7,43 +7,51 @@ dataset:
   val_target_root: /home/a1005/yzy/dataset/SDSD/test/GT
   window_size: 5
   crop_size: 256
-  num_workers: 8
+  num_workers: 4
+  max_val_seqs: 5     # eval 仅前5段, 加速验证
+  val_crop_size: 256   # 限制验证帧尺寸, 防 C_omega OOM (1920×1080 → 21GB)
 model:
   type: TFSNet
   in_channels: 3
   level_channels: [32, 64, 96]
   fused_channels: 64
-  use_soft_clamp: true
+  use_soft_clamp: false
   sace_offset_use_norm: false
   sace_offset_kaiming_init: false
   use_soft_median: true
   use_nafblock: false
+  num_bottleneck_blocks: 0
+  num_igrf_res_blocks: 2
+  use_amp_enhance: false
+  use_dwt_lff: true
+  use_pure_rwkv: true
 train:
-  batch_size: 2
-  epochs: 30
+  batch_size: 4
+  epochs: 90
   lr: 0.0008
   weight_decay: 0.0001
   amp: false
   log_interval: 50
-  val_interval: 5
+  val_interval: 10
   warmup_epochs: 5
   grad_clip: 0.5
+  grad_accum_steps: 2  # effective batch = 4 × 2 = 8   # batch=1 × 3 accum steps = effective batch 3
 loss:
   type: TFSNetLoss
   use_freq_loss: true
   perceptual_pretrained: true
-  lambda_perc: 0.2
-  lambda_freq: 0.1
+  lambda_perc: 0.04
+  lambda_freq: 0.05
   lambda_illum: 0.001
-  lambda_ssim: 0.1
-  lambda_inter: 0.3
+  lambda_ssim: 0.2
+  lambda_inter: 0.2
   fused_channels: 64
-  lambda_illum_sup: 0.1
-  lambda_noise_sup: 0.02
-  noise_tau_high: 5.0
-  perc_multilayer: true
-  freq_with_phase: true
-  freq_phase_weight: 0.5
+  lambda_illum_sup: 0.02
+  lambda_noise_sup: 0.0
+  perc_multilayer: false
+  freq_with_phase: false
+  lambda_ifpn_sup: 0.1
+  lambda_pix: 1.0
 eval:
   tile_size: 256
   tile_overlap: 32

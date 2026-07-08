@@ -67,7 +67,11 @@ class DPE(nn.Module):
             out_channels=fused_channels,
         )
 
+        # Flight3 A: LayerNorm before sigmoid → anti-saturation
+        self.pre_head_norm = nn.LayerNorm(fused_channels)
         self.head = nn.Conv2d(fused_channels, 2, 1)
+        nn.init.zeros_(self.head.weight)
+        nn.init.zeros_(self.head.bias)
 
     @staticmethod
     def _soft_median(x: torch.Tensor, dim: int = 1, tau: float = 0.1) -> torch.Tensor:
@@ -94,7 +98,9 @@ class DPE(nn.Module):
         stats = torch.cat([mu_t, sigma_t, snr], dim=1)
         f_fused = self.ms_branch(stats)
 
-        raw = torch.sigmoid(self.head(f_fused))
+        # Flight3 A: LayerNorm before sigmoid (anti-saturation)
+        f_normed = self.pre_head_norm(f_fused.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        raw = torch.sigmoid(self.head(f_normed))
         s_illum = raw[:, 0:1]
         s_noise = raw[:, 1:2]
 

@@ -215,8 +215,19 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
                 meter_inter.avg,
                 meter_ifpn.avg,
             )
-
-    return {
+            # Flight3 G: diagnostic logging for DPE/ISPN/WFR health
+            with torch.no_grad():
+                s_ill = outputs.get("s_illum")
+                gain = outputs.get("gain_map")
+                wfr = model.wfr if hasattr(model, 'wfr') else None
+                if s_ill is not None:
+                    logger.info(
+                        "diag: dpe_si=%.3f/%.4f g=%.2f/%.3f",
+                        s_ill.mean().item(), s_ill.std().item(),
+                        gain.mean().item() if gain is not None else 0,
+                        gain.std().item() if gain is not None else 0,
+                    )
+        return {
         "loss_total": meter_total.avg,
         "loss_pix": meter_pix.avg,
         "loss_freq": meter_freq.avg,
@@ -378,10 +389,17 @@ def main():
         for pg in optimizer.param_groups:
             pg['lr'] = lr
 
+        # Flight3 I: dynamic max_gain scheduling (4→16 over training)
+        if hasattr(model, 'ispn') and hasattr(model.ispn, 'set_max_gain'):
+            max_g = 4.0 + (16.0 - 4.0) * min(epoch / 40.0, 1.0)
+            model.ispn.set_max_gain(max_g)
+            if epoch % 10 == 0:
+                logger.info("max_gain updated to %.1f", max_g)
+
         # Phase transition actions
         if epoch == 20:
             logger.info("Phase 1.5: Unlocking NDPN/MCPN/CXG")
-        if epoch == 25:
+        if epoch == 40:
             logger.info("Phase 2: Full tri-source restoration")
 
         train_stats = train_one_epoch(

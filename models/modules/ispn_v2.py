@@ -42,11 +42,16 @@ class ISPN(nn.Module):
         nn.init.zeros_(self.bias_head[-1].weight)
         nn.init.zeros_(self.bias_head[-1].bias)
 
+    def set_max_gain(self, max_gain: float):
+        """Flight3 I: dynamic max_gain scheduling"""
+        self.max_gain = max_gain
+
     def forward(self, f_enc_center: torch.Tensor, s_illum: torch.Tensor) -> dict:
         h = self.refine(torch.cat([f_enc_center, s_illum], dim=1))
 
-        log_gain = self.gain_head(h)
-        gain_map = torch.exp(log_gain).clamp(1.0, self.max_gain)
+        # Flight3 C: softplus gain → stable gradients, no saturation
+        raw_gain = self.gain_head(h)
+        gain_map = 1.0 + F.softplus(raw_gain) * (self.max_gain - 1.0) / F.softplus(torch.tensor(4.0, device=raw_gain.device, dtype=raw_gain.dtype))
 
         bias_map = torch.tanh(self.bias_head(h)) * self.bias_range
 
