@@ -23,8 +23,8 @@ flowchart TD
 
     subgraph 处理层["三源退化并行建模<br/>Phase 1: NDPN/MCPN 截断=0"]
         ISPN["ISPN 光照源处理<br/>f_enc + s_illum → gain + bias<br/>gain=softplus(raw_gain)∈[1,max], bias=tanh·range"]
-        NDPN["NDPN 噪声处理 (Phase 1 = zero)"]
-        MCPN["MCPN 运动补偿 (Phase 1 = zero)<br/>Flight3: gamma=0, refine=0, startup_gate=1"]
+        NDPN["NDPN 噪声处理 (Phase 1 = zero, γ=0.001)"]
+        MCPN["MCPN 运动补偿 (Phase 1 = zero, γ=0.001)<br/>Flight3: gamma=0.001, refine=0, startup_gate=1"]
     end
 
     subgraph 融合层["CXG 交叉激励门<br/>Phase 1: bypass<br/>Phase 1.5: ratio激活<br/>Phase 2: 正常"]
@@ -59,20 +59,20 @@ flowchart TD
 
 ### 框架要点
 
-- **WFR 子带分流**：HaarDWT 在子带级分离 LL→光照/噪声 (TFDE), HF→结构 (TCA)。alpha_net(LL) 可学习 α ∈ (0,1) 分配 LL 子带, noise_gate(HF_energy) 门控 HF 子带。输出 LayerNorm。
+- **WFR 子带分流 (Flight3: 取消噪声门控)**：HaarDWT 在子带级分离 LL→光照/噪声 (DPE), HF→结构 (TCA)。alpha_net(LL) 可学习 α ∈ (0,1) 分配 LL，受 `(ᾱ-0.7)²` 弱正则（允许 DPE 获取更多 LL）。HF 两路共享，各自 proj 层独立学习。
 - **DPE (Flight3 简化)**：移除 FrequencyBranch/LFF/phase_conf，用多尺度空洞卷积 (d=1,2,4) 提取时域统计量 [μ,σ,SNR] 的空域特征。梯度路径从 `feats→LFF→DWT→phase→s_noise` 简化为 `feats→统计量→Conv→head`。
 - **ISPN (Flight3 简化)**：移除多帧 cosine attention + L_ratio 锚定，直接用 `f_enc + s_illum` 生成 gain_map (乘法提亮) + bias_map (加法修正)。零初始化 → gain≈2.55+bias=0.8 (softplus) → Phase 1 友好。
-- **TCA 空间扫描**：输入 SWD 的 H/2 特征。MVC-Shift(3 dilated DWConv) → 4方向 Bi-WKV → Channel Mix → H 上采样。C_omega 行 softmax 归一化，L_diag_prior 自监督。
-- **三部保险 (Flight3)**：Phase 2 启动时 NDPN (gamma=0, noise_proj=0) + MCPN (gamma=0, refine=0, startup_gate=1, out_scale=0) + SGRF StageBlock (gate=0) — 任一层都能独立保证无扰动。
+- **TCA 空间扫描**：输入 WFR 的 H/2 特征。MVC-Shift(3 dilated DWConv) → 4方向 Bi-WKV → Channel Mix → H 上采样。C_omega 行 softmax 归一化，L_diag_prior Phase 1 自监督 (Phase 2 取消)。
+- **Flight3 γ=0.001**：NDPN 和 MCPN 的 γ 从 0 提升到 0.001——Phase 1 允许微弱梯度流过噪声/运动分支，保持权重可训练但不产生可见输出。
 
 ### Flight3 多阶段训练策略
 
 | 阶段 | Epoch | lr | NDPN/MCPN | SGRF gate | 损失项 |
 |------|-------|-----|-----------|-----------|--------|
 | Phase 1 Warmup | 0-4 | 8e-6→8e-4 | zero | gate=0 | pix+ssim+illum+gain_sup+wfr_reg+ifpn(align+diag) |
-| Phase 1 Main | 5-19 | 6e-4 | zero | gate=0 | 同上 |
-| Phase 1.5 | 20-39 | 6e-4→4e-4 | 线性 0→100% | 渐进学习 | 同上 |
-| Phase 2 | 40-89 | 4e-4→0.16e-4 | 100%+CXG | 已学习 | +perceptual_decoupling(SSIM→S1,VGG→S2)+freq+inter |
+| Phase 1 Main | 5-9 | 6e-4 | zero (γ=0.001) | gate=0 | 同上 |
+| Phase 1.5 | 10-29 | 6e-4→4e-4 | 线性 0→100% | 渐进学习 | 同上 |
+| Phase 2 | 30-89 | 4e-4→0.16e-4 | 100%+CXG | 已学习 | +perceptual(SSIM→S1,VGG→S2)+freq+inter (diag_prior取消) |
 
 ---
 
@@ -90,15 +90,13 @@ flowchart TD
         direction TB
         DWT["HaarDWT2D<br/>→ LL, LH, HL, HH (H/2×W/2)"]
         ALPHA["alpha_net(LL)<br/>DWConv3x3 → GELU → Conv1x1 → Sigmoid<br/>α ∈ (0,1) — 光照分配比"]
-        LL_DIV["LL分流: α·LL → TFDE (光照+噪声)<br/>(1-α)·LL + InstanceNorm → TCA (去光照结构)"]
-        HF_ENERGY["HF能量: (LH²+HL²+HH²).mean(dim=C) → (B,1,H/2,W/2)"]
-        NOISE_G["noise_gate(HF_energy)<br/>Conv→Sigmoid → g_n ∈ (0,1)<br/>高能量=高噪声概率"]
-        HF_DIV["HF分流: g_n×HF_cat → TFDE (噪声相关)<br/>(1-g_n)×HF_cat + LayerNorm → TCA (结构)"]
+        LL_DIV["LL分流: α·LL → DPE<br/>(1-α)·LL + IN → TCA"]
+        HF_SHARED["HF完整共享 (Flight3: 取消noise_gate)<br/>cat(LH,HL,HH) → 两路各自 proj"]
         PROJ["proj_tfde/proj_tca: Conv(4C→C)+GELU+LN<br/>→ feat_tfde, feat_tca (B,T,C,H/2,W/2)"]
         DWT --> ALPHA --> LL_DIV
-        DWT --> HF_ENERGY --> NOISE_G --> HF_DIV
+        DWT --> HF_SHARED
         LL_DIV --> PROJ
-        HF_DIV --> PROJ
+        HF_SHARED --> PROJ
     end
 
     subgraph TFDE["DPE 退化估计器 (Flight3: 纯空域)"]
@@ -140,13 +138,13 @@ flowchart TD
 
     subgraph NDPN["NDPN 噪声退化处理 (Phase 1: zero截断)"]
         NDPN_CONF["conf_proj: C_omega diag → conf_map<br/>noise_extract: |enc - F_t_aligned| → residual"]
-        NDPN_STR["f_noise = enc - γ·residual·strength + noise_proj(s_noise)<br/>γ=0 → f_noise≈f_enc (pass-through)"]
+            NDPN_STR["f_noise = enc - γ·residual·strength + noise_proj(s_noise)<br/>γ=0.001 → f_noise≈f_enc (pass-through, grad flows)"]
         NDPN_CONF --> NDPN_STR
     end
 
     subgraph MCPN["MCPN 运动补偿处理 (Phase 1: zero截断, Flight3 静默启动)"]
         MCPN_MOT["motion_estimator + window_corr → f_omega_aligned"]
-        MCPN_GATE["gate + startup_bias → g_t (初→1.0, 纯中心帧)<br/>f_fuse = g_t·f_center + (1-g_t)·f_omega + γ·δ"]
+        MCPN_GATE["gate + startup_bias → g_t (初→1.0)<br/>f_fuse = g_t·f_center + (1-g_t)·f_omega + 0.001·δ"]
         MCPN_REF["refine(conv2=0) + f_center·out_scale(0)<br/>→ f_motion≈f_center (pass-through)"]
         MCPN_MOT --> MCPN_GATE --> MCPN_REF
     end
@@ -216,12 +214,12 @@ feat_tca (B,T,C,H/2,W/2) from WFR — 已是半分辨率, 无需再降采样
 ```
 Phase 1 → Phase 1.5 → Phase 2 过渡
 
-NDPN:   f_noise  = f_enc - γ·noise·strength + noise_proj(s_noise)
-          γ=0 → f_noise ≈ f_enc (pass-through)
+NDPN:   f_noise  = f_enc - 0.001·noise·strength + noise_proj(s_noise)
+          γ=0.001 → f_noise ≈ f_enc (pass-through, grad flows)
           noise_proj 零初始化 → 第二项 = 0
 
 MCPN:   g_t = sigmoid(raw_gate + startup_gate=1) → ≈0.73
-          f_fuse = g_t·f_center + (1-g_t)·f_omega + δ·γ(0)
+          f_fuse = g_t·f_center + (1-g_t)·f_omega + δ·0.001
           refine(conv2=0, out_scale=0) → f_motion ≈ f_center
 
 SGRF:   StageBlock gate = 0 → delta = Conv(x)*0 = 0 → img unchanged
@@ -234,7 +232,7 @@ SGRF:   StageBlock gate = 0 → delta = Conv(x)*0 = 0 → img unchanged
 ### Flight3 损失函数架构
 
 ```
-                    Phase 1 Warmup (0-4)         Phase 1 Main (5-19)
+                    Phase 1 Warmup (0-4)         Phase 1 Main (5-9)
                     ─────────────────────        ─────────────────────
 res_t    ←→ GT  ─→  pix (PECharbonnier)          pix
                     ssim (1-SSIM)                 ssim
@@ -247,12 +245,13 @@ NDPN/MCPN         →  零截断 (不参与训练)
 CXG               →  bypass (不参与训练)
 SGRF gate         →  零 (不参与训练, 三重保险)
 
-                    Phase 1.5 (20-39)             Phase 2 (40-89)
+                    Phase 1.5 (10-29)             Phase 2 (30-89)
                     ─────────────────────        ────────────────────
                     损失同上, NDPN/MCPN           img_s1 ←→ GT → ssim_s1
                     线性unlock_ratio              img_s2 ←→ GT → perc_s2 (VGG)
                     SGRF gate 渐进学习             img_s2×gain ← GT → inter
                     CXG: ratio>0.3启用            res_t ←→ GT → freq (FFT L1)
+                                                  diag_prior Phase 2 取消
                             all via Kendall UW (learnable log_vars)
 ```
 
@@ -279,9 +278,12 @@ SGRF gate         →  零 (不参与训练, 三重保险)
 | **ISPN** | 多帧cosine attention | 同Mark1 | **gain/bias Retinex 头** |
 | **SGRF Stage3** | lit_up_map×(1+A_illu) | 同Mark1 | **img×gain+bias** |
 | **StageBlock** | 标准ResBlock | 同Mark1 | **zero-gate 零初始化** |
-| **MCPN** | 随机初始化 | startup_gate=1 | **gamma=0 + refine=0 + out_scale=0** |
+| **MCPN** | 随机初始化 | startup_gate=1 | **gamma=0.001 + refine=0** |
+| **NDPN** | gamma=0 | 同 | **gamma=0.001 (梯度流过)** |
+| **L_diag_prior** | Phase 1+2 | Phase 1+2 | **Phase 1 only (P2取消)** |
+| **L_wfr_reg** | — | (ᾱ-0.5)² | **(ᾱ-0.7)²** |
 | **Phase 2 启动** | 剧烈扰动 | PSNR 18→8.7 暴跌 | **三重保险 (无扰动)** |
-| **Phase 1.5** | 5 epoch (20-25) | 同 | **20 epoch (20-40)** |
+| **Phase 1.5** | 5 epoch (20-25) | 同 | **20 epoch (10-30)** |
 | **参数** | 1.69M | 1.69M | **1.45M** |
 | **DPE head** | — | 直接Sigmoid→饱和 | **LayerNorm+零初始化** |
 | **ISPN gain** | — | exp→梯度异常 | **softplus+动态max_gain** |

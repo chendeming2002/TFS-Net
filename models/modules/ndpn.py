@@ -81,7 +81,8 @@ class NDPN(nn.Module):
             nn.Sigmoid(),
         )
 
-        self.gamma = nn.Parameter(torch.zeros(1, channels, 1, 1))
+        # Flight3: γ=0.001 → gradient flows through noise branch without visible output
+        self.gamma = nn.Parameter(torch.full((1, channels, 1, 1), 0.001))
 
     def forward(
         self,

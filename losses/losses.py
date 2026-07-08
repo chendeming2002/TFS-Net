@@ -363,7 +363,7 @@ class TFSNetLoss(nn.Module):
                 try:
                     alpha_bias = wfr.alpha_net[2].bias.mean()
                     wfr._alpha_mean = alpha_bias.sigmoid()
-                    L_wfr_reg = (wfr._alpha_mean - 0.5)**2
+                    L_wfr_reg = (wfr._alpha_mean - 0.7)**2  # asymmetric: allow DPE to take more LL
                 except: pass
 
             if self.uncertainty_weighting:
@@ -439,7 +439,7 @@ class TFSNetLoss(nn.Module):
             try:
                 alpha_bias = wfr.alpha_net[2].bias.mean()
                 wfr._alpha_mean = alpha_bias.sigmoid()
-                L_wfr_reg = (wfr._alpha_mean - 0.5)**2
+                L_wfr_reg = (wfr._alpha_mean - 0.7)**2  # asymmetric: allow DPE to take more LL
             except: pass
 
         # align_warp + diag_prior (already computed above, shared)
@@ -458,7 +458,7 @@ class TFSNetLoss(nn.Module):
                 + self._uw(L_ssim, 'ssim') + self._uw(L_perc, 'perc')
                 + self._uw(L_illum_smooth, 'illum')
                 + self._uw(L_inter, 'inter')
-                + self._uw(L_align_warp + L_diag_prior, 'ifpn')
+                + self._uw(L_align_warp, 'ifpn')  # Phase 2: diag_prior removed
                 + 0.5 * L_gain_sup + 0.001 * L_wfr_reg
             )
         else:

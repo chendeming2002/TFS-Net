@@ -1,6 +1,6 @@
 # TFS-Net v6 Delta Flight3 模型架构设计文档
 
-> 日期：2026-07-08 (更新: Flight3 — DPE反饱和 + softplus gain + WFR取消噪声门控 + max_gain调度)
+> 日期：2026-07-08 (更新: Phase重构 + NDPN/MCPN γ=0.001 + diag_prior取消 + wfr_reg改0.7)
 > 版本：v6 Delta Flight3
 > 训练配置：`configs/delta_flight3.yaml`，batch=4 (accum=2→eff=8), lr=8e-4, epochs=90
 > 参数量：1.45M
@@ -17,8 +17,8 @@ TSD-Net (Tri-Source Decoupled Network) 是一个端到端多帧低光视频增�
 | **DPE** | Degradation Prior Estimator | 时域统计 + 多尺度空洞卷积 → s_illum, s_noise (Mark4 简化) |
 | **TCA** | Temporal Correspondence & Alignment | 4方向空间 WKV 扫描 + C_omega 时序矩阵 |
 | **ISPN** | Illumination-Source Processing Network | Retinex gain/bias 头 → gain_map, bias_map (Mark4 简化) |
-| **NDPN** | Noise Degradation Processing Network | C_omega 置信度引导去噪 (γ=0, noise_proj=0 → pass-through init) |
-| **MCPN** | Motion Compensation Processing Network | C_omega 运动强度补偿 (Mark4: gamma=0, refine=0, startup_gate=1 → pass-through init) |
+| **NDPN** | Noise Degradation Processing Network | C_omega 置信度引导去噪 (γ=0.001 → 微弱梯度流过) |
+| **MCPN** | Motion Compensation Processing Network | C_omega 运动强度补偿 (gamma=0.001, startup→pass-through) |
 | **CXG** | Cross-eXcitation Gate | 去噪↔运动 交叉激励门 (deploy 重参数化) |
 | **SGRF** | Stage-wise Guided Restoration & Fusion | S1:去噪 → S2:去模糊 → S3:gain×img+bias (Mark4: zero-gate StageBlock) |
 
@@ -198,13 +198,13 @@ $$B = \tanh\left(\text{Conv}_{1\times1} \to \text{GELU} \to \text{Conv}_{1\times
 
 **Flight3 C: softplus 参数化**。替代 `exp(log_gain).clamp()`，用 softplus 提供稳定梯度——导数始终 ∈ (0,1)，不会在极端值时消失或爆炸。raw=0 → G≈2.55；raw=0.8 → G≈3.62。
 
-**Flight3 I: max_gain 动态调度**。$G_{\text{max}}$ 从 4.0 线性 ramp 到 16.0（40 epoch），配合 softplus 上限防止早期梯度爆炸：
+**Flight3 I: max_gain 动态调度**。$G_{\text{max}}$ 从 4.0 线性 ramp 到 16.0（30 epoch），配合 softplus 上限防止早期梯度爆炸：
 
 | Epoch | $G_{\text{max}}$ | raw=0 → G |
 |-------|-----------------|-----------|
 | 0 | 4.0 | 2.55× |
-| 20 | 10.0 | 5.17× |
-| 40+ | 16.0 | 7.78× |
+| 15 | 10.0 | 5.17× |
+| 30+ | 16.0 | 7.78× |
 
 **初始化**：`gain_head[-1].weight`=0, `gain_head[-1].bias`=**0.8**；`bias_head` 零初始化。
 
@@ -218,7 +218,7 @@ $$c = \text{conf\_proj}\left(\text{diag}(C_{t,\Omega}^{(1)}),\dots,\text{diag}(C
 
 $$\mathbf{n} = \text{noise\_extract}\left([F_t^{\text{enc}}, \hat{F}_t]\right) \quad\text{(encoder vs aligned 差异)}$$
 
-$$\text{strength} = \sigma\left(\text{denoise\_strength}([\mathbf{n}, c])\right), \quad \gamma_n = 0$$
+$$\text{strength} = \sigma\left(\text{denoise\_strength}([\mathbf{n}, c])\right), \quad \gamma_n = 0.001 \quad\text{(Flight3: non-zero for gradient flow)}$$
 
 $$\mathbf{f}_{\text{noise}} = F_t^{\text{enc}} - \gamma_n \cdot \mathbf{n} \odot \text{strength} + \text{noise\_proj}(s_{\text{noise}})$$
 
@@ -236,7 +236,7 @@ $$\Delta_m = \text{motion\_refine}([\hat{F}_t, F_{\text{omega}}]), \quad \text{c
 
 $$\mathbf{f}_{\text{motion}} = g_t \odot \hat{F}_t + (1-g_t) \odot F_{\text{omega}} + \gamma_m \cdot \Delta_m \odot \text{comp}$$
 
-其中 $\gamma_m = 0.1$。$g_t = \sigma(\text{gate}([\hat{F}_t, F_{\text{omega}}]))$ 控制信任对齐中心 vs 聚合邻帧。
+其中 $\gamma_m = 0.001$ (Flight3: non-zero for gradient flow)。$g_t = \sigma(\text{gate}([\hat{F}_t, F_{\text{omega}}]))$ 控制信任对齐中心 vs 聚合邻帧。
 
 ### 2.7 CXG — 交叉激励门
 
@@ -414,9 +414,9 @@ $$L_{\text{total}} = \sum_{i} \frac{1}{2\exp(s_i)} L_i + \frac{1}{2}s_i$$
 | 项 | 公式 | 物理含义 |
 |----|------|---------|
 | **L_align_warp** | L1(∑C·F_neighbor, F_center) | 时序 warp 一致性：用 C_omega 对齐邻帧特征，应与中心帧一致 |
-| **L_diag_prior** | −mean(log(diag(C_Ω)+ε)) | C_Ω 对角先验：鼓励静止区域对应 identity（无 GT 自监督） |
+| **L_diag_prior** | −mean(log(diag(C_Ω)+ε)) | Phase 1 仅用于稳定 C_ω 学习；Phase 2 取消，释放运动检测 |
 | **L_illum_smooth** | TV(s_illum)·e^{−‖∇I‖} | 光照图边缘感知平滑 |
-| **L_wfr_reg** | (ᾱ − 0.5)² | WFR 分流平衡正则：防 α 偏离中心 |
+| **L_wfr_reg** | (ᾱ − 0.7)² | WFR 分流平衡正则：允许 DPE 获取更多 LL，仅防极端 α→1.0 |
 
 #### Phase 2 专属 — 感知解耦 & 中间监督
 
@@ -433,7 +433,7 @@ $$L_{\text{total}} = \sum_{i} \frac{1}{2\exp(s_i)} L_i + \frac{1}{2}s_i$$
 |------|---------|
 | Phase 1 Warmup | UW(pix) + UW(ssim) + UW(illum_smooth, 'illum') + UW(align+diag, 'ifpn') + 0.5·L_gain_sup + 0.001·L_wfr_reg |
 | Phase 1 Main | 同上 |
-| Phase 2 | ← + UW(perc, 'perc') + UW(freq, 'freq') + UW(inter, 'inter') (感知解耦: SSIM→S1, VGG→S2) |
+| Phase 2 | ← + UW(perc, 'perc') + UW(freq, 'freq') + UW(inter, 'inter') + UW(align_warp only, 'ifpn') (diag_prior 取消) |
 
 ### 6.3 相位调度 (Mark4)
 
@@ -441,20 +441,20 @@ $$L_{\text{total}} = \sum_{i} \frac{1}{2\exp(s_i)} L_i + \frac{1}{2}s_i$$
 
 | 阶段 | Epoch | 损失 | NDPN/MCPN | CXG | lr |
 |------|-------|------|-----------|-----|-----|
-| **Phase 1 Warmup** | 0–4 | pix + ssim + illum_smooth + gain_sup + align+diag + wfr_reg | **zero** | bypass | 8e-6→8e-4 |
-| **Phase 1 Main** | 5–19 | 同上 | **zero** | bypass | 6e-4 |
-| **Phase 1.5** | 20–39 | 同上 | 线性解锁 0→100% (0.05/epoch) | ratio>0.3 启用 | 6e-4→4e-4 |
-| **Phase 2** | 40–89 | 全损失 (感知解耦 + freq + inter + 共享项) | 100% | 启用 | 4e-4→0.16e-4 |
+| **Phase 1 Warmup** | 0–4 | pix + ssim + illum_smooth + gain_sup + align+diag + wfr_reg | **zero** (输出置零) | bypass | 8e-6→8e-4 |
+| **Phase 1 Main** | 5–9 | 同上 | **zero** (但 γ=0.001 梯度流过) | bypass | 6e-4 |
+| **Phase 1.5** | 10–29 | 同上 | 线性解锁 0→100% (0.05/epoch) | ratio>0.3 启用 | 6e-4→4e-4 |
+| **Phase 2** | 30–89 | 全损失 (感知解耦 + freq + inter; **diag_prior 取消**) | 100% | 启用 | 4e-4→0.16e-4 |
 
 **关键设计决策**：
 
-1. **Phase 1 NDPN/MCPN/SGRF 截断 (Mark4 三部保险)**：Mark3 仅截断 NDPN/MCPN，但 SGRF StageBlock 在 Phase 1 被训练为处理零输入。Phase 2 激活时，StageBlock 收到非零特征后产生任意输出 → PSNR 18→8.7。Mark4 增加三重零保证：NDPN (gamma=0, noise_proj=0) + MCPN (gamma=0, refine=0, startup_gate=1, out_scale=0) + SGRF StageBlock (gate=0)。任一层独立保底。
+1. **Flight3 NDPN/MCPN γ=0.001 (微梯度流过)**：Mark4 的 γ=0 使噪声/运动分支在 Phase 1 完全零梯度，20 epoch 后权重空转。Flight3 将 γ 提升到 0.001，允许微弱梯度流过噪声/运动分支，不产生可见输出但保持权重可训练。
 
-2. **Phase 1.5 延长到 20 epoch (20→40), Phase 2 延长到 50 epoch (40→90)**：Mark3 的 5 epoch 斜坡不足以让 SGRF StageBlock 适应非零输入。延长到 20 epoch 斜坡(0.05/epoch) + 50 epoch Phase 2(lr 4e-4→0.16e-4)，配合 zero-gate 渐进释放和 gain_sup 有效监督。
+2. **Phase 1 缩短到 10 epoch (0→10), Phase 1.5 20 epoch (10→30), Phase 2 60 epoch (30→90)**：Mark4 的 20 epoch ISPN 独占使特征空间固化于纯光照。V9 实验证实 s_illum=100% 主导退化，Phase 1 仅需 10 epoch。提前解锁使三源分支共享基础特征。
 
 3. **感知解耦** (Perceptual Decoupling)：Mark2 设计 B1 方案——SSIM 损失监督 SGRF-S1（去噪），VGG 感知损失监督 SGRF-S2（去模糊），Charbonnier 监督 S3 乘法路径。消除"同一输出接收 SSIM+感知 冲突梯度"问题。
 
-4. **L_diag_prior 自监督**：dataloader 只提供中心帧 GT，无法获取邻帧 GT。使用 C_Ω 对角线的 −log(·) 先验，无条件鼓励 identity 对应。Phase 1 无运动分支，副作用可控。Phase 2 可扩展为邻帧 GT 对应监督。
+4. **L_diag_prior Phase 2 取消**：该损失鼓励 C_ω 对角线恒等，Phase 2 中与 MCPN 运动检测冲突。Phase 1 保留用于稳定 C_ω 初始学习，Phase 2 完全移除以释放运动检测能力。
 
 5. **L_gain_sup 直接监督**：权重 0.5（固定，不受 Kendall UW），将 gain_map 与 GT/I̅ 逐像素 L1 对比。解决 ISPN gain_head 训练路径过长（pix loss → res_t → gain_map 的间接梯度）导致的 gain 学习不足。L_wfr_reg 弱正则（0.001）防止 α_net 极端分流失衡。
 
@@ -472,7 +472,8 @@ $$L_{\text{total}} = \sum_{i} \frac{1}{2\exp(s_i)} L_i + \frac{1}{2}s_i$$
 | lr (Phase 1 Warmup) | 8e-6 → 8e-4 | 线性 warmup |
 | lr (Phase 1 Main) | 6e-4 | 固定 |
 | lr (Phase 1.5) | 6e-4 → 4e-4 | 线性过渡 (20 epoch) |
-| lr (Phase 2) | 4e-4 → 1.6e-5 | Cosine annealing (50 epoch) |
+| lr (Phase 2) | 4e-4 → 1.6e-5 | Cosine annealing (60 epoch) |
+| max_gain ramp | 4→16 over 30 epoch | Flight3 I: 匹配新 Phase 1.5 |
 | optimizer | AdamW | — |
 | weight_decay | 1e-4 | L2 正则 |
 | grad_clip | 0.5 | 梯度裁剪 |
@@ -484,23 +485,23 @@ $$L_{\text{total}} = \sum_{i} \frac{1}{2\exp(s_i)} L_i + \frac{1}{2}s_i$$
 ```python
 def get_phase(epoch):
     if epoch < 5:   return 'phase1_warmup'
-    elif epoch < 20: return 'phase1'
-    elif epoch < 40: return 'phase1_5'   # 20-epoch unlock ramp
+    elif epoch < 10: return 'phase1'         # Flight3: shortened to 5 epoch
+    elif epoch < 30: return 'phase1_5'       # 20-epoch unlock ramp
     else:            return 'phase2'
 
 def get_unlock_ratio(epoch):
-    if epoch < 20: return 0.0
-    if epoch >= 40: return 1.0
-    return (epoch - 20) / 20.0  # 线性 0→1
+    if epoch < 10: return 0.0
+    if epoch >= 30: return 1.0
+    return (epoch - 10) / 20.0  # 线性 0→1
 
 def get_lr(epoch, base_lr=8e-4):
     if epoch < 5:   return base_lr * (0.01 + 0.99 * epoch / 5)
-    elif epoch < 20: return 0.75 * base_lr
-    elif epoch < 40: ratio = (epoch - 20) / 20.0; return (0.75 * (1 - ratio) + 0.5 * ratio) * base_lr
-    elif epoch < 55: return 0.5 * base_lr
-    elif epoch < 70: return 0.125 * base_lr
-    elif epoch < 80: return 0.05 * base_lr
-    else:            return 0.02 * base_lr
+    elif epoch < 10: return 0.75 * base_lr
+    elif epoch < 30: return base_lr * 0.75 * (1 - (epoch - 10) / 20 * 0.33)
+    elif epoch < 55: return base_lr * 0.5
+    elif epoch < 70: return base_lr * 0.125
+    elif epoch < 80: return base_lr * 0.05
+    else:            return base_lr * 0.02
 ```
 
 ### 7.3 Phase-Dependent Forward
@@ -547,7 +548,7 @@ grep "non-finite\|NaN" outputs/sdsd_flight3/nohup.out
 | `ssim` 趋势 | 持续下降到 <0.40（即 SSIM>0.60） | 停滞在 >0.45 |
 | `lit_up_map` 值域 | 均值在 [2.0, 6.0] | <1.0 或 >10.0 |
 | `i_sup` | 下降到 <2.0 | >5.0 (gain_map 未激活) |
-| WFR α 均值 | 在 [0.3, 0.7] | <0.1 或 >0.9 |
+| WFR α 均值 | 在 [0.5, 0.9] | <0.1 或 >0.95 |
 | `diag_prior` | 从 ~4.0 下降到 <2.0 | 上升（C_Ω 退化） |
 | 梯度 norm | Encoder/ISPN/SGRF 同数量级 | 某模块爆炸或消失 |
 

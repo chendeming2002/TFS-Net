@@ -71,7 +71,8 @@ class MCPN(nn.Module):
             nn.Conv2d(channels, channels, 3, 1, 1),
         )
 
-        self.gamma = nn.Parameter(torch.zeros(1, channels, 1, 1))
+        # Flight3: γ=0.001 → gradient flows through motion branch without visible output
+        self.gamma = nn.Parameter(torch.full((1, channels, 1, 1), 0.001))
 
         # Mark3: smooth startup — bias g_t toward 1.0 (favor f_center)
         #         and suppress outer residual at Phase 2 entry
@@ -84,7 +85,7 @@ class MCPN(nn.Module):
 
     def reset_startup(self):
         """Mark3: 从旧 checkpoint 续训时重置 MCPN 平滑启动参数"""
-        self.gamma.data.zero_()
+        self.gamma.data.fill_(0.001)  # Flight3: non-zero for gradient flow
         self.startup_gate.data.fill_(1.0)
         self.out_scale.data.zero_()
         nn.init.zeros_(self.refine.conv2.weight)

@@ -296,19 +296,19 @@ def main():
     # Mark3: Phase-based lr schedule (replaces CosineAnnealing + Linear warmup)
     def get_phase(epoch):
         if epoch < 5:   return 'phase1_warmup'
-        elif epoch < 20: return 'phase1'
-        elif epoch < 40: return 'phase1_5'   # Mark4: extended 20-epoch unlock ramp
+        elif epoch < 10: return 'phase1'         # Flight3: shortened to 5 epoch
+        elif epoch < 30: return 'phase1_5'       # 20-epoch unlock ramp
         else:            return 'phase2'
 
     def get_unlock_ratio(epoch):
-        if epoch < 20: return 0.0
-        elif epoch < 40: return (epoch - 20) / 20.0   # 20-epoch linear ramp
+        if epoch < 10: return 0.0
+        elif epoch < 30: return (epoch - 10) / 20.0   # 20-epoch linear ramp
         else: return 1.0
 
     def get_lr(epoch, base=cfg["train"]["lr"]):
         if epoch < 5: return base * (0.01 + 0.99 * epoch / 5)
-        elif epoch < 20: return base * 0.75
-        elif epoch < 40: return base * 0.75 * (1 - (epoch - 20) / 20 * 0.33)
+        elif epoch < 10: return base * 0.75
+        elif epoch < 30: return base * 0.75 * (1 - (epoch - 10) / 20 * 0.33)  # 6e-4→4e-4 over 20 epochs
         elif epoch < 55: return base * 0.5
         elif epoch < 70: return base * 0.125
         elif epoch < 80: return base * 0.05
@@ -391,15 +391,15 @@ def main():
 
         # Flight3 I: dynamic max_gain scheduling (4→16 over training)
         if hasattr(model, 'ispn') and hasattr(model.ispn, 'set_max_gain'):
-            max_g = 4.0 + (16.0 - 4.0) * min(epoch / 40.0, 1.0)
+            max_g = 4.0 + (16.0 - 4.0) * min(epoch / 30.0, 1.0)
             model.ispn.set_max_gain(max_g)
             if epoch % 10 == 0:
                 logger.info("max_gain updated to %.1f", max_g)
 
         # Phase transition actions
-        if epoch == 20:
+        if epoch == 10:
             logger.info("Phase 1.5: Unlocking NDPN/MCPN/CXG")
-        if epoch == 40:
+        if epoch == 30:
             logger.info("Phase 2: Full tri-source restoration")
 
         train_stats = train_one_epoch(
