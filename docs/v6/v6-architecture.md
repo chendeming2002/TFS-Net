@@ -1,8 +1,8 @@
 # TFS-Net v6 Delta Mark4 模型架构设计文档
 
-> 日期：2026-07-06 (更新: Mark4 三部保险 + TFDE/ISPN 简化)
+> 日期：2026-07-08 (更新: 损失重构 + ISPN初始化 + 相位调度延展)
 > 版本：v6 Delta Mark4
-> 训练配置：`configs/v6_bravo.yaml`，batch=4, lr=8e-4, epochs=50, warmup=5
+> 训练配置：`configs/v6_bravo.yaml`，batch=4, lr=8e-4, epochs=90
 > 参数量：1.45M
 
 ---
@@ -207,10 +207,10 @@ $$\log G = \text{Conv}_{1\times1} \to \text{GELU} \to \text{Conv}_{1\times1}(h),
 
 $$B = \tanh\left(\text{Conv}_{1\times1} \to \text{GELU} \to \text{Conv}_{1\times1}(h)\right) \cdot B_{\text{range}}$$
 
-**零初始化策略**：
-- `gain_head[-1]` (weight, bias) = 0 → $\log G = 0$ → $G = \exp(0) = 1$ (恒等)
+**初始化策略**：
+- `gain_head[-1].weight` = 0, `gain_head[-1].bias` = **0.8** → $\log G = 0.8$ → $G = \exp(0.8) \approx 2.23$ (中等提亮)
 - `bias_head[-1]` (weight, bias) = 0 → $B = 0$ (无偏置)
-- Phase 1 初始行为：增强图像 = 原图 (不改变亮度)，渐进学习提亮
+- Phase 1 初始行为：增强图像 = 输入 × 2.23（约 2 档曝光补偿），渐进学习空间变化
 
 ### 2.5 NDPN — 噪声退化处理 (对应 $\sigma^2_{\text{img}}$)
 
@@ -297,7 +297,7 @@ Encoder feat → [HaarDWT] → LL, LH, HL, HH
 Mark4 移除 FrequencyBranch/LFF/phase_conf，用多尺度空洞卷积替代频域分析。
 
 ```
-feat_tfde (B,T,C,H/2,W/2) from SWD
+feat_tfde (B,T,C,H/2,W/2) from WFR
   │
   ├─ GroupNorm (逐帧)
   ├─ 时域统计: soft-median(μ), var(σ), μ/σ(SNR) 沿 T 维
@@ -384,10 +384,10 @@ pre_norm LayerNorm 在 R/K/V 投影前
 | v5.9.2 | s_illum 复生 + IFPN 监督 | 1.14M | 20.39 PSNR |
 | v6.5 | PureRWKV 移除 DAT | 1.17M | 20.36 |
 | v6 Delta | 空间扫描2D-WKV + C_omega + F_t_aligned | 1.64M | 训练崩溃 |
-| v6 Delta Mark1 | SWD子带分流 + 命名统一 + 数值稳定 | 1.69M | ep15 loss收敛 |
+| v6 Delta Mark1 | WFR子带分流 + 命名统一 + 数值稳定 | 1.69M | ep15 loss收敛 |
 | **v6 Delta Mark2** | **Kendall不确定性加权 + PE Loss + 感知解耦 + 损失调度** | **1.69M** | 收敛停滞 |
 | **v6 Delta Mark3** | **两阶段渐进训练 + ISPN 隔离 + SGRF 中间监督 + 相位调度** | **1.69M** | PSNR 18→8.7 |
-| **v6 Delta Mark4** | **三部保险 (zero-gate) + TFDE/ISPN 简化 + 延长的 Phase 1.5** | **1.45M** | **训练中(ep1)** |
+| **v6 Delta Mark4** | **三部保险 (zero-gate) + DPE/ISPN 简化 + 损失重构 + 延展相位** | **1.45M** | **收敛中** |
 
 ---
 
@@ -405,11 +405,11 @@ $$L_{\text{total}} = \sum_{i} \frac{1}{2\exp(s_i)} L_i + \frac{1}{2}s_i$$
 |-----|-------------|---------|
 | `pix` | 0.0 | 像素重建 |
 | `ssim` | -1.0 | 结构相似度 |
-| `illum` | 0.0 | 光照平滑 + 光照图监督 |
+| `illum` | 0.0 | 光照图边缘平滑 |
 | `ifpn` | 0.0 | TCA 对齐质量 (align_warp + diag_prior) |
 | `perc` | 2.0 | VGG 感知 (Phase 1 屏蔽, Phase 2→-1.0) |
 | `freq` | 0.0 | 频域纹理 |
-| `inter` | 0.0 | 中间路径监督 |
+| `inter` | 0.0 | 中间乘法路径监督 |
 
 ### 6.2 各损失项
 
@@ -419,16 +419,16 @@ $$L_{\text{total}} = \sum_{i} \frac{1}{2\exp(s_i)} L_i + \frac{1}{2}s_i$$
 |----|------|---------|------|
 | **L_pix** | PECharbonnier(res_t, GT) | 最终输出 | SGRF-S3 |
 | **L_ssim** | 1 - SSIM(res_t, GT) | 结构相似度 | 最终输出 |
-| **L_illum_sup** | L1(lit_up_map, GT/I̅_t) | 光照图空间分布 | ISPN→lit_up_map |
+| **L_gain_sup** | L1(gain_map, GT/I̅_t) | 光照图空间分布 | ISPN→gain_map |
 
-#### Phase 1 专属 — TCA 对齐 & ISPN 约束
+#### TCA 对齐 & 正则 (Phase 1/2 共享)
 
 | 项 | 公式 | 物理含义 |
 |----|------|---------|
 | **L_align_warp** | L1(∑C·F_neighbor, F_center) | 时序 warp 一致性：用 C_omega 对齐邻帧特征，应与中心帧一致 |
 | **L_diag_prior** | −mean(log(diag(C_Ω)+ε)) | C_Ω 对角先验：鼓励静止区域对应 identity（无 GT 自监督） |
 | **L_illum_smooth** | TV(s_illum)·e^{−‖∇I‖} | 光照图边缘感知平滑 |
-| **L_swd_reg** | (ᾱ − 0.5)² | WFR 分流平衡正则：防 α 偏离中心 |
+| **L_wfr_reg** | (ᾱ − 0.5)² | WFR 分流平衡正则：防 α 偏离中心 |
 
 #### Phase 2 专属 — 感知解耦 & 中间监督
 
@@ -437,16 +437,15 @@ $$L_{\text{total}} = \sum_{i} \frac{1}{2\exp(s_i)} L_i + \frac{1}{2}s_i$$
 | **L_ssim_s1** | 1 − SSIM(img_s1, GT) | SGRF-S1 (去噪) | 感知解耦：SSIM→S1 |
 | **L_perc_s2** | ‖VGG(img_s2) − VGG(GT)‖ | SGRF-S2 (去模糊) | 感知解耦：VGG→S2 |
 | **L_pix_s3** | Charbonnier(img_s2·lit_up_map, GT) | SGRF-S3 提亮路径 | 中间乘法监督 |
-| **L_ifpn_side** | Charbonnier(ifpn_side, GT↓) | ISPN 侧输出 | 暗图监督 |
 | **L_freq** | L1(|FFT(res)|, |FFT(GT)|) | 频域纹理 | 目标纹理细节 |
 
 #### Kendall UW 聚合规则
 
 | 阶段 | 聚合公式 |
 |------|---------|
-| Phase 1 Warmup | UW(pix) + UW(ssim) + UW(illum_smooth + 0.02·L_illum_sup) + 0.001·L_swd_reg |
-| Phase 1 Main | Phase1_Warmup + UW(align_warp + diag_prior, 'ifpn') |
-| Phase 2 | 完整损失 (perceptual_decoupling: SSIM→S1, VGG→S2, Charb→S3) |
+| Phase 1 Warmup | UW(pix) + UW(ssim) + UW(illum_smooth, 'illum') + UW(align+diag, 'ifpn') + 0.5·L_gain_sup + 0.001·L_wfr_reg |
+| Phase 1 Main | 同上 |
+| Phase 2 | ← + UW(perc, 'perc') + UW(freq, 'freq') + UW(inter, 'inter') (感知解耦: SSIM→S1, VGG→S2) |
 
 ### 6.3 相位调度 (Mark4)
 
@@ -454,22 +453,22 @@ $$L_{\text{total}} = \sum_{i} \frac{1}{2\exp(s_i)} L_i + \frac{1}{2}s_i$$
 
 | 阶段 | Epoch | 损失 | NDPN/MCPN | CXG | lr |
 |------|-------|------|-----------|-----|-----|
-| **Phase 1 Warmup** | 0–4 | pix + ssim + illum_smooth + lit_up_sup + swd_reg | **zero** (输出置零) | bypass | 8e-6→8e-4 |
-| **Phase 1 Main** | 5–19 | + align_warp + diag_prior | **zero** | bypass | 6e-4 |
-| **Phase 1.5** | 20–29 | = Phase 1 Main | 线性解锁 0→100% | ratio>0.3 时启用 | 6e-4→4e-4 |
-| **Phase 2** | 30–49 | 全损失 (感知解耦 + freq + 中间监督) | 100% | 启用 | 4e-4→1e-4 |
+| **Phase 1 Warmup** | 0–4 | pix + ssim + illum_smooth + gain_sup + align+diag + wfr_reg | **zero** | bypass | 8e-6→8e-4 |
+| **Phase 1 Main** | 5–19 | 同上 | **zero** | bypass | 6e-4 |
+| **Phase 1.5** | 20–39 | 同上 | 线性解锁 0→100% (0.05/epoch) | ratio>0.3 启用 | 6e-4→4e-4 |
+| **Phase 2** | 40–89 | 全损失 (感知解耦 + freq + inter + 共享项) | 100% | 启用 | 4e-4→0.16e-4 |
 
 **关键设计决策**：
 
 1. **Phase 1 NDPN/MCPN/SGRF 截断 (Mark4 三部保险)**：Mark3 仅截断 NDPN/MCPN，但 SGRF StageBlock 在 Phase 1 被训练为处理零输入。Phase 2 激活时，StageBlock 收到非零特征后产生任意输出 → PSNR 18→8.7。Mark4 增加三重零保证：NDPN (gamma=0, noise_proj=0) + MCPN (gamma=0, refine=0, startup_gate=1, out_scale=0) + SGRF StageBlock (gate=0)。任一层独立保底。
 
-2. **Phase 1.5 延长到 10 epoch (20→30)**：Mark3 的 5 epoch 斜坡不足以让 SGRF StageBlock 适应非零输入。延长到 10 epoch，配合 zero-gate 渐进释放，确保 Phase 2 启动平稳。
+2. **Phase 1.5 延长到 20 epoch (20→40), Phase 2 延长到 50 epoch (40→90)**：Mark3 的 5 epoch 斜坡不足以让 SGRF StageBlock 适应非零输入。延长到 20 epoch 斜坡(0.05/epoch) + 50 epoch Phase 2(lr 4e-4→0.16e-4)，配合 zero-gate 渐进释放和 gain_sup 有效监督。
 
 3. **感知解耦** (Perceptual Decoupling)：Mark2 设计 B1 方案——SSIM 损失监督 SGRF-S1（去噪），VGG 感知损失监督 SGRF-S2（去模糊），Charbonnier 监督 S3 乘法路径。消除"同一输出接收 SSIM+感知 冲突梯度"问题。
 
 4. **L_diag_prior 自监督**：dataloader 只提供中心帧 GT，无法获取邻帧 GT。使用 C_Ω 对角线的 −log(·) 先验，无条件鼓励 identity 对应。Phase 1 无运动分支，副作用可控。Phase 2 可扩展为邻帧 GT 对应监督。
 
-5. **L_swd_reg 弱正则**：固定权重 0.001（不受 Kendall UW 控制），防止 α_net 极端分流失衡（α→0 或 α→1）。
+5. **L_gain_sup 直接监督**：权重 0.5（固定，不受 Kendall UW），将 gain_map 与 GT/I̅ 逐像素 L1 对比。解决 ISPN gain_head 训练路径过长（pix loss → res_t → gain_map 的间接梯度）导致的 gain 学习不足。L_wfr_reg 弱正则（0.001）防止 α_net 极端分流失衡。
 
 ---
 
@@ -481,11 +480,11 @@ $$L_{\text{total}} = \sum_{i} \frac{1}{2\exp(s_i)} L_i + \frac{1}{2}s_i$$
 |------|-----|------|
 | batch_size | 4 | 物理 batch |
 | grad_accum_steps | **1** | 等效 batch=4 |
-| epochs | 50 | — |
+| epochs | 90 | — |
 | lr (Phase 1 Warmup) | 8e-6 → 8e-4 | 线性 warmup |
 | lr (Phase 1 Main) | 6e-4 | 固定 |
-| lr (Phase 1.5) | 6e-4 → 4e-4 | 线性过渡 |
-| lr (Phase 2) | 4e-4 → 1e-4 | Cosine annealing |
+| lr (Phase 1.5) | 6e-4 → 4e-4 | 线性过渡 (20 epoch) |
+| lr (Phase 2) | 4e-4 → 1.6e-5 | Cosine annealing (50 epoch) |
 | optimizer | AdamW | — |
 | weight_decay | 1e-4 | L2 正则 |
 | grad_clip | 0.5 | 梯度裁剪 |
@@ -498,25 +497,22 @@ $$L_{\text{total}} = \sum_{i} \frac{1}{2\exp(s_i)} L_i + \frac{1}{2}s_i$$
 def get_phase(epoch):
     if epoch < 5:   return 'phase1_warmup'
     elif epoch < 20: return 'phase1'
-    elif epoch < 30: return 'phase1_5'   # Mark4: 10-epoch unlock ramp
+    elif epoch < 40: return 'phase1_5'   # 20-epoch unlock ramp
     else:            return 'phase2'
 
 def get_unlock_ratio(epoch):
     if epoch < 20: return 0.0
-    if epoch >= 30: return 1.0
-    return (epoch - 20) / 10.0  # 线性 0→1
+    if epoch >= 40: return 1.0
+    return (epoch - 20) / 20.0  # 线性 0→1
 
 def get_lr(epoch, base_lr=8e-4):
-    if epoch < 5:
-        return base_lr * (0.01 + 0.99 * epoch / 5)
-    elif epoch < 20:
-        return 0.75 * base_lr
-    elif epoch < 30:
-        ratio = (epoch - 20) / 10.0
-        return (0.75 * (1 - ratio) + 0.5 * ratio) * base_lr
-    else:
-        progress = (epoch - 30) / 20.0
-        return 0.50 * base_lr * (0.5 + 0.5 * math.cos(math.pi * progress))
+    if epoch < 5:   return base_lr * (0.01 + 0.99 * epoch / 5)
+    elif epoch < 20: return 0.75 * base_lr
+    elif epoch < 40: ratio = (epoch - 20) / 20.0; return (0.75 * (1 - ratio) + 0.5 * ratio) * base_lr
+    elif epoch < 55: return 0.5 * base_lr
+    elif epoch < 70: return 0.125 * base_lr
+    elif epoch < 80: return 0.05 * base_lr
+    else:            return 0.02 * base_lr
 ```
 
 ### 7.3 Phase-Dependent Forward
@@ -562,7 +558,7 @@ grep "non-finite\|NaN" outputs/sdsd_delta/nohup.out
 | `pix` 趋势 | 持续下降到 <0.12 | 平台期或上升 |
 | `ssim` 趋势 | 持续下降到 <0.40（即 SSIM>0.60） | 停滞在 >0.45 |
 | `lit_up_map` 值域 | 均值在 [2.0, 6.0] | <1.0 或 >10.0 |
-| `i_sup` | 下降到 <2.0 | >5.0 (lit_up 未激活) |
+| `i_sup` | 下降到 <2.0 | >5.0 (gain_map 未激活) |
 | WFR α 均值 | 在 [0.3, 0.7] | <0.1 或 >0.9 |
 | `diag_prior` | 从 ~4.0 下降到 <2.0 | 上升（C_Ω 退化） |
 | 梯度 norm | Encoder/ISPN/SGRF 同数量级 | 某模块爆炸或消失 |
@@ -573,15 +569,15 @@ grep "non-finite\|NaN" outputs/sdsd_delta/nohup.out
 
 | 文件 | 模块 |
 |------|------|
-| `models/modules/swd.py (legacy)` | SWD (SpatialWaveletDiverter, HaarDWT2D) |
+| `models/modules/swd.py (legacy)` | WFR (Wavelet Feature Router, HaarDWT2D) |
 | `models/modules/pure_rwkv_sace.py` | TCA, BiWKV, SpatialWKV2D, MVCShift, TemporalCorrespondence, TemporalAggregation |
-| `models/modules/tfsi_v2.py` | DPE (MultiScaleSpatialBranch) |
-| `models/modules/ispn_v2.py` | ISPN |
+| `models/modules/tfsi_v2.py` | DPE, MultiScaleSpatialBranch |
+| `models/modules/ispn_v2.py` | ISPN (gain/bias Retinex head) |
 | `models/modules/ifpn.py` | ISPN (legacy, Mark3) |
 | `models/modules/ndpn.py` | NDPN |
 | `models/modules/mrpn.py` | MCPN |
-| `models/modules/igrf.py` | SGRF |
+| `models/modules/igrf.py` | SGRF (zero-gate StageBlock, BrightenStage) |
 | `models/tfs_net.py` | CXG, TFSNet (数据流编排) |
-| `losses/losses.py` | TFSNetLoss (Kendall UW + PE Loss + Phase Schedule) |
-| `train.py` | 训练循环 (grad accum + loss schedule + phase lr) |
-| `configs/v6_bravo.yaml` | 训练配置 |
+| `losses/losses.py` | TFSNetLoss (Kendall UW + gain_sup + Phase Schedule) |
+| `train.py` | 训练循环 (grad accum + phase lr + metric logging) |
+| `configs/v6_bravo.yaml` | 训练配置 (batch=4, epochs=90) |

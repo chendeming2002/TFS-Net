@@ -199,10 +199,10 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
         meter_ifpn.update(loss_dict["loss_ifpn_sup"].item(), clip.size(0))
 
         progress.set_postfix(loss=meter_total.avg, pix=meter_pix.avg, ssim=meter_ssim.avg,
-                             i_sup=meter_illum_sup.avg, n_sup=meter_noise_sup.avg)
+                              perc=meter_perc.avg, i_sup=meter_illum_sup.avg)
         if (step + 1) % log_interval == 0:
             logger.info(
-                "step %d/%d loss=%.4f pix=%.4f freq=%.4f ssim=%.4f perc=%.4f illum=%.4f i_sup=%.4f n_sup=%.4f inter=%.4f ifpn=%.4f",
+                "step %d/%d loss=%.4f pix=%.4f freq=%.4f ssim=%.4f perc=%.4f illum=%.4f i_sup=%.4f inter=%.4f ifpn=%.4f",
                 step + 1,
                 len(loader),
                 meter_total.avg,
@@ -212,7 +212,6 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
                 meter_perc.avg,
                 meter_illum.avg,
                 meter_illum_sup.avg,
-                meter_noise_sup.avg,
                 meter_inter.avg,
                 meter_ifpn.avg,
             )

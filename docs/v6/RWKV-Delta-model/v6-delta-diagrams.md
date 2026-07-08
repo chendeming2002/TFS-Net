@@ -61,7 +61,7 @@ flowchart TD
 
 - **WFR 子带分流**：HaarDWT 在子带级分离 LL→光照/噪声 (TFDE), HF→结构 (TCA)。alpha_net(LL) 可学习 α ∈ (0,1) 分配 LL 子带, noise_gate(HF_energy) 门控 HF 子带。输出 LayerNorm。
 - **DPE (Mark4 简化)**：移除 FrequencyBranch/LFF/phase_conf，用多尺度空洞卷积 (d=1,2,4) 提取时域统计量 [μ,σ,SNR] 的空域特征。梯度路径从 `feats→LFF→DWT→phase→s_noise` 简化为 `feats→统计量→Conv→head`。
-- **ISPN (Mark4 简化)**：移除多帧 cosine attention + L_ratio 锚定，直接用 `f_enc + s_illum` 生成 gain_map (乘法提亮) + bias_map (加法修正)。零初始化 → gain≈1, bias≈0 → Phase 1 友好。
+- **ISPN (Mark4 简化)**：移除多帧 cosine attention + L_ratio 锚定，直接用 `f_enc + s_illum` 生成 gain_map (乘法提亮) + bias_map (加法修正)。零初始化 → gain≈2.23 (bias=0.8) → Phase 1 友好。
 - **TCA 空间扫描**：输入 SWD 的 H/2 特征。MVC-Shift(3 dilated DWConv) → 4方向 Bi-WKV → Channel Mix → H 上采样。C_omega 行 softmax 归一化，L_diag_prior 自监督。
 - **三部保险 (Mark4)**：Phase 2 启动时 NDPN (gamma=0, noise_proj=0) + MCPN (gamma=0, refine=0, startup_gate=1, out_scale=0) + SGRF StageBlock (gate=0) — 任一层都能独立保证无扰动。
 
@@ -69,10 +69,10 @@ flowchart TD
 
 | 阶段 | Epoch | lr | NDPN/MCPN | SGRF gate | 损失项 |
 |------|-------|-----|-----------|-----------|--------|
-| Phase 1 Warmup | 0-4 | 8e-6→8e-4 | zero | gate=0 | pix+ssim+illum+gain_sup+swd_reg+ifpn(align+diag) |
+| Phase 1 Warmup | 0-4 | 8e-6→8e-4 | zero | gate=0 | pix+ssim+illum+gain_sup+wfr_reg+ifpn(align+diag) |
 | Phase 1 Main | 5-19 | 6e-4 | zero | gate=0 | 同上 |
-| Phase 1.5 | 20-29 | 6e-4→4e-4 | 线性 0→100% | 渐进学习 | 同上 |
-| Phase 2 | 30-49 | 4e-4→1e-4 | 100%+CXG | 已学习 | +perceptual_decoupling(SSIM→S1,VGG→S2)+freq+inter |
+| Phase 1.5 | 20-39 | 6e-4→4e-4 | 线性 0→100% | 渐进学习 | 同上 |
+| Phase 2 | 40-89 | 4e-4→0.16e-4 | 100%+CXG | 已学习 | +perceptual_decoupling(SSIM→S1,VGG→S2)+freq+inter |
 
 ---
 
@@ -132,7 +132,7 @@ flowchart TD
     subgraph ISPN["ISPN 光照源处理 (Mark4: Retinex gain/bias)"]
         direction TB
         ISPN_REFINE["refine: Conv(f_enc + s_illum, 65→64)<br/>→ GELU → Conv(64→64) → GELU → h"]
-        ISPN_GAIN["gain_head: Conv(64→16)→GELU→Conv(16→1)<br/>→ exp(log_gain) → clamp[1, max_gain]<br/>零初始化 → gain≈1 (恒等)"]
+        ISPN_GAIN["gain_head: Conv(64→16)→GELU→Conv(16→1)<br/>→ exp(log_gain) → clamp[1, max_gain]<br/>零初始化 → gain≈2.23 (中等提亮, bias=0.8)"]
         ISPN_BIAS["bias_head: Conv(64→16)→GELU→Conv(16→3)<br/>→ tanh × range → bias∈[-0.1, 0.1]<br/>零初始化 → bias≈0 (无偏置)"]
         ISPN_REFINE --> ISPN_GAIN
         ISPN_REFINE --> ISPN_BIAS
@@ -187,7 +187,7 @@ flowchart TD
 ### TCA 空间扫描详解
 
 ```
-feat_tca (B,T,C,H/2,W/2) from SWD — 已是半分辨率, 无需再降采样
+feat_tca (B,T,C,H/2,W/2) from WFR — 已是半分辨率, 无需再降采样
   │
   ├─ [MVC-Shift] 3分支空洞DWConv(d=1,2,3) + 1x1混频 → x_shifted
   │
@@ -238,16 +238,16 @@ SGRF:   StageBlock gate = 0 → delta = Conv(x)*0 = 0 → img unchanged
                     ─────────────────────        ─────────────────────
 res_t    ←→ GT  ─→  pix (PECharbonnier)          pix
                     ssim (1-SSIM)                 ssim
-gain_map ← GT/I̅ ─→  gain_sup (L1, 0.02×illum)   gain_sup
+gain_map ← GT/I̅ ─→  gain_sup (L1, 0.5× 固定权重)   gain_sup
 s_illum          ─→  illum_smooth (edge-TV)       illum_smooth
-SWD α            ─→  swd_reg (0.001固定)          swd_reg
+WFR α            ─→  wfr_reg (0.001固定)          wfr_reg
 C_omega          ─→                               align_warp (L1 warp一致性)
                                                   diag_prior (-log(diag)自监督)
 NDPN/MCPN         →  零截断 (不参与训练)
 CXG               →  bypass (不参与训练)
 SGRF gate         →  零 (不参与训练, 三重保险)
 
-                    Phase 1.5 (20-29)             Phase 2 (30-49)
+                    Phase 1.5 (20-39)             Phase 2 (40-89)
                     ─────────────────────        ────────────────────
                     损失同上, NDPN/MCPN           img_s1 ←→ GT → ssim_s1
                     线性unlock_ratio              img_s2 ←→ GT → perc_s2 (VGG)
@@ -281,5 +281,5 @@ SGRF gate         →  零 (不参与训练, 三重保险)
 | **StageBlock** | 标准ResBlock | 同Mark1 | **zero-gate 零初始化** |
 | **MCPN** | 随机初始化 | startup_gate=1 | **gamma=0 + refine=0 + out_scale=0** |
 | **Phase 2 启动** | 剧烈扰动 | PSNR 18→8.7 暴跌 | **三重保险 (无扰动)** |
-| **Phase 1.5** | 5 epoch (20-25) | 同 | **10 epoch (20-30)** |
+| **Phase 1.5** | 5 epoch (20-25) | 同 | **20 epoch (20-40)** |
 | **参数** | 1.69M | 1.69M | **1.45M** |

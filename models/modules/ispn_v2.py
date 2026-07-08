@@ -32,7 +32,7 @@ class ISPN(nn.Module):
             nn.Conv2d(channels // 4, 1, 1),
         )
         nn.init.zeros_(self.gain_head[-1].weight)
-        nn.init.zeros_(self.gain_head[-1].bias)
+        nn.init.constant_(self.gain_head[-1].bias, 0.8)  # log(2.2)→gain≈2.2 initial: moderate brightening
 
         self.bias_head = nn.Sequential(
             nn.Conv2d(channels, channels // 4, 1),
