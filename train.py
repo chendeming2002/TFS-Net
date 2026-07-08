@@ -227,7 +227,7 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
                         gain.mean().item() if gain is not None else 0,
                         gain.std().item() if gain is not None else 0,
                     )
-        return {
+    return {
         "loss_total": meter_total.avg,
         "loss_pix": meter_pix.avg,
         "loss_freq": meter_freq.avg,
