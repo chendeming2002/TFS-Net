@@ -20,7 +20,7 @@ TSD-Net (Tri-Source Decoupled Network) 是一个端到端多帧低光视频增�
 | **NDPN** | Noise Degradation Processing Network | C_omega 置信度引导去噪 (γ=0.01 → 10× stronger gradient flow) |
 | **MCPN** | Motion Compensation Processing Network | C_omega 运动强度补偿 (gamma=0.01, startup→pass-through) |
 | **CXG** | Cross-eXcitation Gate | 去噪↔运动 交叉激励门 (Mod3: 输出喂入SGRF, 不再pass-through原始NDPN/MCPN) |
-| **SGRF** | Stage-wise Guided Restoration & Fusion | S1:去噪 → S2:去模糊 → S3:gain×img+bias (Mark4: zero-gate StageBlock) |
+| **SGRF** | Stage-wise Guided Restoration & Fusion | S1:去噪 → S2:去模糊 → S2.5:ZeroDCE曲线(Mod4) → S3:gain×img+bias |
 
 ### 命名变更总表
 
@@ -34,7 +34,7 @@ TSD-Net (Tri-Source Decoupled Network) 是一个端到端多帧低光视频增�
 | IGRF | **SGRF** | 阶段式引导修复融合 |
 | CrossFusionGate | **CXG** | 交叉激励门 |
 
-### 完整数据流 (Mark4)
+### 完整数据流 (Mod4)
 
 ```
 输入: I_{t-2}, I_{t-1}, I_t, I_{t+1}, I_{t+2}  (T=5 窗口)
@@ -277,7 +277,7 @@ $$\text{S2.5 (曲线, Mod4): } \quad I_2^{\text{curve}} = \text{ZeroDCE}(I_2, \a
 
 $$\text{S3 (提亮): } \quad \hat{X}_t = \text{clamp}\left(I_2^{\text{curve}} \odot G + B + \delta_3(I_2^{\text{curve}}G+B) \cdot \gamma_3, 0, 1\right)$$
 
-其中 $\gamma_1 = \gamma_2 = \gamma_3 = 0$ (初始) → Phase 1 完全等效于纯 ISPN 提亮（曲线=identity）。$\gamma_i$ 在 Phase 1.5/2 渐进释放。
+其中 $\gamma_1 = \gamma_2 = \gamma_3 = 0$ (初始) → Phase 1 完全等效于纯 ISPN 提亮。四重零保证: 分支零(NDPN/MCPN截断) × gate零(StageBlock) × unlock零(ratio=0) × curve零(α=0)。
 
 ---
 
@@ -581,7 +581,7 @@ grep "non-finite\|NaN" outputs/sdsd_flight3/nohup.out
 | `models/modules/swd.py (legacy)` | WFR (Wavelet Feature Router, HaarDWT2D) |
 | `models/modules/pure_rwkv_sace.py` | TCA, BiWKV, SpatialWKV2D, MVCShift, TemporalCorrespondence, TemporalAggregation |
 | `models/modules/tfsi_v2.py` | DPE, MultiScaleSpatialBranch |
-| `models/modules/ispn_v2.py` | ISPN (gain/bias Retinex head) |
+| `models/modules/ispn_v2.py` | ISPN (Mod4: CurveBranch + gain/bias Retinex head) |
 | `models/modules/ifpn.py` | ISPN (legacy, Mark3) |
 | `models/modules/ndpn.py` | NDPN |
 | `models/modules/mrpn.py` | MCPN |

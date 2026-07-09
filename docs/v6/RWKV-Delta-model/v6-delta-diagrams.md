@@ -31,7 +31,7 @@ flowchart TD
         CXG["CXG<br/>Mod3: 输出 f_noise_gated, f_motion_gated → SGRF<br/>training:动态交叉调制<br/>infer:静态重参数化"]
     end
 
-    subgraph 执行层["SGRF 阶段式修复融合 (Flight3: gain/bias)"]
+    subgraph 执行层["SGRF 阶段式修复融合 (Mod4: ZeroDCE曲线 + gain/bias)"]
         SGRF["SGRF (Mod4: ZeroDCE曲线增强)<br/>S1: zero-gate StageBlock + f_noise → img_s1<br/>S2: zero-gate StageBlock + f_motion → img_s2<br/>S2.5: ZeroDCE_curve(img_s2, curve_α) → img_curved<br/>S3: img_curved × gain + bias → res_t"]
     end
 
@@ -249,7 +249,7 @@ C_omega          ─→                               align_warp (L1 warp一致�
                                                   diag_prior (-log(diag)自监督)
 NDPN/MCPN         →  零截断 (不参与训练)
 CXG               →  bypass (不参与训练)
-SGRF gate         →  零 (不参与训练, 三重保险)
+SGRF gate         →  零 (四重保险: 分支零 × gate零 × unlock零 × curve零)
 
                     Phase 1.5 (10-29)             Phase 2 (30-89)
                     ─────────────────────        ────────────────────
