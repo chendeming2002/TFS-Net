@@ -366,11 +366,18 @@ class TFSNetLoss(nn.Module):
                     L_wfr_reg = (wfr._alpha_mean - 0.7)**2  # asymmetric: allow DPE to take more LL
                 except: pass
 
+            # Flight3 B: DPE direct supervision — break spatial constancy
+            L_dpe_prior = pred.new_tensor(0.0)
+            if "s_illum" in outputs and "image_center" in outputs:
+                ic = outputs["image_center"].mean(dim=1, keepdim=True)
+                L_dpe_prior = F.l1_loss(s_illum, (1.0 - ic).detach().expand_as(s_illum))
+
             if self.uncertainty_weighting:
                 L = (self._uw(L_pix, 'pix') + self._uw(L_ssim, 'ssim')
                    + self._uw(L_illum_smooth, 'illum')
                    + self._uw(L_align_warp + L_diag_prior, 'ifpn')
-                   + 0.5 * L_gain_sup + 0.001 * L_wfr_reg)
+                   + 0.5 * L_gain_sup + 0.001 * L_wfr_reg
+                   + 0.1 * L_dpe_prior)  # Flight3 B: DPE direct supervision
             else:
                 L = self.lambda_pix * L_pix + self.lambda_ssim * L_ssim + self.lambda_illum * L_illum_smooth
             losses.update({'loss_pix': L_pix.detach(), 'loss_ssim': L_ssim.detach(),
@@ -432,6 +439,16 @@ class TFSNetLoss(nn.Module):
             img_s2_lit = torch.clamp(outputs["img_s2"] * gain, 0.0, 1.0)
             L_inter = charbonnier_loss(img_s2_lit, target)
 
+        # Gamma anti-collapse (Flight3 Mod3): penalize gamma→0
+        L_gamma_reg = pred.new_tensor(0.0)
+        if model is not None and epoch >= 10:
+            if hasattr(model, 'ndpn') and hasattr(model.ndpn, 'gamma'):
+                g_ndpn = model.ndpn.gamma.abs().mean()
+                L_gamma_reg = L_gamma_reg + torch.relu(0.005 - g_ndpn)
+            if hasattr(model, 'mcpn') and hasattr(model.mcpn, 'gamma'):
+                g_mcpn = model.mcpn.gamma.abs().mean()
+                L_gamma_reg = L_gamma_reg + torch.relu(0.005 - g_mcpn)
+
         # WFR reg (Mark4: shared)
         L_wfr_reg = pred.new_tensor(0.0)
         if model is not None and hasattr(model, 'wfr'):
@@ -444,6 +461,12 @@ class TFSNetLoss(nn.Module):
 
         # align_warp + diag_prior (already computed above, shared)
         # Mark4: these C_omega losses remain active in all phases
+
+        # Flight3 B: DPE direct supervision (Phase 2, reduced weight)
+        L_dpe_prior = pred.new_tensor(0.0)
+        if "s_illum" in outputs and "image_center" in outputs:
+            ic = outputs["image_center"].mean(dim=1, keepdim=True)
+            L_dpe_prior = F.l1_loss(s_illum, (1.0 - ic).detach().expand_as(s_illum))
 
         # Mark2 warmup: pix+ssim only for first 5 epochs
         if self.warmup_loss_only_pix_ssim and epoch < 5:
@@ -460,6 +483,8 @@ class TFSNetLoss(nn.Module):
                 + self._uw(L_inter, 'inter')
                 + self._uw(L_align_warp, 'ifpn')  # Phase 2: diag_prior removed
                 + 0.5 * L_gain_sup + 0.001 * L_wfr_reg
+                + 0.01 * L_dpe_prior  # Flight3 B: DPE supervision (reduced in Phase 2)
+                + 0.1 * L_gamma_reg  # Flight3 Mod3: gamma anti-collapse
             )
         else:
             L_total = (
@@ -480,6 +505,7 @@ class TFSNetLoss(nn.Module):
             "loss_noise_sup":  L_noise_sup.detach(),
             "loss_inter":      L_inter.detach(),
             "loss_ifpn_sup":   L_diag_prior.detach(),
+            "loss_gamma_reg":  L_gamma_reg.detach(),
         }
         return L_total, loss_dict
 

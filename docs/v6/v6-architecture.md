@@ -1,7 +1,7 @@
 # TFS-Net v6 Delta Flight3 模型架构设计文档
 
-> 日期：2026-07-08 (更新: Phase重构 + NDPN/MCPN γ=0.001 + diag_prior取消 + wfr_reg改0.7)
-> 版本：v6 Delta Flight3
+> 日期：2026-07-09 (更新: Mod4 ZeroDCE曲线增强 + CXG路由修复 + γ=0.01 + gamma anti-collapse + per-phase ckpt)
+> 版本：v6 Delta Flight3 Mod4
 > 训练配置：`configs/delta_flight3.yaml`，batch=4 (accum=2→eff=8), lr=8e-4, epochs=90
 > 参数量：1.45M
 
@@ -16,10 +16,10 @@ TSD-Net (Tri-Source Decoupled Network) 是一个端到端多帧低光视频增�
 | **WFR** | Wavelet Feature Router | Haar DWT 子带级分流 (LL→光照/噪声, HF→结构) |
 | **DPE** | Degradation Prior Estimator | 时域统计 + 多尺度空洞卷积 → s_illum, s_noise (Mark4 简化) |
 | **TCA** | Temporal Correspondence & Alignment | 4方向空间 WKV 扫描 + C_omega 时序矩阵 |
-| **ISPN** | Illumination-Source Processing Network | Retinex gain/bias 头 → gain_map, bias_map (Mark4 简化) |
-| **NDPN** | Noise Degradation Processing Network | C_omega 置信度引导去噪 (γ=0.001 → 微弱梯度流过) |
-| **MCPN** | Motion Compensation Processing Network | C_omega 运动强度补偿 (gamma=0.001, startup→pass-through) |
-| **CXG** | Cross-eXcitation Gate | 去噪↔运动 交叉激励门 (deploy 重参数化) |
+| **ISPN** | Illumination-Source Processing Network | ZeroDCE曲线增强 + Retinex gain/bias (Mod4: s_illum→curve_α→全局亮度映射) |
+| **NDPN** | Noise Degradation Processing Network | C_omega 置信度引导去噪 (γ=0.01 → 10× stronger gradient flow) |
+| **MCPN** | Motion Compensation Processing Network | C_omega 运动强度补偿 (gamma=0.01, startup→pass-through) |
+| **CXG** | Cross-eXcitation Gate | 去噪↔运动 交叉激励门 (Mod3: 输出喂入SGRF, 不再pass-through原始NDPN/MCPN) |
 | **SGRF** | Stage-wise Guided Restoration & Fusion | S1:去噪 → S2:去模糊 → S3:gain×img+bias (Mark4: zero-gate StageBlock) |
 
 ### 命名变更总表
@@ -48,15 +48,16 @@ TSD-Net (Tri-Source Decoupled Network) 是一个端到端多帧低光视频增�
   │
   ├─→ TCA(F_tca) → {F_{t'}^{\text{out}}}_{t'=0}^{T-1}, C_{t,Ω}, \hat{F}_t, μ, σ
   │
-  ├─→ ISPN(f_enc, s_illum) → gain_map, bias_map
+  ├─→ ISPN(f_enc, s_illum) → curve_alpha, gain_map, bias_map
   ├─→ NDPN({F^{\text{out}}}, s_noise, μ, σ, C_{t,Ω}, \hat{F}_t) → f_noise_out
   ├─→ MCPN({F^{\text{out}}}, σ, C_{t,Ω}, \hat{F}_t) → f_motion_out
   │
   ├─→ CXG(f_noise_out, f_motion_out) → f_noise_gated, f_motion_gated
   │
-  └─→ SGRF(gain, bias, f_noise_gated, f_motion_gated, I_t)
+  └─→ SGRF(gain, bias, f_noise_gated, f_motion_gated, I_t, curve_α)
         S1: I_1 = I_t + StageBlock_1(f_noise_gated, gate=0)
         S2: I_2 = I_1 + StageBlock_2(f_motion_gated, gate=0)
+        S2.5 (Mod4): I_2 = ZeroDCE_curve(I_2, curve_α)  ← 全局曲线提亮
         S3: \hat{X}_t = clamp(I_2 × gain + bias, 0, 1)
 ```
 
@@ -182,9 +183,20 @@ $$F_{\text{TCA}} = \text{LN}\left(\text{Conv}_{1\times1}([LL_{\text{TCA}}, \text
 
 删除 `noise_gate` 和 `hf_tca_norm` 两个子模块，简化 WFR 并消除误分流的归纳偏置。
 
-### 2.4 ISPN — 光照源处理 (Flight3: softplus gain + 动态 max_gain)
+### 2.4 ISPN — 光照源处理 (Mod4: ZeroDCE曲线增强 + softplus gain)
 
-ISPN 接收编码器中心帧特征 $F_t^{\text{enc}}$ 和 DPE 的光照先验 $s_{\text{illum}}$，输出 Retinex 风格的增益-偏置对。
+ISPN 接收编码器中心帧特征 $F_t^{\text{enc}}$ 和 DPE 的光照先验 $s_{\text{illum}}$，输出三部分：全局曲线参数 `curve_alpha`（粗提亮）、空间增益/偏置图（细修正）。
+
+**Mod4 CurveBranch (ZeroDCE-style)**。从 $s_{\text{illum}}$ 的全局均值预测 per-image curve 参数，受 V11 全局曲线分解启发，仅有 9 个自由度 (3 iter × 3 RGB)：
+$$\alpha = \text{Tanh}\left(\text{MLP}_{1\to16\to9}\left(\text{AvgPool}(s_{\text{illum}})\right)\right), \quad \alpha \in \mathbb{R}^{B\times N_{\text{iter}}\times 3}$$
+
+**ZeroDCE 迭代曲线**：$$LE_n(I) = LE_{n-1}(I) + \alpha_n \odot LE_{n-1}(I) \odot (1 - LE_{n-1}(I))$$
+
+在 SGRF S2 和 S3 之间施加曲线（去噪/去模糊后提亮），然后 gain/bias 做空间残差修正。
+
+**零初始化**：MLP 权重=0 → $\alpha=0$ → 初始曲线为 identity，Phase 1 零扰动。
+
+**空间 gain/bias (保留)**：
 
 **Retinex 物理模型**：
 $$\hat{X}_t = I_t \cdot G + B$$
@@ -218,7 +230,7 @@ $$c = \text{conf\_proj}\left(\text{diag}(C_{t,\Omega}^{(1)}),\dots,\text{diag}(C
 
 $$\mathbf{n} = \text{noise\_extract}\left([F_t^{\text{enc}}, \hat{F}_t]\right) \quad\text{(encoder vs aligned 差异)}$$
 
-$$\text{strength} = \sigma\left(\text{denoise\_strength}([\mathbf{n}, c])\right), \quad \gamma_n = 0.001 \quad\text{(Flight3: non-zero for gradient flow)}$$
+$$\text{strength} = \sigma\left(\text{denoise\_strength}([\mathbf{n}, c])\right), \quad \gamma_n = 0.01 \quad\text{(Mod3: 10× stronger for visible noise subtraction)}$$
 
 $$\mathbf{f}_{\text{noise}} = F_t^{\text{enc}} - \gamma_n \cdot \mathbf{n} \odot \text{strength} + \text{noise\_proj}(s_{\text{noise}})$$
 
@@ -236,7 +248,7 @@ $$\Delta_m = \text{motion\_refine}([\hat{F}_t, F_{\text{omega}}]), \quad \text{c
 
 $$\mathbf{f}_{\text{motion}} = g_t \odot \hat{F}_t + (1-g_t) \odot F_{\text{omega}} + \gamma_m \cdot \Delta_m \odot \text{comp}$$
 
-其中 $\gamma_m = 0.001$ (Flight3: non-zero for gradient flow)。$g_t = \sigma(\text{gate}([\hat{F}_t, F_{\text{omega}}]))$ 控制信任对齐中心 vs 聚合邻帧。
+其中 $\gamma_m = 0.01$ (Mod3: 10× stronger for visible motion compensation)。$g_t = \sigma(\text{gate}([\hat{F}_t, F_{\text{omega}}]))$ 控制信任对齐中心 vs 聚合邻帧。
 
 ### 2.7 CXG — 交叉激励门
 
@@ -246,24 +258,26 @@ $$\mathbf{f}_{\text{noise}}^{\text{out}} = \mathbf{f}_{\text{noise}} \odot \begi
 
 $$\mathbf{f}_{\text{motion}}^{\text{out}} = \mathbf{f}_{\text{motion}} \odot \begin{cases} \sigma(\text{SE}(\mathbf{f}_{\text{noise}})) & \text{train} \\ \bar{g}_m & \text{infer (deploy)} \end{cases}$$
 
-### 2.8 SGRF — 阶段式修复融合 (Mark4)
+### 2.8 SGRF — 阶段式修复融合 (Mod4: ZeroDCE曲线增强)
 
-SGRF 的三阶段顺序由 §2.1 的物理推导确定。Mark4 将 Stage3 替换为 gain/bias 公式，StageBlock 增加 zero-gate 以保证 Phase 2 无扰动启动。
+SGRF 的三阶段顺序由 §2.1 的物理推导确定。Mark4 将 Stage3 替换为 gain/bias 公式，StageBlock 增加 zero-gate。Mod4 在 S2→S3 之间插入 ZeroDCE 迭代曲线，将提亮分解为"全局曲线粗调 + gain/bias 空间精调"。
 
 **Zero-gate StageBlock**：
 $$\delta = \text{ConvBlock}([f_{\text{branch}}, \text{proj}(I_{\text{current}})]) \cdot \gamma_{\text{gate}}, \quad \gamma_{\text{gate}} \xrightarrow{\text{init}} 0$$
 
 gate=0 → $\delta = 0$ → 主路径不受扰动（Phase 1 安全）。gate 可学习上升，等价于 LoRA B=0 初始化策略。
 
-**三阶段公式 (Denoise → Deblur → Brighten)**：
+**三阶段公式 (Denoise → Deblur → Curve → Brighten)**：
 
 $$\text{S1 (去噪): } \quad I_1 = \text{clamp}\left(I_t + \delta_1(\mathbf{f}_{\text{noise}}^{\text{out}}) \cdot \gamma_1, 0, 1\right)$$
 
 $$\text{S2 (去模糊): } \quad I_2 = \text{clamp}\left(I_1 + \delta_2(\mathbf{f}_{\text{motion}}^{\text{out}}) \cdot \gamma_2, 0, 1\right)$$
 
-$$\text{S3 (提亮): } \quad \hat{X}_t = \text{clamp}\left(I_2 \odot G + B + \delta_3(I_2G+B) \cdot \gamma_3, 0, 1\right)$$
+$$\text{S2.5 (曲线, Mod4): } \quad I_2^{\text{curve}} = \text{ZeroDCE}(I_2, \alpha(s_{\text{illum}}))$$
 
-其中 $\gamma_1 = \gamma_2 = \gamma_3 = 0$ (初始) → Phase 1 完全等效于纯 ISPN 提亮。$\gamma_i$ 在 Phase 1.5/2 渐进释放。
+$$\text{S3 (提亮): } \quad \hat{X}_t = \text{clamp}\left(I_2^{\text{curve}} \odot G + B + \delta_3(I_2^{\text{curve}}G+B) \cdot \gamma_3, 0, 1\right)$$
+
+其中 $\gamma_1 = \gamma_2 = \gamma_3 = 0$ (初始) → Phase 1 完全等效于纯 ISPN 提亮（曲线=identity）。$\gamma_i$ 在 Phase 1.5/2 渐进释放。
 
 ---
 
@@ -344,6 +358,7 @@ pre_norm LayerNorm 在 R/K/V 投影前
 | DPE head | LayerNorm2d + 零初始化 → s_illum≈0.5 (居中, 防饱和) |
 | ISPN gain | softplus → dG/draw ∈ (0,1), 梯度不消失不爆炸 |
 | max_gain | 动态调度 4→16 → 防止早期梯度爆炸，后期扩大范围 |
+| CurveBranch | Tanh → $\alpha \in (-1,1)$, $I(1-I)$ 有界 → 曲线输出去稳 |
 
 ---
 
@@ -375,7 +390,7 @@ pre_norm LayerNorm 在 R/K/V 投影前
 | v6 Delta Mark1 | WFR子带分流 + 命名统一 + 数值稳定 | 1.69M | ep15 loss收敛 |
 | **v6 Delta Mark2** | **Kendall不确定性加权 + PE Loss + 感知解耦 + 损失调度** | **1.69M** | 收敛停滞 |
 | **v6 Delta Mark3** | **两阶段渐进训练 + ISPN 隔离 + SGRF 中间监督 + 相位调度** | **1.69M** | PSNR 18→8.7 |
-| **v6 Delta Flight3** | **DPE反饱和 + softplus gain + WFR取消噪声门控 + max_gain调度 + eff_batch=8** | **1.45M** | **训练中** |
+| **v6 Delta Flight3 Mod4** | **ZeroDCE曲线增强 + CXG路由修复 + γ=0.01 + gamma anti-collapse + per-phase ckpt** | **1.45M** | **训练中** |
 
 ---
 
@@ -417,6 +432,7 @@ $$L_{\text{total}} = \sum_{i} \frac{1}{2\exp(s_i)} L_i + \frac{1}{2}s_i$$
 | **L_diag_prior** | −mean(log(diag(C_Ω)+ε)) | Phase 1 仅用于稳定 C_ω 学习；Phase 2 取消，释放运动检测 |
 | **L_illum_smooth** | TV(s_illum)·e^{−‖∇I‖} | 光照图边缘感知平滑 |
 | **L_wfr_reg** | (ᾱ − 0.7)² | WFR 分流平衡正则：允许 DPE 获取更多 LL，仅防极端 α→1.0 |
+| **L_gamma_reg** | relu(0.005 − |γ_ndpn|) + relu(0.005 − |γ_mcpn|) | 防止γ坍缩到零, 保持三源分支活性 | 权重0.1 |
 
 #### Phase 2 专属 — 感知解耦 & 中间监督
 
@@ -433,7 +449,7 @@ $$L_{\text{total}} = \sum_{i} \frac{1}{2\exp(s_i)} L_i + \frac{1}{2}s_i$$
 |------|---------|
 | Phase 1 Warmup | UW(pix) + UW(ssim) + UW(illum_smooth, 'illum') + UW(align+diag, 'ifpn') + 0.5·L_gain_sup + 0.001·L_wfr_reg |
 | Phase 1 Main | 同上 |
-| Phase 2 | ← + UW(perc, 'perc') + UW(freq, 'freq') + UW(inter, 'inter') + UW(align_warp only, 'ifpn') (diag_prior 取消) |
+| Phase 2 | ← + UW(perc, 'perc') + UW(freq, 'freq') + UW(inter, 'inter') + UW(align_warp only, 'ifpn') + 0.1·L_gamma_reg (Mod3) (diag_prior 取消) |
 
 ### 6.3 相位调度 (Mark4)
 
@@ -442,13 +458,13 @@ $$L_{\text{total}} = \sum_{i} \frac{1}{2\exp(s_i)} L_i + \frac{1}{2}s_i$$
 | 阶段 | Epoch | 损失 | NDPN/MCPN | CXG | lr |
 |------|-------|------|-----------|-----|-----|
 | **Phase 1 Warmup** | 0–4 | pix + ssim + illum_smooth + gain_sup + align+diag + wfr_reg | **zero** (输出置零) | bypass | 8e-6→8e-4 |
-| **Phase 1 Main** | 5–9 | 同上 | **zero** (但 γ=0.001 梯度流过) | bypass | 6e-4 |
-| **Phase 1.5** | 10–29 | 同上 | 线性解锁 0→100% (0.05/epoch) | ratio>0.3 启用 | 6e-4→4e-4 |
-| **Phase 2** | 30–89 | 全损失 (感知解耦 + freq + inter; **diag_prior 取消**) | 100% | 启用 | 4e-4→0.16e-4 |
+| **Phase 1 Main** | 5–9 | 同上 | **zero** (但 γ=0.01 梯度流过) | bypass | 6e-4 |
+| **Phase 1.5** | 10–29 | ← + 0.1·L_gamma_reg (Mod3) | 线性解锁 0→100% (0.05/epoch) | ratio>0.3 启用 | 6e-4→4e-4 |
+| **Phase 2** | 30–89 | 全损失 (感知解耦 + freq + inter + L_gamma_reg; **diag_prior 取消**) | 100% | 启用 | 4e-4→0.16e-4 |
 
 **关键设计决策**：
 
-1. **Flight3 NDPN/MCPN γ=0.001 (微梯度流过)**：Mark4 的 γ=0 使噪声/运动分支在 Phase 1 完全零梯度，20 epoch 后权重空转。Flight3 将 γ 提升到 0.001，允许微弱梯度流过噪声/运动分支，不产生可见输出但保持权重可训练。
+1. **Mod3 γ=0.01**：Mark4 的 γ=0 使分支无梯度。Flight3 提升至 0.001，但 CXG 输出未被 SGRF 使用导致 gamma 坍缩。Mod3 提升至 0.01 并修复 CXG 路由——SGRF 现在接收 CXG 门控特征 (f_noise_gated/f_motion_gated)，gamma 直接影响输出，赋予 NDPN/MCPN 实际学习动力。
 
 2. **Phase 1 缩短到 10 epoch (0→10), Phase 1.5 20 epoch (10→30), Phase 2 60 epoch (30→90)**：Mark4 的 20 epoch ISPN 独占使特征空间固化于纯光照。V9 实验证实 s_illum=100% 主导退化，Phase 1 仅需 10 epoch。提前解锁使三源分支共享基础特征。
 
@@ -457,6 +473,10 @@ $$L_{\text{total}} = \sum_{i} \frac{1}{2\exp(s_i)} L_i + \frac{1}{2}s_i$$
 4. **L_diag_prior Phase 2 取消**：该损失鼓励 C_ω 对角线恒等，Phase 2 中与 MCPN 运动检测冲突。Phase 1 保留用于稳定 C_ω 初始学习，Phase 2 完全移除以释放运动检测能力。
 
 5. **L_gain_sup 直接监督**：权重 0.5（固定，不受 Kendall UW），将 gain_map 与 GT/I̅ 逐像素 L1 对比。解决 ISPN gain_head 训练路径过长（pix loss → res_t → gain_map 的间接梯度）导致的 gain 学习不足。L_wfr_reg 弱正则（0.001）防止 α_net 极端分流失衡。
+
+6. **Gamma anti-collapse 正则化 (Mod3)**：L_gamma_reg = relu(0.005 - |γ_ndpn|) + relu(0.005 - |γ_mcpn|)，权重 0.1。当 gamma 均值降至初始值一半以下时产生惩罚，防止三源退化为单源。
+
+7. **ZeroDCE 曲线增强 (Mod4)**：ISPN 新增 CurveBranch——从 s_illum 的全局均值预测 per-image 迭代曲线参数 α (3 iter × 3 RGB = 9 DOF)，在 SGRF S2→S3 之间施加 ZeroDCE 曲线 I_{n+1} = I_n + α_n·I_n·(1-I_n)。曲线零初始化 → Phase 1 为 identity。仅 9 个自由度天然防止过拟合，将亮度映射委托给曲线而释放 gain_map 做空间残差——符合 V11"全局曲线 + 空间残差"的分解思想，促进三源分支各司其职。
 
 ---
 

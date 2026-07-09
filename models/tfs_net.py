@@ -217,6 +217,7 @@ class TFSNet(nn.Module):
         gain_map = ispn_out["gain_map"]
         bias_map = ispn_out["bias_map"]
         f_illum_feat = ispn_out["f_illum_feat"]
+        curve_alpha = ispn_out.get("curve_alpha", None)
 
         # --- Mark3: Phase-dependent NDPN/MCPN/CXG ---
         phase = getattr(self, '_phase', 'phase2')
@@ -247,13 +248,15 @@ class TFSNet(nn.Module):
                 sigma_t_clean=sigma_t_clean, C_omega_list=C_omega_list, F_t_aligned=F_t_aligned)
             f_noise_gated, f_motion_gated = self.cxg(ndpn_out["f_noise_out"], mcpn_out["f_motion_out"])
 
-        # SGRF: 阶段式修复融合 (Mark4: gain/bias interface)
+        # SGRF: 阶段式修复融合 (Flight3 Mod3: CXG-gated features, Mod4: curve-enhanced)
         sgrf_out = self.sgrf(
             gain_map=gain_map,
             bias_map=bias_map,
-            f_noise_out=ndpn_out["f_noise_out"],
-            f_motion_out=mcpn_out["f_motion_out"],
+            f_noise_out=f_noise_gated,
+            f_motion_out=f_motion_gated,
             image_center=image_center,
+            curve_alpha=curve_alpha,
+            curve_iter=self.ispn.curve_iter,
         )
 
         return {
@@ -276,5 +279,6 @@ class TFSNet(nn.Module):
             "F_out_list":     F_aligned_list,
             "F_hat":          F_t_aligned,
             "dpe_out":        dpe_out,
+            "curve_alpha":    curve_alpha,
             "phase":          phase,
         }

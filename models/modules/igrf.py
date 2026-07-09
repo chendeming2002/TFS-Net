@@ -148,9 +148,20 @@ class SGRF(nn.Module):
         f_noise_out: torch.Tensor,
         f_motion_out: torch.Tensor,
         image_center: torch.Tensor,
+        curve_alpha: torch.Tensor = None,
+        curve_iter: int = 3,
     ) -> dict:
         img_s1, _ = self.stage_noise(f_noise_out, image_center)
         img_s2, _ = self.stage_motion(f_motion_out, img_s1)
+
+        # Flight3 Mod4: ZeroDCE curve enhancement before gain/bias
+        if curve_alpha is not None:
+            B = img_s2.shape[0]
+            alpha = curve_alpha.reshape(B, curve_iter, 3, 1, 1)
+            for i in range(curve_iter):
+                A = alpha[:, i]
+                img_s2 = img_s2 + A * img_s2 * (1.0 - img_s2)
+
         res_t, lit_up = self.brighten(gain_map, bias_map, img_s2)
 
         return {

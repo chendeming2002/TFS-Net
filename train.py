@@ -160,6 +160,7 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
     meter_noise_sup = AverageMeter()
     meter_inter = AverageMeter()
     meter_ifpn = AverageMeter()
+    meter_gamma_reg = AverageMeter()
 
     progress = tqdm(enumerate(loader), total=len(loader), desc="train", leave=False)
     for step, (clip, target, _) in progress:
@@ -197,6 +198,7 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
         meter_noise_sup.update(loss_dict["loss_noise_sup"].item(), clip.size(0))
         meter_inter.update(loss_dict["loss_inter"].item(), clip.size(0))
         meter_ifpn.update(loss_dict["loss_ifpn_sup"].item(), clip.size(0))
+        meter_gamma_reg.update(loss_dict.get("loss_gamma_reg", 0.0), clip.size(0))
 
         progress.set_postfix(loss=meter_total.avg, pix=meter_pix.avg, ssim=meter_ssim.avg,
                               perc=meter_perc.avg, i_sup=meter_illum_sup.avg)
@@ -219,14 +221,21 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
             with torch.no_grad():
                 s_ill = outputs.get("s_illum")
                 gain = outputs.get("gain_map")
-                wfr = model.wfr if hasattr(model, 'wfr') else None
+                g_ndpn = model.ndpn.gamma.abs().mean().item() if hasattr(model, 'ndpn') and hasattr(model.ndpn, 'gamma') else 0
+                g_mcpn = model.mcpn.gamma.abs().mean().item() if hasattr(model, 'mcpn') and hasattr(model.mcpn, 'gamma') else 0
+                ca = outputs.get("curve_alpha")
                 if s_ill is not None:
                     logger.info(
-                        "diag: dpe_si=%.3f/%.4f g=%.2f/%.3f",
+                        "diag: dpe_si=%.3f/%.4f g=%.2f/%.3f gn=%.4f gm=%.4f",
                         s_ill.mean().item(), s_ill.std().item(),
                         gain.mean().item() if gain is not None else 0,
                         gain.std().item() if gain is not None else 0,
+                        g_ndpn, g_mcpn,
                     )
+                    if ca is not None:
+                        # Show curve alpha mean per iteration
+                        ca_mean = ca.abs().mean().item()
+                        logger.info("      curve_α|mean|=%.4f", ca_mean)
     return {
         "loss_total": meter_total.avg,
         "loss_pix": meter_pix.avg,
@@ -323,6 +332,8 @@ def main():
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         sd = ckpt["model"]
+        # Remap: die→dpe, wsd→wfr (Flight3 rename)
+        sd = {k.replace('die.', 'dpe.').replace('wsd.', 'wfr.'): v for k, v in sd.items()}
         # Remap: 旧 checkpoint 用 Sequential 包裹 ResBlock (fuse.N.0.conv1 → fuse.N.conv1)
         remapped = {}
         for k, v in sd.items():
@@ -343,10 +354,17 @@ def main():
                     continue
             filtered[k] = v
         model.load_state_dict(filtered, strict=False)
-        # Mark3: reset MCPN startup params after loading old checkpoint
-        if hasattr(model, 'mcpn') and hasattr(model.mcpn, 'reset_startup'):
+        # MCPN startup reset: only for pre-Flight3 checkpoints (gamma==0 and startup_gate==1 in ckpt)
+        ckpt_gamma_near_zero = True
+        for k, v in sd.items():
+            if 'mcpn.gamma' in k and v.abs().max() > 0.001:
+                ckpt_gamma_near_zero = False
+                break
+        if ckpt_gamma_near_zero and hasattr(model, 'mcpn') and hasattr(model.mcpn, 'reset_startup'):
             model.mcpn.reset_startup()
-            logger.info("MCPN startup params reset (gamma=0, startup_gate=1, out_scale=0, refine zero-init)")
+            logger.info("MCPN startup params reset (pre-Flight3 checkpoint detected)")
+        else:
+            logger.info("Skipped MCPN reset (Flight3+ checkpoint, gamma already learned)")
         if "optimizer" in ckpt:
             try:
                 optimizer.load_state_dict(ckpt["optimizer"])
@@ -445,6 +463,21 @@ def main():
             },
             os.path.join(output_dir, "latest.pth"),
         )
+        # Flight3 Mod3: per-phase checkpoint saving
+        phase_ckpt_map = {5: "phase1_warmup.pth", 10: "phase1.pth", 30: "phase15.pth"}
+        if epoch + 1 in phase_ckpt_map:
+            phase_path = os.path.join(output_dir, phase_ckpt_map[epoch + 1])
+            save_checkpoint(
+                {
+                    "epoch": epoch + 1,
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "config": cfg,
+                    "phase": phase,
+                },
+                phase_path,
+            )
+            logger.info("Saved phase checkpoint: %s", phase_path)
         if val_stats is not None:
             if val_stats["psnr"] > best_psnr:
                 best_psnr = val_stats["psnr"]

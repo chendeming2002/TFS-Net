@@ -1,4 +1,4 @@
-# TFS-Net v6 Delta Flight3 整体架构图 (2026-07-06)
+# TFS-Net v6 Delta Flight3 Mod4 整体架构图 (2026-07-09)
 
 ## 图一：最简架构 (含 Flight3 Phase-Dependent + 三部保险)
 
@@ -22,17 +22,17 @@ flowchart TD
     end
 
     subgraph 处理层["三源退化并行建模<br/>Phase 1: NDPN/MCPN 截断=0"]
-        ISPN["ISPN 光照源处理<br/>f_enc + s_illum → gain + bias<br/>gain=softplus(raw_gain)∈[1,max], bias=tanh·range"]
-        NDPN["NDPN 噪声处理 (Phase 1 = zero, γ=0.001)"]
-        MCPN["MCPN 运动补偿 (Phase 1 = zero, γ=0.001)<br/>Flight3: gamma=0.001, refine=0, startup_gate=1"]
+        ISPN["ISPN 光照源处理 (Mod4: ZeroDCE曲线 + gain/bias)<br/>f_enc + s_illum → curve_α + gain + bias<br/>curve: s_illum→MLP→α, I+=α·I·(1-I) (全局提亮)<br/>gain=softplus(raw_gain)∈[1,max], bias=tanh·range"]
+        NDPN["NDPN 噪声处理 (Phase 1 = zero, γ=0.01)"]
+        MCPN["MCPN 运动补偿 (Phase 1 = zero, γ=0.01)<br/>Mod3: gamma=0.01, refine=0, startup_gate=1"]
     end
 
     subgraph 融合层["CXG 交叉激励门<br/>Phase 1: bypass<br/>Phase 1.5: ratio激活<br/>Phase 2: 正常"]
-        CXG["CXG<br/>训练:动态交叉调制<br/>推理:静态重参数化"]
+        CXG["CXG<br/>Mod3: 输出 f_noise_gated, f_motion_gated → SGRF<br/>training:动态交叉调制<br/>infer:静态重参数化"]
     end
 
     subgraph 执行层["SGRF 阶段式修复融合 (Flight3: gain/bias)"]
-        SGRF["SGRF<br/>S1: zero-gate StageBlock + f_noise → img_s1<br/>S2: zero-gate StageBlock + f_motion → img_s2<br/>S3: img_s2 × gain + bias → res_t"]
+        SGRF["SGRF (Mod4: ZeroDCE曲线增强)<br/>S1: zero-gate StageBlock + f_noise → img_s1<br/>S2: zero-gate StageBlock + f_motion → img_s2<br/>S2.5: ZeroDCE_curve(img_s2, curve_α) → img_curved<br/>S3: img_curved × gain + bias → res_t"]
     end
 
     OUT["输出 res_t"]
@@ -49,6 +49,7 @@ flowchart TD
     TCA -- "F_aligned, C_omega, sigma" --> MCPN
 
     ISPN -- "gain_map + bias_map" --> SGRF
+    ISPN -- "curve_alpha (Mod4)" --> SGRF
     NDPN -- "f_noise (Zero if Phase1)" --> CXG
     MCPN -- "f_motion (Zero if Phase1)" --> CXG
     CXG -- "f_noise_gated, f_motion_gated" --> SGRF
@@ -61,16 +62,16 @@ flowchart TD
 
 - **WFR 子带分流 (Flight3: 取消噪声门控)**：HaarDWT 在子带级分离 LL→光照/噪声 (DPE), HF→结构 (TCA)。alpha_net(LL) 可学习 α ∈ (0,1) 分配 LL，受 `(ᾱ-0.7)²` 弱正则（允许 DPE 获取更多 LL）。HF 两路共享，各自 proj 层独立学习。
 - **DPE (Flight3 简化)**：移除 FrequencyBranch/LFF/phase_conf，用多尺度空洞卷积 (d=1,2,4) 提取时域统计量 [μ,σ,SNR] 的空域特征。梯度路径从 `feats→LFF→DWT→phase→s_noise` 简化为 `feats→统计量→Conv→head`。
-- **ISPN (Flight3 简化)**：移除多帧 cosine attention + L_ratio 锚定，直接用 `f_enc + s_illum` 生成 gain_map (乘法提亮) + bias_map (加法修正)。零初始化 → gain≈2.55+bias=0.8 (softplus) → Phase 1 友好。
+- **ISPN (Mod4: ZeroDCE曲线增强)**：新增 CurveBranch——s_illum → AvgPool → MLP → Tanh → per-image α (3 iter × 3 RGB = 9 DOF)。在 SGRF S2→S3 之间施加 ZeroDCE 曲线 I_{n+1}=I_n+α·I_n·(1-I_n)。零初始化 → Phase 1 为 identity，符合 V11"全局曲线+空间残差"分解（仅 9 参数，天然防过拟合）。gain_map/bias_map 保留做空间精调。
 - **TCA 空间扫描**：输入 WFR 的 H/2 特征。MVC-Shift(3 dilated DWConv) → 4方向 Bi-WKV → Channel Mix → H 上采样。C_omega 行 softmax 归一化，L_diag_prior Phase 1 自监督 (Phase 2 取消)。
-- **Flight3 γ=0.001**：NDPN 和 MCPN 的 γ 从 0 提升到 0.001——Phase 1 允许微弱梯度流过噪声/运动分支，保持权重可训练但不产生可见输出。
+- **Mod3 γ=0.01**：NDPN 和 MCPN 的 γ 从 Flight3 的 0.001 提升到 0.01——Phase 1.5/2 允许 10× 更强的梯度流过噪声/运动分支。配合 CXG 路由修复 (SGRF 接收 CXG 门控特征)，gamma 直接影响最终输出。
 
 ### Flight3 多阶段训练策略
 
 | 阶段 | Epoch | lr | NDPN/MCPN | SGRF gate | 损失项 |
 |------|-------|-----|-----------|-----------|--------|
 | Phase 1 Warmup | 0-4 | 8e-6→8e-4 | zero | gate=0 | pix+ssim+illum+gain_sup+wfr_reg+ifpn(align+diag) |
-| Phase 1 Main | 5-9 | 6e-4 | zero (γ=0.001) | gate=0 | 同上 |
+| Phase 1 Main | 5-9 | 6e-4 | zero (γ=0.01) | gate=0 | 同上 |
 | Phase 1.5 | 10-29 | 6e-4→4e-4 | 线性 0→100% | 渐进学习 | 同上 |
 | Phase 2 | 30-89 | 4e-4→0.16e-4 | 100%+CXG | 已学习 | +perceptual(SSIM→S1,VGG→S2)+freq+inter (diag_prior取消) |
 
@@ -127,24 +128,26 @@ flowchart TD
         TCA_SPATIAL --> TCORR
     end
 
-    subgraph ISPN["ISPN 光照源处理 (Flight3: Retinex gain/bias)"]
+    subgraph ISPN["ISPN 光照源处理 (Mod4: ZeroDCE曲线 + gain/bias)"]
         direction TB
         ISPN_REFINE["refine: Conv(f_enc + s_illum, 65→64)<br/>→ GELU → Conv(64→64) → GELU → h"]
-        ISPN_GAIN["gain_head: Conv(64→16)→GELU→Conv(16→1)<br/>→ softplus(raw_gain) → clamp[1, max_gain]<br/>softplus参数化 + bias=0.8 | max_gain动态4→16"]
-        ISPN_BIAS["bias_head: Conv(64→16)→GELU→Conv(16→3)<br/>→ tanh × range → bias∈[-0.1, 0.1]<br/>零初始化 → bias≈0 (无偏置)"]
+        ISPN_CURVE["Mod4 CurveBranch: s_illum → AvgPool → MLP(1→16→9) → Tanh<br/>→ α (B, 3iter, 3ch) | 零初始化 → identity"]
+        ISPN_GAIN["gain_head: Conv(64→16)→GELU→Conv(16→1)<br/>→ softplus(raw_gain) → clamp[1, max_gain]"]
+        ISPN_BIAS["bias_head: Conv(64→16)→GELU→Conv(16→3)<br/>→ tanh × range → bias∈[-0.1, 0.1]"]
+        ISPN_REFINE --> ISPN_CURVE
         ISPN_REFINE --> ISPN_GAIN
         ISPN_REFINE --> ISPN_BIAS
     end
 
     subgraph NDPN["NDPN 噪声退化处理 (Phase 1: zero截断)"]
         NDPN_CONF["conf_proj: C_omega diag → conf_map<br/>noise_extract: |enc - F_t_aligned| → residual"]
-            NDPN_STR["f_noise = enc - γ·residual·strength + noise_proj(s_noise)<br/>γ=0.001 → f_noise≈f_enc (pass-through, grad flows)"]
+            NDPN_STR["f_noise = enc - γ·residual·strength + noise_proj(s_noise)<br/>γ=0.01 → f_noise含实际降噪成分 (Mod3: 10× stronger)"]
         NDPN_CONF --> NDPN_STR
     end
 
     subgraph MCPN["MCPN 运动补偿处理 (Phase 1: zero截断, Flight3 静默启动)"]
         MCPN_MOT["motion_estimator + window_corr → f_omega_aligned"]
-        MCPN_GATE["gate + startup_bias → g_t (初→1.0)<br/>f_fuse = g_t·f_center + (1-g_t)·f_omega + 0.001·δ"]
+        MCPN_GATE["gate + startup_bias → g_t (初→1.0)<br/>f_fuse = g_t·f_center + (1-g_t)·f_omega + 0.01·δ"]
         MCPN_REF["refine(conv2=0) + f_center·out_scale(0)<br/>→ f_motion≈f_center (pass-through)"]
         MCPN_MOT --> MCPN_GATE --> MCPN_REF
     end
@@ -157,7 +160,8 @@ flowchart TD
         direction LR
         SGRF_S1["S1: Denoise<br/>f_noise_gated + img_center<br/>→ StageBlock(gate=0) → img_s1"]
         SGRF_S2["S2: Deblur<br/>f_motion_gated + img_s1<br/>→ StageBlock(gate=0) → img_s2"]
-        SGRF_S3["S3: Brighten<br/>img_s2 × gain_map + bias_map<br/>+ refine(0-gate) → clamp → res_t"]
+        SGRF_CURVE["S2.5 (Mod4): ZeroDCE Curve<br/>img_s2 += α·img_s2·(1-img_s2)<br/>3 iterations, α predicted from s_illum"]
+        SGRF_S3["S3: Brighten<br/>img_curved × gain_map + bias_map<br/>+ refine(0-gate) → clamp → res_t"]
     end
 
     OUT["输出 res_t"]
@@ -172,6 +176,7 @@ flowchart TD
     TCA_TEMP -- "F_t_aligned" --> ISPN_REFINE
     TCA_TEMP -- "C_omega" --> NDPN_CONF
     TCA_TEMP -- "C_omega" --> MCPN_MOT
+    ISPN_CURVE -- "curve_α" --> SGRF_CURVE
     ISPN_GAIN --> SGRF_S3
     ISPN_BIAS --> SGRF_S3
     NDPN_STR -- "f_noise" --> CXG_G
@@ -179,7 +184,7 @@ flowchart TD
     CXG_G -- "f_noise_gated" --> SGRF_S1
     CXG_G -- "f_motion_gated" --> SGRF_S2
     IN -- "img_center" --> SGRF_S1
-    SGRF_S1 --> SGRF_S2 --> SGRF_S3 --> OUT
+    SGRF_S1 --> SGRF_S2 --> SGRF_CURVE --> SGRF_S3 --> OUT
 ```
 
 ### TCA 空间扫描详解
@@ -214,17 +219,18 @@ feat_tca (B,T,C,H/2,W/2) from WFR — 已是半分辨率, 无需再降采样
 ```
 Phase 1 → Phase 1.5 → Phase 2 过渡
 
-NDPN:   f_noise  = f_enc - 0.001·noise·strength + noise_proj(s_noise)
-          γ=0.001 → f_noise ≈ f_enc (pass-through, grad flows)
+NDPN:   f_noise  = f_enc - 0.01·noise·strength + noise_proj(s_noise)
+          γ=0.01 → CXG-gated output → SGRF (Mod3: CXG路由修复)
           noise_proj 零初始化 → 第二项 = 0
 
 MCPN:   g_t = sigmoid(raw_gate + startup_gate=1) → ≈0.73
-          f_fuse = g_t·f_center + (1-g_t)·f_omega + δ·0.001
+          f_fuse = g_t·f_center + (1-g_t)·f_omega + δ·0.01
           refine(conv2=0, out_scale=0) → f_motion ≈ f_center
 
 SGRF:   StageBlock gate = 0 → delta = Conv(x)*0 = 0 → img unchanged
+        Mod4: curve_α=0 (零初始化) → curve=identity → 无扰动
                 ↓
-           三重零保证: 分支零 × gate零 × unlock零
+           四重零保证: 分支零 × gate零 × unlock零 × curve零
                 ↓
            Phase 2 启动时输出 ≡ Phase 1 输出
 ```
@@ -278,13 +284,16 @@ SGRF gate         →  零 (不参与训练, 三重保险)
 | **ISPN** | 多帧cosine attention | 同Mark1 | **gain/bias Retinex 头** |
 | **SGRF Stage3** | lit_up_map×(1+A_illu) | 同Mark1 | **img×gain+bias** |
 | **StageBlock** | 标准ResBlock | 同Mark1 | **zero-gate 零初始化** |
-| **MCPN** | 随机初始化 | startup_gate=1 | **gamma=0.001 + refine=0** |
-| **NDPN** | gamma=0 | 同 | **gamma=0.001 (梯度流过)** |
+| **MCPN** | 随机初始化 | startup_gate=1 | **gamma=0.01 + refine=0** |
+| **NDPN** | gamma=0 | 同 | **gamma=0.01 (10x 梯度)** |
 | **L_diag_prior** | Phase 1+2 | Phase 1+2 | **Phase 1 only (P2取消)** |
 | **L_wfr_reg** | — | (ᾱ-0.5)² | **(ᾱ-0.7)²** |
+| **L_gamma_reg** | — | — | **relu(0.005−|γ|) 防坍缩 (Mod3)** |
+| **CXG routing** | output unused | output unused | **Mod3: CXG→SGRF (不再pass-through)** |
 | **Phase 2 启动** | 剧烈扰动 | PSNR 18→8.7 暴跌 | **三重保险 (无扰动)** |
 | **Phase 1.5** | 5 epoch (20-25) | 同 | **20 epoch (10-30)** |
 | **参数** | 1.69M | 1.69M | **1.45M** |
 | **DPE head** | — | 直接Sigmoid→饱和 | **LayerNorm+零初始化** |
 | **ISPN gain** | — | exp→梯度异常 | **softplus+动态max_gain** |
 | **WFR HF** | — | noise_gate 误分流 | **共享HF, proj隐式分化** |
+| **CurveBranch** | — | — | **Mod4: s_illum→α, ZeroDCE曲线粗提亮 (9 DOF)** |
