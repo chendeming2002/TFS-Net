@@ -16,7 +16,7 @@ import torch.nn.functional as F
 class ISPN(nn.Module):
     def __init__(self, channels: int = 64, img_channels: int = 3,
                  max_gain: float = 10.0, bias_range: float = 0.1,
-                 curve_iter: int = 3):
+                 curve_iter: int = 5):
         super().__init__()
         self.max_gain = max_gain
         self.bias_range = bias_range
@@ -48,7 +48,7 @@ class ISPN(nn.Module):
         self.curve_alpha = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
-            nn.Linear(1, 16),
+            nn.Linear(channels, 16),
             nn.GELU(),
             nn.Linear(16, curve_iter * img_channels),
             nn.Tanh(),
@@ -75,11 +75,11 @@ class ISPN(nn.Module):
         h = self.refine(torch.cat([f_enc_center, s_illum], dim=1))
 
         raw_gain = self.gain_head(h)
-        gain_map = 1.0 + F.softplus(raw_gain) * (self.max_gain - 1.0) / F.softplus(torch.tensor(4.0, device=raw_gain.device, dtype=raw_gain.dtype))
+        gain_map = 0.5 + F.softplus(raw_gain) / F.softplus(torch.tensor(4.0, device=raw_gain.device, dtype=raw_gain.dtype)) * (self.max_gain - 0.5)
 
         bias_map = torch.tanh(self.bias_head(h)) * self.bias_range
 
-        alpha = self.curve_alpha(s_illum)
+        alpha = self.curve_alpha(h)
 
         return {
             "gain_map": gain_map,
