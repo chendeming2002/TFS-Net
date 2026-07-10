@@ -77,6 +77,10 @@ class StageBlock(nn.Module):
         delta = self.fuse(combined) * self.gate
         if self.use_intensity and s_intensity is not None:
             delta = delta + self.intensity_corr(s_intensity)
+        # Flight3 Mod5: zero-mean constraint — StageBlock rearranges pixels but
+        # cannot shift mean brightness. All brightness change must route through
+        # ISPN curve/gain (enforcing S2.1 denoise-before-brighten constraint).
+        delta = delta - delta.mean(dim=[-2, -1], keepdim=True)
         if self.use_soft_clamp:
             img_next = soft_clamp(img_current + delta)
         else:

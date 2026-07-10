@@ -1,4 +1,4 @@
-# TFS-Net v6 Delta Flight3 Mod4 整体架构图 (2026-07-09)
+# TFS-Net v6 Delta Flight3 Mod5 整体架构图 (2026-07-10)
 
 ## 图一：最简架构 (含 Flight3 Phase-Dependent + 三部保险)
 
@@ -22,7 +22,7 @@ flowchart TD
     end
 
     subgraph 处理层["三源退化并行建模<br/>Phase 1: NDPN/MCPN 截断=0"]
-        ISPN["ISPN 光照源处理 (Mod4: ZeroDCE曲线 + gain/bias)<br/>f_enc + s_illum → curve_α + gain + bias<br/>curve: s_illum→MLP→α, I+=α·I·(1-I) (全局提亮)<br/>gain=softplus(raw_gain)∈[1,max], bias=tanh·range"]
+        ISPN["ISPN 光照源处理 (Mod5: ZeroDCE曲线5iter + gain/bias)<br/>f_enc + s_illum → h(64ch) → curve_α(5iter×3ch) + gain + bias<br/>curve: MLP(64→16→15)→α, I+=α·I·(1-I) (全局提亮)<br/>gain=0.5+softplus*(max-0.5)/softplus(4)∈[0.5,max], bias=tanh·range"]
         NDPN["NDPN 噪声处理 (Phase 1 = zero, γ=0.01)"]
         MCPN["MCPN 运动补偿 (Phase 1 = zero, γ=0.01)<br/>Mod3: gamma=0.01, refine=0, startup_gate=1"]
     end
@@ -32,7 +32,7 @@ flowchart TD
     end
 
     subgraph 执行层["SGRF 阶段式修复融合 (Mod4: ZeroDCE曲线 + gain/bias)"]
-        SGRF["SGRF (Mod4: ZeroDCE曲线增强)<br/>S1: zero-gate StageBlock + f_noise → img_s1<br/>S2: zero-gate StageBlock + f_motion → img_s2<br/>S2.5: ZeroDCE_curve(img_s2, curve_α) → img_curved<br/>S3: img_curved × gain + bias → res_t"]
+        SGRF["SGRF (Mod5: zero-mean StageBlock + ZeroDCE曲线)<br/>S1: δ₁=zero-mean(StageBlock(f_noise)), gate=0 → img_s1<br/>S2: δ₂=zero-mean(StageBlock(f_motion)), gate=0 → img_s2<br/>S2.5: ZeroDCE_curve(img_s2, curve_α) → img_curved<br/>S3: img_curved × gain + bias → res_t"]
     end
 
     OUT["输出 res_t"]
@@ -62,9 +62,10 @@ flowchart TD
 
 - **WFR 子带分流 (Flight3: 取消噪声门控)**：HaarDWT 在子带级分离 LL→光照/噪声 (DPE), HF→结构 (TCA)。alpha_net(LL) 可学习 α ∈ (0,1) 分配 LL，受 `(ᾱ-0.7)²` 弱正则（允许 DPE 获取更多 LL）。HF 两路共享，各自 proj 层独立学习。
 - **DPE (Flight3 简化)**：移除 FrequencyBranch/LFF/phase_conf，用多尺度空洞卷积 (d=1,2,4) 提取时域统计量 [μ,σ,SNR] 的空域特征。梯度路径从 `feats→LFF→DWT→phase→s_noise` 简化为 `feats→统计量→Conv→head`。
-- **ISPN (Mod4: ZeroDCE曲线增强)**：新增 CurveBranch——s_illum → AvgPool → MLP → Tanh → per-image α (3 iter × 3 RGB = 9 DOF)。在 SGRF S2→S3 之间施加 ZeroDCE 曲线 I_{n+1}=I_n+α·I_n·(1-I_n)。零初始化 → Phase 1 为 identity，符合 V11"全局曲线+空间残差"分解（仅 9 参数，天然防过拟合）。gain_map/bias_map 保留做空间精调。
+- **ISPN (Mod5: ZeroDCE曲线增强, 5 iter)**：CurveBranch——refine 特征 h (64ch) → AvgPool → Linear(64→16)→Linear(16→15) → Tanh → per-image α (5 iter × 3 RGB)。在 SGRF S2→S3 之间施加 ZeroDCE 曲线 I_{n+1}=I_n+α·I_n·(1-I_n)。零初始化 → Phase 1 为 identity。gain 基值 0.5 允许 <1（曲线后残差调暗），gain_sup 目标改为 GT/img_s2（曲线感知）。
 - **TCA 空间扫描**：输入 WFR 的 H/2 特征。MVC-Shift(3 dilated DWConv) → 4方向 Bi-WKV → Channel Mix → H 上采样。C_omega 行 softmax 归一化，L_diag_prior Phase 1 自监督 (Phase 2 取消)。
 - **Mod3 γ=0.01**：NDPN 和 MCPN 的 γ 从 Flight3 的 0.001 提升到 0.01——Phase 1.5/2 允许 10× 更强的梯度流过噪声/运动分支。配合 CXG 路由修复 (SGRF 接收 CXG 门控特征)，gamma 直接影响最终输出。
+- **Mod5 StageBlock 零均值约束**：δ = δ - mean(δ)。强制 S1/S2 的 delta 每通道空间均值为零——StageBlock 只能重新排列像素（去噪/去模糊），不能改变整体亮度。所有亮度变化必须走 curve → gain 路径，阻止 S2 抄近路成为主要提亮器（f3mk5mod1 中 S2 delta 有 12× 的非零均值）。
 
 ### Flight3 多阶段训练策略
 
@@ -214,7 +215,7 @@ feat_tca (B,T,C,H/2,W/2) from WFR — 已是半分辨率, 无需再降采样
         → upsample + residual + LayerNorm → F_t_aligned (B,C,H,W)
 ```
 
-### Flight3 三部保险 (零扰动启动)
+### Flight3 五重零保证 (Mod5: zero-mean约束)
 
 ```
 Phase 1 → Phase 1.5 → Phase 2 过渡
@@ -227,11 +228,11 @@ MCPN:   g_t = sigmoid(raw_gate + startup_gate=1) → ≈0.73
           f_fuse = g_t·f_center + (1-g_t)·f_omega + δ·0.01
           refine(conv2=0, out_scale=0) → f_motion ≈ f_center
 
-SGRF:   StageBlock gate = 0 → delta = Conv(x)*0 = 0 → img unchanged
+SGRF:   StageBlock gate = 0 → delta = 0 → img unchanged
+        Mod5: δ = zero-mean(ConvBlock(f_branch, img)·gate) → brightening forbidden
         Mod4: curve_α=0 (零初始化) → curve=identity → 无扰动
                 ↓
-           四重零保证: 分支零 × gate零 × unlock零 × curve零
-                ↓
+           五重零保证: 分支零 × gate零 × unlock零 × curve零 × delta零均值
            Phase 2 启动时输出 ≡ Phase 1 输出
 ```
 
@@ -296,4 +297,6 @@ SGRF gate         →  零 (四重保险: 分支零 × gate零 × unlock零 × c
 | **DPE head** | — | 直接Sigmoid→饱和 | **LayerNorm+零初始化** |
 | **ISPN gain** | — | exp→梯度异常 | **softplus+动态max_gain** |
 | **WFR HF** | — | noise_gate 误分流 | **共享HF, proj隐式分化** |
-| **CurveBranch** | — | — | **Mod4: s_illum→α, ZeroDCE曲线粗提亮 (9 DOF)** |
+| **CurveBranch** | — | — | **Mod5: h→MLP(64→16→15), ZeroDCE曲线粗提亮 (15 DOF, 5 iter)** |
+| **StageBlock δ** | 自由均值 | 自由均值 | **Mod5: δ=δ-mean(δ), 零均值约束** |
+| **Epochs** | — | 90 | **100** |
