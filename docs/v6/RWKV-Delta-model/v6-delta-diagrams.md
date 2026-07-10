@@ -1,4 +1,4 @@
-# TFS-Net v6 Delta Flight3 Mod5 整体架构图 (2026-07-10)
+# TFS-Net v6 Delta Flight3 Mod6 整体架构图 (2026-07-10)
 
 ## 图一：最简架构 (含 Flight3 Phase-Dependent + 三部保险)
 
@@ -22,7 +22,7 @@ flowchart TD
     end
 
     subgraph 处理层["三源退化并行建模<br/>Phase 1: NDPN/MCPN 截断=0"]
-        ISPN["ISPN 光照源处理 (Mod5: ZeroDCE曲线5iter + gain/bias)<br/>f_enc + s_illum → h(64ch) → curve_α(5iter×3ch) + gain + bias<br/>curve: MLP(64→16→15)→α, I+=α·I·(1-I) (全局提亮)<br/>gain=0.5+softplus*(max-0.5)/softplus(4)∈[0.5,max], bias=tanh·range"]
+        ISPN["ISPN 光照源处理 (Mod6: spatial curve + gain only)<br/>f_enc + s_illum → h(64ch) → curve_α(8iter pixel-wise) + gain<br/>curve: Conv(64→32)→GELU→Conv(32→24)→A ∈ (B,8,3,H,W)<br/>gain=0.5+softplus*(max-0.5)/softplus(4)∈[0.5,max]<br/>Mod6: bias removed — curve provides additive correction"]
         NDPN["NDPN 噪声处理 (Phase 1 = zero, γ=0.01)"]
         MCPN["MCPN 运动补偿 (Phase 1 = zero, γ=0.01)<br/>Mod3: gamma=0.01, refine=0, startup_gate=1"]
     end
@@ -32,7 +32,7 @@ flowchart TD
     end
 
     subgraph 执行层["SGRF 阶段式修复融合 (Mod4: ZeroDCE曲线 + gain/bias)"]
-        SGRF["SGRF (Mod5: zero-mean StageBlock + ZeroDCE曲线)<br/>S1: δ₁=zero-mean(StageBlock(f_noise)), gate=0 → img_s1<br/>S2: δ₂=zero-mean(StageBlock(f_motion)), gate=0 → img_s2<br/>S2.5: ZeroDCE_curve(img_s2, curve_α) → img_curved<br/>S3: img_curved × gain + bias → res_t"]
+        SGRF["SGRF (Mod6: spatial curve + no bias)<br/>S1: δ₁=zero-mean(StageBlock(f_noise)), gate=0 → img_s1<br/>S2: δ₂=zero-mean(StageBlock(f_motion)), gate=0 → img_s2<br/>S2.5: ZeroDCE_curve(img_s2, A(xy)), pixel-wise 8 iter → img_curved<br/>S3: img_curved × gain → res_t (Mod6: bias removed)"]
     end
 
     OUT["输出 res_t"]
@@ -48,8 +48,7 @@ flowchart TD
     TCA -- "F_aligned, C_omega, mu, sigma" --> NDPN
     TCA -- "F_aligned, C_omega, sigma" --> MCPN
 
-    ISPN -- "gain_map + bias_map" --> SGRF
-    ISPN -- "curve_alpha (Mod4)" --> SGRF
+    ISPN -- "gain_map + curve_α" --> SGRF
     NDPN -- "f_noise (Zero if Phase1)" --> CXG
     MCPN -- "f_motion (Zero if Phase1)" --> CXG
     CXG -- "f_noise_gated, f_motion_gated" --> SGRF
@@ -62,7 +61,7 @@ flowchart TD
 
 - **WFR 子带分流 (Flight3: 取消噪声门控)**：HaarDWT 在子带级分离 LL→光照/噪声 (DPE), HF→结构 (TCA)。alpha_net(LL) 可学习 α ∈ (0,1) 分配 LL，受 `(ᾱ-0.7)²` 弱正则（允许 DPE 获取更多 LL）。HF 两路共享，各自 proj 层独立学习。
 - **DPE (Flight3 简化)**：移除 FrequencyBranch/LFF/phase_conf，用多尺度空洞卷积 (d=1,2,4) 提取时域统计量 [μ,σ,SNR] 的空域特征。梯度路径从 `feats→LFF→DWT→phase→s_noise` 简化为 `feats→统计量→Conv→head`。
-- **ISPN (Mod5: ZeroDCE曲线增强, 5 iter)**：CurveBranch——refine 特征 h (64ch) → AvgPool → Linear(64→16)→Linear(16→15) → Tanh → per-image α (5 iter × 3 RGB)。在 SGRF S2→S3 之间施加 ZeroDCE 曲线 I_{n+1}=I_n+α·I_n·(1-I_n)。零初始化 → Phase 1 为 identity。gain 基值 0.5 允许 <1（曲线后残差调暗），gain_sup 目标改为 GT/img_s2（曲线感知）。
+- **ISPN (Mod6: spatial curve, pixel-wise, 8 iter)**：SpatialCurveBranch——refine 特征 h (64ch) → Conv(64→32)+GELU+Conv(32→24) → Tanh → per-pixel A ∈ (B,8,3,H,W)。在 SGRF S2→S3 之间施加 ZeroDCE 曲线 I_{n+1}=I_n+A_n·I_n·(1-I_n)。零初始化 → Phase 1 为 identity。gain 基值 0.5，gain_sup 目标改为 GT/img_s2。Mod6 移除 bias_map——曲线 $I+\alpha·I·(1-I)$ 提供有界加性修正，无需独立 bias。
 - **TCA 空间扫描**：输入 WFR 的 H/2 特征。MVC-Shift(3 dilated DWConv) → 4方向 Bi-WKV → Channel Mix → H 上采样。C_omega 行 softmax 归一化，L_diag_prior Phase 1 自监督 (Phase 2 取消)。
 - **Mod3 γ=0.01**：NDPN 和 MCPN 的 γ 从 Flight3 的 0.001 提升到 0.01——Phase 1.5/2 允许 10× 更强的梯度流过噪声/运动分支。配合 CXG 路由修复 (SGRF 接收 CXG 门控特征)，gamma 直接影响最终输出。
 - **Mod5 StageBlock 零均值约束**：δ = δ - mean(δ)。强制 S1/S2 的 delta 每通道空间均值为零——StageBlock 只能重新排列像素（去噪/去模糊），不能改变整体亮度。所有亮度变化必须走 curve → gain 路径，阻止 S2 抄近路成为主要提亮器（f3mk5mod1 中 S2 delta 有 12× 的非零均值）。
@@ -129,15 +128,13 @@ flowchart TD
         TCA_SPATIAL --> TCORR
     end
 
-    subgraph ISPN["ISPN 光照源处理 (Mod4: ZeroDCE曲线 + gain/bias)"]
+    subgraph ISPN["ISPN 光照源处理 (Mod6: spatial curve + gain only)"]
         direction TB
         ISPN_REFINE["refine: Conv(f_enc + s_illum, 65→64)<br/>→ GELU → Conv(64→64) → GELU → h"]
-        ISPN_CURVE["Mod4 CurveBranch: s_illum → AvgPool → MLP(1→16→9) → Tanh<br/>→ α (B, 3iter, 3ch) | 零初始化 → identity"]
-        ISPN_GAIN["gain_head: Conv(64→16)→GELU→Conv(16→1)<br/>→ softplus(raw_gain) → clamp[1, max_gain]"]
-        ISPN_BIAS["bias_head: Conv(64→16)→GELU→Conv(16→3)<br/>→ tanh × range → bias∈[-0.1, 0.1]"]
+        ISPN_CURVE["Mod6 SpatialCurveBranch: h → Conv(64→32)→GELU→Conv(32→24)→ Tanh<br/>→ A (B, 8iter, 3ch, H, W) pixel-wise | 零初始化 → identity"]
+        ISPN_GAIN["gain_head: Conv(64→16)→GELU→Conv(16→1)<br/>→ softplus(raw_gain), base=0.5"]
         ISPN_REFINE --> ISPN_CURVE
         ISPN_REFINE --> ISPN_GAIN
-        ISPN_REFINE --> ISPN_BIAS
     end
 
     subgraph NDPN["NDPN 噪声退化处理 (Phase 1: zero截断)"]
@@ -161,8 +158,8 @@ flowchart TD
         direction LR
         SGRF_S1["S1: Denoise<br/>f_noise_gated + img_center<br/>→ StageBlock(gate=0) → img_s1"]
         SGRF_S2["S2: Deblur<br/>f_motion_gated + img_s1<br/>→ StageBlock(gate=0) → img_s2"]
-        SGRF_CURVE["S2.5 (Mod4): ZeroDCE Curve<br/>img_s2 += α·img_s2·(1-img_s2)<br/>3 iterations, α predicted from s_illum"]
-        SGRF_S3["S3: Brighten<br/>img_curved × gain_map + bias_map<br/>+ refine(0-gate) → clamp → res_t"]
+        SGRF_CURVE["S2.5 (Mod6): ZeroDCE Curve (pixel-wise)<br/>img_s2 += A_n·img_s2·(1-img_s2)<br/>8 iterations, A(xy) predicted from h"]
+        SGRF_S3["S3: Brighten (Mod6: no bias)<br/>img_curved × gain_map<br/>+ refine(0-gate) → clamp → res_t"]
     end
 
     OUT["输出 res_t"]
@@ -179,7 +176,6 @@ flowchart TD
     TCA_TEMP -- "C_omega" --> MCPN_MOT
     ISPN_CURVE -- "curve_α" --> SGRF_CURVE
     ISPN_GAIN --> SGRF_S3
-    ISPN_BIAS --> SGRF_S3
     NDPN_STR -- "f_noise" --> CXG_G
     MCPN_REF -- "f_motion" --> CXG_G
     CXG_G -- "f_noise_gated" --> SGRF_S1
@@ -275,7 +271,7 @@ SGRF gate         →  零 (四重保险: 分支零 × gate零 × unlock零 × c
 | **C_omega** | ds capped ≤ 96 → N≤9216 → C_omega≤340MB, 防OOM |
 | **diag_prior** | `C_omega.diag().clamp(min=1e-6)` → -log防数值爆炸 |
 | **gain_map** | `softplus(raw_gain).clamp(1.0, max_gain)` → 物理合理范围 |
-| **bias_map** | `tanh(·)·range` → 有界输出 |
+| **bias_map** | — | — | **Mod6: removed — curve provides additive correction** |
 
 ### Flight3 vs Mark3/Mark1 核心差异
 
@@ -293,10 +289,11 @@ SGRF gate         →  零 (四重保险: 分支零 × gate零 × unlock零 × c
 | **CXG routing** | output unused | output unused | **Mod3: CXG→SGRF (不再pass-through)** |
 | **Phase 2 启动** | 剧烈扰动 | PSNR 18→8.7 暴跌 | **三重保险 (无扰动)** |
 | **Phase 1.5** | 5 epoch (20-25) | 同 | **20 epoch (10-30)** |
-| **参数** | 1.69M | 1.69M | **1.45M** |
+| **参数** | 1.69M | 1.69M | **1.47M** |
 | **DPE head** | — | 直接Sigmoid→饱和 | **LayerNorm+零初始化** |
-| **ISPN gain** | — | exp→梯度异常 | **softplus+动态max_gain** |
+| **ISPN gain** | — | exp→梯度异常 | **softplus+动态max_gain, base 0.5** |
 | **WFR HF** | — | noise_gate 误分流 | **共享HF, proj隐式分化** |
-| **CurveBranch** | — | — | **Mod5: h→MLP(64→16→15), ZeroDCE曲线粗提亮 (15 DOF, 5 iter)** |
+| **CurveBranch** | — | — | **Mod6: spatial Conv(64→32→24), pixel-wise 8 iter (24ch)** |
 | **StageBlock δ** | 自由均值 | 自由均值 | **Mod5: δ=δ-mean(δ), 零均值约束** |
+| **S3 formula** | img×gain+bias | 同 | **Mod6: img_curved×gain, bias removed** |
 | **Epochs** | — | 90 | **100** |

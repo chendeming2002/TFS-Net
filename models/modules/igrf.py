@@ -89,9 +89,9 @@ class StageBlock(nn.Module):
 
 
 class BrightenStage(nn.Module):
-    """Mark4: Retinex-style brightening — img_enhanced = img × gain + bias.
+    """Mod6: Retinex-style brightening — img_enhanced = img × gain.
 
-    No delta_refine, no A_illu modulation — ISPN_v2 outputs gain/bias directly.
+    bias_map removed — additive correction provided by ZeroDCE curve.
     """
 
     def __init__(self, channels: int, img_channels: int = 3,
@@ -105,14 +105,11 @@ class BrightenStage(nn.Module):
         nn.init.zeros_(self.final_refine[0].bias)
         self.refine_gate = nn.Parameter(torch.zeros(1))
 
-    def forward(self, gain_map: torch.Tensor, bias_map: torch.Tensor,
-                img_dark: torch.Tensor) -> tuple:
+    def forward(self, gain_map: torch.Tensor, img_dark: torch.Tensor) -> tuple:
         gain = F.interpolate(gain_map, size=img_dark.shape[-2:],
                               mode='bilinear', align_corners=False)
-        bias = F.interpolate(bias_map, size=img_dark.shape[-2:],
-                              mode='bilinear', align_corners=False)
 
-        img_bright = img_dark * gain + bias
+        img_bright = img_dark * gain
         img_bright = img_bright + self.final_refine(img_bright) * self.refine_gate
         img_bright = torch.clamp(img_bright, 0.0, 1.0)
         return img_bright, gain
@@ -123,9 +120,11 @@ class SGRF(nn.Module):
 
     Stage 1 (Denoise):  img_s1 = img_center + StageBlock_1(f_noise_out, img_center)
     Stage 2 (Deblur):   img_s2 = img_s1 + StageBlock_2(f_motion_out, img_s1)
-    Stage 3 (Brighten): res_t = img_s2 × gain_map + bias_map
+    Stage 3 (Brighten): res_t = img_s2 × gain_map (Mod6: bias removed)
 
     StageBlock uses zero-gate: gate=0 at init → no perturbation to Phase 1 output.
+    Mod5: delta zero-mean constraint → StageBlocks cannot shift global brightness.
+    Mod6: curve is pixel-wise with 8 iterations, bias_map removed.
     """
 
     def __init__(self, channels: int = 64, out_channels: int = 3, use_soft_clamp: bool = False,
@@ -148,25 +147,22 @@ class SGRF(nn.Module):
     def forward(
         self,
         gain_map: torch.Tensor,
-        bias_map: torch.Tensor,
         f_noise_out: torch.Tensor,
         f_motion_out: torch.Tensor,
         image_center: torch.Tensor,
         curve_alpha: torch.Tensor = None,
-        curve_iter: int = 3,
+        curve_iter: int = 8,
     ) -> dict:
         img_s1, _ = self.stage_noise(f_noise_out, image_center)
         img_s2, _ = self.stage_motion(f_motion_out, img_s1)
 
-        # Flight3 Mod4: ZeroDCE curve enhancement before gain/bias
+        # Mod6: pixel-wise ZeroDCE curve (A: (B, n_iter, 3, H, W))
         if curve_alpha is not None:
-            B = img_s2.shape[0]
-            alpha = curve_alpha.reshape(B, curve_iter, 3, 1, 1)
             for i in range(curve_iter):
-                A = alpha[:, i]
+                A = curve_alpha[:, i]
                 img_s2 = img_s2 + A * img_s2 * (1.0 - img_s2)
 
-        res_t, lit_up = self.brighten(gain_map, bias_map, img_s2)
+        res_t, lit_up = self.brighten(gain_map, img_s2)
 
         return {
             "res_t":       res_t,

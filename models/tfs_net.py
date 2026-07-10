@@ -215,7 +215,6 @@ class TFSNet(nn.Module):
         f_enc_center = feats[:, center_idx]
         ispn_out = self.ispn(f_enc_center, s_illum)
         gain_map = ispn_out["gain_map"]
-        bias_map = ispn_out["bias_map"]
         f_illum_feat = ispn_out["f_illum_feat"]
         curve_alpha = ispn_out.get("curve_alpha", None)
 
@@ -248,10 +247,9 @@ class TFSNet(nn.Module):
                 sigma_t_clean=sigma_t_clean, C_omega_list=C_omega_list, F_t_aligned=F_t_aligned)
             f_noise_gated, f_motion_gated = self.cxg(ndpn_out["f_noise_out"], mcpn_out["f_motion_out"])
 
-        # SGRF: 阶段式修复融合 (Flight3 Mod3: CXG-gated features, Mod4: curve-enhanced)
+        # SGRF: 阶段式修复融合 (Mod6: spatial curve, no bias)
         sgrf_out = self.sgrf(
             gain_map=gain_map,
-            bias_map=bias_map,
             f_noise_out=f_noise_gated,
             f_motion_out=f_motion_gated,
             image_center=image_center,
@@ -265,7 +263,6 @@ class TFSNet(nn.Module):
             "img_s2":         sgrf_out["img_s2"],
             "lit_up_map":     sgrf_out["lit_up_map"],
             "gain_map":       gain_map,
-            "bias_map":       bias_map,
             "image_center":   image_center,
             "s_illum":        s_illum,
             "s_noise":        s_noise,
