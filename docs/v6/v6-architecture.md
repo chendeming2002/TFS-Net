@@ -1,7 +1,7 @@
 # TFS-Net v6 Delta Flight3 模型架构设计文档
 
-> 日期：2026-07-10 (更新: Mod6 spatial curve + bias去除 + 8 iter pixel-wise α)
-> 版本：v6 Delta Flight3 Mod6
+> 日期：2026-07-11 (更新: Flight5 TCC曲线 + gain监督重定向 + soft_clamp)
+> 版本：v6 Delta Flight5
 > 训练配置：`configs/delta_flight3.yaml`，batch=4 (accum=2→eff=8), lr=8e-4, epochs=100
 > 参数量：1.47M
 
@@ -16,11 +16,11 @@ TSD-Net (Tri-Source Decoupled Network) 是一个端到端多帧低光视频增�
 | **WFR** | Wavelet Feature Router | Haar DWT 子带级分流 (LL→光照/噪声, HF→结构) |
 | **DPE** | Degradation Prior Estimator | 时域统计 + 多尺度空洞卷积 → s_illum, s_noise (Mark4 简化) |
 | **TCA** | Temporal Correspondence & Alignment | 4方向空间 WKV 扫描 + C_omega 时序矩阵 |
-| **ISPN** | Illumination-Source Processing Network | SpatialCurveBranch (pixel-wise, 8 iter) + gain_map (Mod6: bias去除) |
+| **ISPN** | Illumination-Source Processing Network | TargetConvergentCurve (Flight5: 6 iter, A∈[-4,4], α_target收敛) + gain_map |
 | **NDPN** | Noise Degradation Processing Network | C_omega 置信度引导去噪 (γ=0.01 → 10× stronger gradient flow) |
 | **MCPN** | Motion Compensation Processing Network | C_omega 运动强度补偿 (gamma=0.01, startup→pass-through) |
 | **CXG** | Cross-eXcitation Gate | 去噪↔运动 交叉激励门 (Mod3: 输出喂入SGRF, 不再pass-through原始NDPN/MCPN) |
-| **SGRF** | Stage-wise Guided Restoration & Fusion | S1:去噪 → S2:去模糊 → S2.5:ZeroDCE曲线(Mod6: pixel-wise 8 iter) → S3:gain×img (Mod6: bias去除) |
+| **SGRF** | Stage-wise Guided Restoration & Fusion | S1:去噪 → S2:去模糊 → S2.5:TCC曲线(Flight5:6 iter, α收敛) → S3:soft_clamp(gain×img) |
 
 ### 命名变更总表
 
@@ -183,40 +183,25 @@ $$F_{\text{TCA}} = \text{LN}\left(\text{Conv}_{1\times1}([LL_{\text{TCA}}, \text
 
 删除 `noise_gate` 和 `hf_tca_norm` 两个子模块，简化 WFR 并消除误分流的归纳偏置。
 
-### 2.4 ISPN — 光照源处理 (Mod6: spatial curve + gain only)
+### 2.4 ISPN — 光照源处理 (Flight5: Target-Convergent Curve + gain)
 
-ISPN 接收编码器中心帧特征 $F_t^{\text{enc}}$ 和 DPE 的光照先验 $s_{\text{illum}}$，输出 pixel-wise 曲线参数和空间增益图。Mod6 移除 bias_map——ZeroDCE 曲线 $I+\alpha\cdot I\cdot(1-I)$ 已提供有界加性修正。
+ISPN 输出 pixel-wise TCC 曲线参数 $A(x,y)$ 和空间增益图。Flight5 将 ZeroDCE LE-curve 替换为 Target-Convergent Curve——曲线自动收敛到可学习目标 $\alpha_{\text{target}}$，永不饱和。
 
-**Mod6 SpatialCurveBranch**。从 refine 特征 $h$（64ch）用 2 层 Conv 预测 pixel-wise 曲线参数，8 次迭代 × 3 RGB = 24 通道 per-pixel：
-$$A = \text{Tanh}\left(\text{Conv2d}_{32\to 24}\left(\text{GELU}\left(\text{Conv2d}_{64\to 32}(h)\right)\right)\right), \quad A \in \mathbb{R}^{B\times 8\times 3\times H\times W}$$
+**Flight5 TargetConvergentCurve**：
+$$A = 4\cdot\text{Tanh}\left(\text{Conv2d}_{32\to 18}\left(\text{GELU}\left(\text{Conv2d}_{64\to 32}(h)\right)\right)\right), \quad A \in \mathbb{R}^{B\times 6\times 3\times H\times W}$$
 
-**ZeroDCE 迭代曲线**：$$LE_n(x,y) = LE_{n-1}(x,y) + A_n(x,y) \odot LE_{n-1}(x,y) \odot (1 - LE_{n-1}(x,y))$$
+**TCC 迭代公式**：
+$$\text{TCC}_n = \text{TCC}_{n-1} + A_n \odot \text{TCC}_{n-1} \odot (1 - \text{TCC}_{n-1}) \odot (\alpha_{\text{target}} - \text{TCC}_{n-1})$$
 
-在 SGRF S2 和 S3 之间施加曲线，然后 gain_map 做空间乘性残差。
+不动点：$\text{TCC}^* = 0$, $\text{TCC}^* = 1$, 或 $\text{TCC}^* = \alpha_{\text{target}}$。从暗图出发，曲线自动停在 $\alpha_{\text{target}}$。
+$\alpha_{\text{target}} = \sigma(\alpha_{\text{raw}})$，可学习参数，初始=0.5。
 
-**零初始化**：Conv2 权重=0 → $A=0$ → 初始曲线为 identity，Phase 1 零扰动。
+**关键性质**：曲线永不饱和到 1.0，gain 不需充当刹车。
 
-**空间 gain (保留)**：
+**空间 gain**：
+$$G = 0.5 + \frac{\text{softplus}(\text{raw})}{\text{softplus}(4)} \cdot (G_{\text{max}} - 0.5)$$
 
-**Retinex 物理模型**：
-$$\hat{X}_t = \text{curve}(I_t) \cdot G$$
-
-**网络结构**：
-$$h = \text{Conv}_{3\times3} \to \text{GELU} \to \text{Conv}_{3\times3}([F_t^{\text{enc}}, s_{\text{illum}}])$$
-
-$$\text{raw} = \text{Conv}_{1\times1} \to \text{GELU} \to \text{Conv}_{1\times1}(h), \quad G = 0.5 + \frac{\text{softplus}(\text{raw})}{\text{softplus}(4)} \cdot (G_{\text{max}} - 0.5)$$
-
-**Flight3 C: softplus 参数化**。替代 `exp(log_gain).clamp()`，用 softplus 提供稳定梯度——导数始终 ∈ (0,1)，不会在极端值时消失或爆炸。raw=0 → G≈2.55；raw=0.8 → G≈3.62。
-
-**Flight3 I: max_gain 动态调度**。$G_{\text{max}}$ 从 4.0 线性 ramp 到 16.0（30 epoch），配合 softplus 上限防止早期梯度爆炸：
-
-| Epoch | $G_{\text{max}}$ | raw=0 → G |
-|-------|-----------------|-----------|
-| 0 | 4.0 | 1.59× |
-| 15 | 10.0 | 3.47× |
-| 30+ | 16.0 | 5.41× |
-
-**初始化**：`gain_head[-1].weight`=0, `gain_head[-1].bias`=**0.8**；CurveBranch Conv2 零初始化。
+gain_head bias=0.0 → 初始 G≈1.10（近似 identity），配合 TCC 输出≈0.5 → 最终输出≈0.55，合理起点。
 
 ### 2.5 NDPN — 噪声退化处理 (对应 $\sigma^2_{\text{img}}$)
 
@@ -256,7 +241,15 @@ $$\mathbf{f}_{\text{noise}}^{\text{out}} = \mathbf{f}_{\text{noise}} \odot \begi
 
 $$\mathbf{f}_{\text{motion}}^{\text{out}} = \mathbf{f}_{\text{motion}} \odot \begin{cases} \sigma(\text{SE}(\mathbf{f}_{\text{noise}})) & \text{train} \\ \bar{g}_m & \text{infer (deploy)} \end{cases}$$
 
-### 2.8 SGRF — 阶段式修复融合 (Mod6: spatial curve, no bias)
+### 2.8 SGRF — 阶段式修复融合 (Flight5: TCC curve + soft_clamp)
+
+Flight4 用 soft_clamp 替代 hard clamp 消除了梯度截断。Flight5 将曲线升级为 TCC（自动收敛），并新增 Flight4 soft_clamp 保留——所有 StageBlock 和 BrightenStage 统一使用 Tanh 基 soft_clamp。
+
+**S2.5 TCC 曲线**：
+$$\text{TCC}_n = \text{TCC}_{n-1} + A_n \odot \text{TCC}_{n-1} \odot (1 - \text{TCC}_{n-1}) \odot (\alpha_{\text{target}} - \text{TCC}_{n-1})$$
+
+**S3 提亮**：
+$$\hat{X}_t = \text{soft\_clamp}\left(\text{TCC}(I_2) \odot G\right)$$
 
 SGRF 的三阶段顺序由 §2.1 的物理推导确定。Mod5 对 StageBlock delta 施加零均值约束。Mod6 将曲线升级为 pixel-wise 8 iter，并移除 bias_map——ZeroDCE 曲线 $I+\alpha\cdot I\cdot(1-I)$ 提供有界加性修正，bias 无独立物理角色。
 
@@ -384,7 +377,7 @@ pre_norm LayerNorm 在 R/K/V 投影前
 | v6 Delta Mark1 | WFR子带分流 + 命名统一 + 数值稳定 | 1.69M | ep15 loss收敛 |
 | **v6 Delta Mark2** | **Kendall不确定性加权 + PE Loss + 感知解耦 + 损失调度** | **1.69M** | 收敛停滞 |
 | **v6 Delta Mark3** | **两阶段渐进训练 + ISPN 隔离 + SGRF 中间监督 + 相位调度** | **1.69M** | PSNR 18→8.7 |
-| **v6 Delta Flight3 Mod6** | **Spatial curve (pixel-wise, 8 iter) + bias去除 + zero-mean δ + CXG路由 + γ=0.01 + gamma anti-collapse** | **1.47M** | **训练中** |
+| **v6 Delta Flight5** | **TCC curve (6 iter) + gain监督重定向 + soft_clamp + zero-mean δ** | **1.47M** | **训练中** |
 
 ---
 

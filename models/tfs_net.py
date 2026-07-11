@@ -216,7 +216,8 @@ class TFSNet(nn.Module):
         ispn_out = self.ispn(f_enc_center, s_illum)
         gain_map = ispn_out["gain_map"]
         f_illum_feat = ispn_out["f_illum_feat"]
-        curve_alpha = ispn_out.get("curve_alpha", None)
+        curve_A = ispn_out.get("curve_A", None)
+        alpha_target = ispn_out.get("alpha_target", None)
 
         # --- Mark3: Phase-dependent NDPN/MCPN/CXG ---
         phase = getattr(self, '_phase', 'phase2')
@@ -247,13 +248,14 @@ class TFSNet(nn.Module):
                 sigma_t_clean=sigma_t_clean, C_omega_list=C_omega_list, F_t_aligned=F_t_aligned)
             f_noise_gated, f_motion_gated = self.cxg(ndpn_out["f_noise_out"], mcpn_out["f_motion_out"])
 
-        # SGRF: 阶段式修复融合 (Mod6: spatial curve, no bias)
+        # SGRF: 阶段式修复融合 (Flight5: TCC curve)
         sgrf_out = self.sgrf(
             gain_map=gain_map,
             f_noise_out=f_noise_gated,
             f_motion_out=f_motion_gated,
             image_center=image_center,
-            curve_alpha=curve_alpha,
+            curve_A=curve_A,
+            alpha_target=alpha_target,
             curve_iter=self.ispn.curve_iter,
         )
 
@@ -261,6 +263,7 @@ class TFSNet(nn.Module):
             "res_t":          sgrf_out["res_t"],
             "img_s1":         sgrf_out["img_s1"],
             "img_s2":         sgrf_out["img_s2"],
+            "img_curved":     sgrf_out.get("img_curved", sgrf_out["img_s2"]),
             "lit_up_map":     sgrf_out["lit_up_map"],
             "gain_map":       gain_map,
             "image_center":   image_center,
@@ -276,6 +279,7 @@ class TFSNet(nn.Module):
             "F_out_list":     F_aligned_list,
             "F_hat":          F_t_aligned,
             "dpe_out":        dpe_out,
-            "curve_alpha":    curve_alpha,
+            "curve_A":        curve_A,
+            "alpha_target":   alpha_target,
             "phase":          phase,
         }

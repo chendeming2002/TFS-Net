@@ -1,258 +1,518 @@
-"""
-训练+推理脚本 — RWKV-Charlie
-============================
-合并自原始 train.py + inference.py + utils.py
-
-Charlie 特有:
-  - sigma_t 传入 MRPN
-  - warmup_epochs=5
-  - max_lr=2e-4
-"""
-
+import argparse
 import os
-import sys
-import math
-import time
-import glob
-import random
-import logging
-from typing import Any
-from pathlib import Path
 
-import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
-from torch.utils.tensorboard import SummaryWriter
-from torch.optim.lr_scheduler import CosineAnnealingLR
+import yaml
+from torch.cuda.amp import GradScaler, autocast
+from torch.optim import AdamW
 
+from torch.utils.data import DataLoader, Subset
+
+try:
+    from tqdm import tqdm
+except Exception:
+    class _TqdmFallback(object):
+        def __init__(self, iterable=None, *args, **kwargs):
+            self.iterable = iterable
+
+        def __iter__(self):
+            return iter(self.iterable)
+
+        def set_postfix(self, **kwargs):
+            return None
+
+    def tqdm(iterable=None, *args, **kwargs):
+        return _TqdmFallback(iterable, *args, **kwargs)
+
+from datasets import SDSDDataset
+from losses.losses import TFSNetLoss
 from models import TFSNet
-from losses import TFSNetLoss
-from datasets import create_sdsd_dataloader, SDSDDataset, VideoToTensor, VideoRandomCrop, VideoRandomFlip, TestTimeAug
+from utils.io import save_checkpoint
+from utils.inference import tiled_forward
+from utils.metrics import tensor_psnr, tensor_ssim
+from utils.misc import AverageMeter, create_logger, seed_everything
 
-logger = logging.getLogger("delta")
-
-
-def warp(img, flow):
-    B, _, H, W = flow.shape
-    grid_y, grid_x = torch.meshgrid(torch.arange(H, device=flow.device), torch.arange(W, device=flow.device), indexing='ij')
-    grid = torch.stack([grid_x, grid_y], dim=-1).float().unsqueeze(0).repeat(B, 1, 1, 1)
-    grid = grid + flow.permute(0, 2, 3, 1)
-    grid = grid * 2 / torch.tensor([W - 1, H - 1], device=flow.device) - 1
-    return F.grid_sample(img, grid, mode='bilinear', padding_mode='reflection', align_corners=False)
+_LPIPS_AVAILABLE = None
+_LPIPS_FN = None
 
 
-def create_optimizer(model, lr=2e-4, weight_decay=1e-4):
-    decay_params = []
-    no_decay_params = []
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if 'norm' in name or 'bias' in name:
-            no_decay_params.append(param)
-        else:
-            decay_params.append(param)
-    return torch.optim.AdamW([
-        {'params': decay_params, 'weight_decay': weight_decay},
-        {'params': no_decay_params, 'weight_decay': 0.0},
-    ], lr=lr)
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--resume", type=str, default=None, help="checkpoint path to resume from")
+    parser.add_argument("--pretrained", type=str, default=None, help="pretrained weights to init model only")
+    return parser.parse_args()
 
 
-class AverageMeter:
-    def __init__(self):
-        self.reset()
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / max(self.count, 1)
+def load_config(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
 
-class Config:
-    num_frames = 5
-    width = 32
-    batch_size = 4
-    num_workers = 4
-    max_epochs = 300
-    warmup_epochs = 5
-    max_lr = 2e-4
-    min_lr = 1e-6
-    weight_decay = 1e-4
-    patch_size = 128
-    lambda_pix = 1.0
-    lambda_perc = 0.04
-    lambda_ssim = 0.2
-    use_rwkv = True
-    deep_supervision = False
-    use_temporal_fusion = True
+def build_dataloaders(cfg, smoke=False):
+    ds_cfg = cfg["dataset"]
+    max_train = ds_cfg.get("max_train_seqs", None)
+    max_val = ds_cfg.get("max_val_seqs", None)
+    train_set = SDSDDataset(
+        input_root=ds_cfg["train_input_root"],
+        target_root=ds_cfg["train_target_root"],
+        window_size=ds_cfg["window_size"],
+        mode="train",
+        crop_size=ds_cfg["crop_size"],
+        max_seqs=max_train,
+    )
+    val_set = SDSDDataset(
+        input_root=ds_cfg["val_input_root"],
+        target_root=ds_cfg["val_target_root"],
+        window_size=ds_cfg["window_size"],
+        mode="val",
+        crop_size=ds_cfg["crop_size"],
+        max_seqs=max_val,
+    )
+
+    if smoke:
+        train_set = Subset(train_set, list(range(min(8, len(train_set)))))
+        val_set = Subset(val_set, list(range(min(4, len(val_set)))))
+    else:
+        # 简短训练: 限制 validation 帧数避免 CPU 推理耗时过长
+        max_val_samples = ds_cfg.get("max_val_samples", None)
+        if max_val_samples is not None and len(val_set) > max_val_samples:
+            val_set = Subset(val_set, list(range(max_val_samples)))
+
+    train_loader = DataLoader(
+        train_set,
+        batch_size=cfg["train"]["batch_size"],
+        shuffle=True,
+        num_workers=cfg["dataset"]["num_workers"],
+        pin_memory=True,
+        drop_last=False,
+    )
+    val_loader = DataLoader(
+        val_set,
+        batch_size=1,
+        shuffle=False,
+        num_workers=cfg["dataset"]["num_workers"],
+        pin_memory=True,
+        drop_last=False,
+    )
+    return train_loader, val_loader
 
 
-def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, epoch, config, writer=None):
+def build_model(cfg, device):
+    model_cfg = cfg["model"]
+    model = TFSNet(
+        in_channels=model_cfg["in_channels"],
+        level_channels=tuple(model_cfg["level_channels"]),
+        fused_channels=model_cfg["fused_channels"],
+        share_lff=model_cfg.get("share_lff", True),
+        sace_phase_preserving=model_cfg.get("sace_phase_preserving", True),
+        use_soft_clamp=model_cfg.get("use_soft_clamp", True),
+        sace_offset_use_norm=model_cfg.get("sace_offset_use_norm", False),
+        sace_offset_kaiming_init=model_cfg.get("sace_offset_kaiming_init", False),
+        use_soft_median=model_cfg.get("use_soft_median", True),
+        use_cross_rwkv=model_cfg.get("use_cross_rwkv", False),
+        use_dwt_lff=model_cfg.get("use_dwt_lff", False),
+        use_pure_rwkv=model_cfg.get("use_pure_rwkv", False),
+        use_nafblock=model_cfg.get("use_nafblock", False),
+        num_bottleneck_blocks=model_cfg.get("num_bottleneck_blocks", 0),
+        num_igrf_res_blocks=model_cfg.get("num_igrf_res_blocks", 2),
+        use_amp_enhance=model_cfg.get("use_amp_enhance", False),
+        charlie_mode=model_cfg.get("charlie_mode", False),
+    )
+    return model.to(device)
+
+
+def build_loss(cfg, device):
+    loss_cfg = cfg["loss"]
+    criterion = TFSNetLoss(
+        use_freq_loss=loss_cfg.get("use_freq_loss", True),
+        perceptual_pretrained=loss_cfg.get("perceptual_pretrained", False),
+        lambda_perc=loss_cfg.get("lambda_perc", 0.1),
+        lambda_freq=loss_cfg.get("lambda_freq", 0.1),
+        lambda_illum=loss_cfg.get("lambda_illum", 0.001),
+        lambda_ssim=loss_cfg.get("lambda_ssim", 0.2),
+        lambda_inter=loss_cfg.get("lambda_inter", 0.3),
+        fused_channels=loss_cfg.get("fused_channels", 64),
+        # v5.6 P0-2/P0-3
+        lambda_illum_sup=loss_cfg.get("lambda_illum_sup", 0.1),
+        lambda_noise_sup=loss_cfg.get("lambda_noise_sup", 0.05),
+        lambda_recon=loss_cfg.get("lambda_recon", 0.5),
+        noise_tau_high=loss_cfg.get("noise_tau_high", 5.0),
+        # v5.6 P1-3/P1-4
+        perc_multilayer=loss_cfg.get("perc_multilayer", True),
+        freq_with_phase=loss_cfg.get("freq_with_phase", True),
+        freq_phase_weight=loss_cfg.get("freq_phase_weight", 0.5),
+        # v5.9.2
+        lambda_ifpn_sup=loss_cfg.get("lambda_ifpn_sup", 0.0),
+        # v6 Bravo P0-1
+        lambda_pix=loss_cfg.get("lambda_pix", 1.0),
+    )
+    return criterion.to(device)
+
+
+def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp, logger, log_interval, epoch=0, grad_clip=1.0, grad_accum_steps=1, phase='phase2', unlock_ratio=1.0):
     model.train()
-    loss_meter = AverageMeter()
-    pix_meter = AverageMeter()
-    perc_meter = AverageMeter()
-    ssim_meter = AverageMeter()
-    t0 = time.time()
-    for step, batch in enumerate(dataloader):
-        noisy = batch["noisy"].cuda()
-        clean = batch["clean"].cuda()
-        B, T, C, H, W = noisy.shape
-        optimizer.zero_grad()
-        pred = model(noisy)
-        if isinstance(pred, list):
-            ds_preds = pred[1:]
-            pred = pred[0]
-        else:
-            ds_preds = None
-        loss = criterion(pred, clean, ds_preds)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        loss_meter.update(loss.item(), B)
-        if step % 50 == 0:
-            elapsed = time.time() - t0
+    meter_total = AverageMeter()
+    meter_pix = AverageMeter()
+    meter_freq = AverageMeter()
+    meter_ssim = AverageMeter()
+    meter_perc = AverageMeter()
+    meter_illum = AverageMeter()
+    meter_illum_sup = AverageMeter()
+    meter_noise_sup = AverageMeter()
+    meter_inter = AverageMeter()
+    meter_ifpn = AverageMeter()
+    meter_gamma_reg = AverageMeter()
+
+    progress = tqdm(enumerate(loader), total=len(loader), desc="train", leave=False)
+    for step, (clip, target, _) in progress:
+        clip = clip.to(device, non_blocking=True)
+        target = target.to(device, non_blocking=True)
+
+        # gradient accumulation: scale loss so effective batch = batch × accum_steps
+        with autocast(enabled=use_amp):
+            outputs = model(clip, phase=phase)
+        model._unlock_ratio = unlock_ratio
+        loss, loss_dict = criterion(outputs, target, epoch=epoch, phase=phase, unlock_ratio=unlock_ratio, model=model)
+
+        if not torch.isfinite(loss):
+            logger.warning("Skipping non-finite loss at step %d", step + 1)
+            optimizer.zero_grad(set_to_none=True)
+            continue
+
+        loss = loss / grad_accum_steps
+        scaler.scale(loss).backward()
+
+        if (step + 1) % grad_accum_steps == 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+        meter_total.update(loss_dict["loss_total"].item(), clip.size(0))
+        meter_pix.update(loss_dict["loss_pix"].item(), clip.size(0))
+        meter_freq.update(loss_dict["loss_freq"].item(), clip.size(0))
+        meter_ssim.update(loss_dict["loss_ssim"].item(), clip.size(0))
+        meter_perc.update(loss_dict["loss_perc"].item(), clip.size(0))
+        meter_illum.update(loss_dict["loss_illum"].item(), clip.size(0))
+        meter_illum_sup.update(loss_dict["loss_illum_sup"].item(), clip.size(0))
+        meter_noise_sup.update(loss_dict["loss_noise_sup"].item(), clip.size(0))
+        meter_inter.update(loss_dict["loss_inter"].item(), clip.size(0))
+        meter_ifpn.update(loss_dict["loss_ifpn_sup"].item(), clip.size(0))
+        meter_gamma_reg.update(loss_dict.get("loss_gamma_reg", 0.0), clip.size(0))
+
+        progress.set_postfix(loss=meter_total.avg, pix=meter_pix.avg, ssim=meter_ssim.avg,
+                              perc=meter_perc.avg, i_sup=meter_illum_sup.avg)
+        if (step + 1) % log_interval == 0:
             logger.info(
-                f"Epoch {epoch}/{config.max_epochs} | Step {step}/{len(dataloader)} | "
-                f"Loss {loss_meter.avg:.4f} | LR {scheduler.get_last_lr()[0]:.2e} | {elapsed:.1f}s"
+                "step %d/%d loss=%.4f pix=%.4f freq=%.4f ssim=%.4f perc=%.4f illum=%.4f i_sup=%.4f inter=%.4f ifpn=%.4f",
+                step + 1,
+                len(loader),
+                meter_total.avg,
+                meter_pix.avg,
+                meter_freq.avg,
+                meter_ssim.avg,
+                meter_perc.avg,
+                meter_illum.avg,
+                meter_illum_sup.avg,
+                meter_inter.avg,
+                meter_ifpn.avg,
             )
-            t0 = time.time()
-    if writer:
-        writer.add_scalar("train/loss", loss_meter.avg, epoch)
+            # Flight3 G: diagnostic logging for DPE/ISPN/WFR health
+            with torch.no_grad():
+                s_ill = outputs.get("s_illum")
+                gain = outputs.get("gain_map")
+                g_ndpn = model.ndpn.gamma.abs().mean().item() if hasattr(model, 'ndpn') and hasattr(model.ndpn, 'gamma') else 0
+                g_mcpn = model.mcpn.gamma.abs().mean().item() if hasattr(model, 'mcpn') and hasattr(model.mcpn, 'gamma') else 0
+                ca = outputs.get("curve_alpha")
+                if s_ill is not None:
+                    logger.info(
+                        "diag: dpe_si=%.3f/%.4f g=%.2f/%.3f gn=%.4f gm=%.4f",
+                        s_ill.mean().item(), s_ill.std().item(),
+                        gain.mean().item() if gain is not None else 0,
+                        gain.std().item() if gain is not None else 0,
+                        g_ndpn, g_mcpn,
+                    )
+                    if ca is not None:
+                        # Show curve alpha mean per iteration
+                        ca_mean = ca.abs().mean().item()
+                        logger.info("      curve_α|mean|=%.4f", ca_mean)
+    return {
+        "loss_total": meter_total.avg,
+        "loss_pix": meter_pix.avg,
+        "loss_freq": meter_freq.avg,
+        "loss_ssim": meter_ssim.avg,
+        "loss_perc": meter_perc.avg,
+        "loss_illum": meter_illum.avg,
+        "loss_illum_sup": meter_illum_sup.avg,
+        "loss_noise_sup": meter_noise_sup.avg,
+        "loss_inter": meter_inter.avg,
+        "loss_ifpn_sup": meter_ifpn.avg,
+    }
 
 
 @torch.no_grad()
-def validate(model, dataloader, epoch, config, writer=None):
+def validate(model, loader, device, tile_size, tile_overlap, use_amp, val_crop_size=None, phase='phase2'):
     model.eval()
     psnr_meter = AverageMeter()
     ssim_meter = AverageMeter()
-    for batch in dataloader:
-        noisy = batch["noisy"].cuda()
-        clean = batch["clean"].cuda()
-        B, T, C, H, W = noisy.shape
-        pred = model(noisy)
-        if isinstance(pred, list):
-            pred = pred[0]
-        pred_clip = pred.clamp(0, 1)
-        for b in range(B):
-            for t in range(T):
-                p = pred_clip[b, t].unsqueeze(0)
-                c = clean[b, t].unsqueeze(0)
-                mse = F.mse_loss(p, c).item()
-                psnr = 10 * math.log10(1.0 / max(mse, 1e-10))
-                psnr_meter.update(psnr)
-    logger.info(f"Validation Epoch {epoch} | PSNR {psnr_meter.avg:.2f}")
-    if writer:
-        writer.add_scalar("val/psnr", psnr_meter.avg, epoch)
-
-
-def test(model, test_loader, output_dir=None):
-    model.eval()
-    psnr_meter = AverageMeter()
-    for batch in test_loader:
-        noisy = batch["noisy"].cuda()
-        clean = batch["clean"].cuda()
-        pred = model(noisy)
-        if isinstance(pred, list):
-            pred = pred[0]
-        pred_clip = pred.clamp(0, 1)
-        B, T, C, H, W = pred_clip.shape
-        for b in range(B):
-            p = pred_clip[b].mean(dim=0, keepdim=True)
-            c = clean[b].mean(dim=0, keepdim=True)
-            mse = F.mse_loss(p, c).item()
-            psnr = 10 * math.log10(1.0 / max(mse, 1e-10))
-            psnr_meter.update(psnr)
-    logger.info(f"Test PSNR {psnr_meter.avg:.2f}")
-    return psnr_meter.avg
+    loss_meter = AverageMeter()
+    lpips_meter = AverageMeter()
+    global _LPIPS_AVAILABLE, _LPIPS_FN
+    if _LPIPS_AVAILABLE is None:
+        try:
+            import lpips
+            _lpips_fn = lpips.LPIPS(net='alex', verbose=False).to(device)
+            _LPIPS_AVAILABLE = True
+            _LPIPS_FN = _lpips_fn
+        except Exception:
+            _LPIPS_AVAILABLE = False
+            _LPIPS_FN = None
+    _lpips_fn = _LPIPS_FN
+    for clip, target, _ in tqdm(loader, total=len(loader), desc="val", leave=False):
+        clip = clip.to(device, non_blocking=True)
+        target = target.to(device, non_blocking=True)
+        # 简短训练/消融: 中心裁剪到小尺寸避免 CPU 全分辨率推理耗时过长
+        if val_crop_size is not None:
+            _, _, _, h, w = clip.shape
+            cs = min(val_crop_size, h, w)
+            top = (h - cs) // 2
+            left = (w - cs) // 2
+            clip = clip[:, :, :, top:top + cs, left:left + cs]
+            target = target[:, :, top:top + cs, left:left + cs]
+        pred = tiled_forward(
+            model=model,
+            clip=clip,
+            tile_size=tile_size,
+            tile_overlap=tile_overlap,
+            use_amp=use_amp,
+            phase=phase,
+        )
+        loss = torch.mean(torch.abs(pred - target))
+        psnr_meter.update(tensor_psnr(pred, target), clip.size(0))
+        ssim_meter.update(tensor_ssim(pred, target), clip.size(0))
+        loss_meter.update(loss.item(), clip.size(0))
+        if _lpips_fn is not None:
+            lpips_meter.update(_lpips_fn(pred, target).mean().item(), clip.size(0))
+        del clip, target, pred, loss
+    result = {"val_l1": loss_meter.avg, "psnr": psnr_meter.avg, "ssim": ssim_meter.avg}
+    if _lpips_fn is not None:
+        result["lpips"] = lpips_meter.avg
+    return result
 
 
 def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(name)s | %(message)s")
-    config = Config()
-    num_gpus = torch.cuda.device_count()
-    logger.info(f"Using {num_gpus} GPU(s)")
+    args = parse_args()
+    cfg = load_config(args.config)
+    seed_everything(cfg["seed"])
 
-    model = TFSNet(
-        in_channels=3,
-        num_frames=config.num_frames,
-        width=config.width,
-        use_rwkv=config.use_rwkv,
-        deep_supervision=config.deep_supervision,
-        use_temporal_fusion=config.use_temporal_fusion,
-    )
-    model = model.cuda()
-    if num_gpus > 1:
-        model = nn.DataParallel(model)
+    output_dir = cfg["output_dir"]
+    os.makedirs(output_dir, exist_ok=True)
+    logger = create_logger(output_dir)
+    logger.info("Loading config from %s", args.config)
 
-    transform_train = [
-        VideoToTensor(),
-        VideoRandomCrop(config.patch_size),
-        VideoRandomFlip(),
-    ]
-    transform_test = [VideoToTensor()]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info("Using device: %s", device)
 
-    def compose(transforms):
-        class Compose:
-            def __call__(self, sample):
-                for t in transforms:
-                    sample = t(sample)
-                return sample
-        return Compose()
+    train_loader, val_loader = build_dataloaders(cfg, smoke=args.smoke)
+    model = build_model(cfg, device)
+    criterion = build_loss(cfg, device)
+    optimizer = AdamW(model.parameters(), lr=cfg["train"]["lr"], weight_decay=cfg["train"]["weight_decay"])
+    total_epochs = cfg["train"]["epochs"] if not args.smoke else 1
 
-    train_loader = create_sdsd_dataloader(
-        root_dir="/data/sdsd",
-        split="train",
-        num_frames=config.num_frames,
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=config.num_workers,
-        transform=compose(transform_train),
-    )
+    # Mark3: Phase-based lr schedule (replaces CosineAnnealing + Linear warmup)
+    def get_phase(epoch):
+        if epoch < 5:   return 'phase1_warmup'
+        elif epoch < 10: return 'phase1'         # Flight3: shortened to 5 epoch
+        elif epoch < 30: return 'phase1_5'       # 20-epoch unlock ramp
+        else:            return 'phase2'
 
-    val_loader = create_sdsd_dataloader(
-        root_dir="/data/sdsd",
-        split="val",
-        num_frames=config.num_frames,
-        batch_size=1,
-        shuffle=False,
-        num_workers=config.num_workers,
-        transform=compose(transform_test),
-    )
+    def get_unlock_ratio(epoch):
+        if epoch < 10: return 0.0
+        elif epoch < 30: return (epoch - 10) / 20.0   # 20-epoch linear ramp
+        else: return 1.0
 
-    criterion = TFSNetLoss(
-        lambda_pix=config.lambda_pix,
-        lambda_perc=config.lambda_perc,
-        lambda_ssim=config.lambda_ssim,
-    )
-    optimizer = create_optimizer(model, config.max_lr, config.weight_decay)
-    total_steps = len(train_loader) * config.max_epochs
-    warmup_steps = len(train_loader) * config.warmup_epochs
+    def get_lr(epoch, base=cfg["train"]["lr"]):
+        if epoch < 5: return base * (0.01 + 0.99 * epoch / 5)
+        elif epoch < 10: return base * 0.75
+        elif epoch < 30: return base * 0.75 * (1 - (epoch - 10) / 20 * 0.33)  # 6e-4→4e-4 over 20 epochs
+        elif epoch < 55: return base * 0.5
+        elif epoch < 70: return base * 0.125
+        elif epoch < 80: return base * 0.05
+        else: return base * 0.02
+    scaler = GradScaler(enabled=cfg["train"]["amp"] and device.type == "cuda")
+    grad_clip = cfg["train"].get("grad_clip", 1.0)
+    grad_accum_steps = cfg["train"].get("grad_accum_steps", 1)
 
-    def warmup_cosine_lr(step):
-        if step < warmup_steps:
-            return step / max(warmup_steps, 1)
-        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
-        return 0.5 * (1 + math.cos(math.pi * progress))
+    best_psnr = -1.0
+    start_epoch = 0
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, warmup_cosine_lr)
-    writer = SummaryWriter(log_dir="logs/charlie")
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        sd = ckpt["model"]
+        # Remap: die→dpe, wsd→wfr (Flight3 rename)
+        sd = {k.replace('die.', 'dpe.').replace('wsd.', 'wfr.'): v for k, v in sd.items()}
+        # Remap: 旧 checkpoint 用 Sequential 包裹 ResBlock (fuse.N.0.conv1 → fuse.N.conv1)
+        remapped = {}
+        for k, v in sd.items():
+            parts = k.split(".")
+            remapped_key = k
+            for i in range(len(parts) - 2):
+                if parts[i] == "fuse" and parts[i + 2] == "0":
+                    remapped_key = ".".join(parts[:i + 2] + parts[i + 3:])
+                    break
+            remapped[remapped_key] = v
+        # Filter size-mismatched keys (for architecture changes like phase_conf)
+        filtered = {}
+        for k, v in remapped.items():
+            if k in model.state_dict():
+                if model.state_dict()[k].shape != v.shape:
+                    logger.warning("Skipping size-mismatched key: %s (ckpt %s != model %s)", 
+                                   k, list(v.shape), list(model.state_dict()[k].shape))
+                    continue
+            filtered[k] = v
+        model.load_state_dict(filtered, strict=False)
+        # MCPN startup reset: only for pre-Flight3 checkpoints (gamma==0 and startup_gate==1 in ckpt)
+        ckpt_gamma_near_zero = True
+        for k, v in sd.items():
+            if 'mcpn.gamma' in k and v.abs().max() > 0.001:
+                ckpt_gamma_near_zero = False
+                break
+        if ckpt_gamma_near_zero and hasattr(model, 'mcpn') and hasattr(model.mcpn, 'reset_startup'):
+            model.mcpn.reset_startup()
+            logger.info("MCPN startup params reset (pre-Flight3 checkpoint detected)")
+        else:
+            logger.info("Skipped MCPN reset (Flight3+ checkpoint, gamma already learned)")
+        if "optimizer" in ckpt:
+            try:
+                optimizer.load_state_dict(ckpt["optimizer"])
+            except Exception:
+                logger.warning("Optimizer state load failed, starting fresh optimizer")
+        start_epoch = ckpt["epoch"]
+        best_psnr = ckpt.get("best_psnr", -1.0)
+        logger.info("Resumed from %s (epoch %d, best_psnr=%.4f)", args.resume, start_epoch, best_psnr)
 
-    best_psnr = 0
-    for epoch in range(1, config.max_epochs + 1):
-        train_one_epoch(model, train_loader, criterion, optimizer, scheduler, epoch, config, writer)
-        if epoch % 5 == 0:
-            validate(model, val_loader, epoch, config, writer)
-            torch.save(model.state_dict(), f"checkpoints/charlie_epoch_{epoch}.pth")
-        scheduler.step()
+    if args.pretrained:
+        ckpt = torch.load(args.pretrained, map_location=device, weights_only=False)
+        sd = ckpt["model"]
+        remapped = {}
+        for k, v in sd.items():
+            parts = k.split(".")
+            remapped_key = k
+            for i in range(len(parts) - 2):
+                if parts[i] == "fuse" and parts[i + 2] == "0":
+                    remapped_key = ".".join(parts[:i + 2] + parts[i + 3:])
+                    break
+            remapped[remapped_key] = v
+        # Filter size-mismatched keys
+        filtered = {}
+        for k, v in remapped.items():
+            if k in model.state_dict():
+                if model.state_dict()[k].shape != v.shape:
+                    logger.warning("Skipping size-mismatched key: %s", k)
+                    continue
+            filtered[k] = v
+        missing_keys, unexpected = model.load_state_dict(filtered, strict=False)
+        logger.info("Loaded pretrained weights from %s (missing=%d, unexpected=%d)", args.pretrained, len(missing_keys), len(unexpected))
 
-    logger.info("Training complete")
+    for epoch in range(start_epoch, total_epochs):
+        phase = get_phase(epoch)
+        lr = get_lr(epoch)
+        unlock = get_unlock_ratio(epoch)
+        logger.info("Epoch %d / %d [%s] lr=%.2e unlock=%.2f", epoch + 1, total_epochs, phase, lr, unlock)
+
+        # Set lr
+        for pg in optimizer.param_groups:
+            pg['lr'] = lr
+
+        # Flight3 I: dynamic max_gain scheduling (4→16 over training)
+        if hasattr(model, 'ispn') and hasattr(model.ispn, 'set_max_gain'):
+            max_g = 4.0 + (16.0 - 4.0) * min(epoch / 30.0, 1.0)
+            model.ispn.set_max_gain(max_g)
+            if epoch % 10 == 0:
+                logger.info("max_gain updated to %.1f", max_g)
+
+        # Phase transition actions
+        if epoch == 10:
+            logger.info("Phase 1.5: Unlocking NDPN/MCPN/CXG")
+        if epoch == 30:
+            logger.info("Phase 2: Full tri-source restoration")
+
+        train_stats = train_one_epoch(
+            model=model,
+            criterion=criterion,
+            optimizer=optimizer,
+            scaler=scaler,
+            loader=train_loader,
+            device=device,
+            use_amp=cfg["train"]["amp"] and device.type == "cuda",
+            epoch=epoch,
+            logger=logger,
+            log_interval=cfg["train"]["log_interval"],
+            grad_clip=grad_clip,
+            grad_accum_steps=grad_accum_steps,
+            phase=phase,
+            unlock_ratio=unlock,
+        )
+        # Mark3: lr managed by get_lr(), scheduler disabled
+        # scheduler.step()
+        logger.info("Train stats: %s", train_stats)
+
+        val_stats = None
+        if (epoch + 1) % cfg["train"]["val_interval"] == 0:
+            val_stats = validate(
+                model,
+                val_loader,
+                device,
+                tile_size=cfg["eval"]["tile_size"],
+                tile_overlap=cfg["eval"]["tile_overlap"],
+                use_amp=cfg["eval"]["amp"] and device.type == "cuda",
+                val_crop_size=cfg["dataset"].get("val_crop_size", None),
+                phase=phase,
+            )
+            logger.info("Val stats: %s", val_stats)
+
+        save_checkpoint(
+            {
+                "epoch": epoch + 1,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "config": cfg,
+            },
+            os.path.join(output_dir, "latest.pth"),
+        )
+        # Flight3 Mod3: per-phase checkpoint saving
+        phase_ckpt_map = {5: "phase1_warmup.pth", 10: "phase1.pth", 30: "phase15.pth"}
+        if epoch + 1 in phase_ckpt_map:
+            phase_path = os.path.join(output_dir, phase_ckpt_map[epoch + 1])
+            save_checkpoint(
+                {
+                    "epoch": epoch + 1,
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "config": cfg,
+                    "phase": phase,
+                },
+                phase_path,
+            )
+            logger.info("Saved phase checkpoint: %s", phase_path)
+        if val_stats is not None:
+            if val_stats["psnr"] > best_psnr:
+                best_psnr = val_stats["psnr"]
+                save_checkpoint(
+                    {
+                        "epoch": epoch + 1,
+                        "model": model.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "config": cfg,
+                        "best_psnr": best_psnr,
+                    },
+                    os.path.join(output_dir, "best.pth"),
+                )
+        if args.smoke:
+            break
 
 
 if __name__ == "__main__":

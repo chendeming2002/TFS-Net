@@ -32,6 +32,9 @@ from utils.inference import tiled_forward
 from utils.metrics import tensor_psnr, tensor_ssim
 from utils.misc import AverageMeter, create_logger, seed_everything
 
+_LPIPS_AVAILABLE = None
+_LPIPS_FN = None
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -256,6 +259,18 @@ def validate(model, loader, device, tile_size, tile_overlap, use_amp, val_crop_s
     psnr_meter = AverageMeter()
     ssim_meter = AverageMeter()
     loss_meter = AverageMeter()
+    lpips_meter = AverageMeter()
+    global _LPIPS_AVAILABLE, _LPIPS_FN
+    if _LPIPS_AVAILABLE is None:
+        try:
+            import lpips
+            _lpips_fn = lpips.LPIPS(net='alex', verbose=False).to(device)
+            _LPIPS_AVAILABLE = True
+            _LPIPS_FN = _lpips_fn
+        except Exception:
+            _LPIPS_AVAILABLE = False
+            _LPIPS_FN = None
+    _lpips_fn = _LPIPS_FN
     for clip, target, _ in tqdm(loader, total=len(loader), desc="val", leave=False):
         clip = clip.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
@@ -279,8 +294,13 @@ def validate(model, loader, device, tile_size, tile_overlap, use_amp, val_crop_s
         psnr_meter.update(tensor_psnr(pred, target), clip.size(0))
         ssim_meter.update(tensor_ssim(pred, target), clip.size(0))
         loss_meter.update(loss.item(), clip.size(0))
+        if _lpips_fn is not None:
+            lpips_meter.update(_lpips_fn(pred, target).mean().item(), clip.size(0))
         del clip, target, pred, loss
-    return {"val_l1": loss_meter.avg, "psnr": psnr_meter.avg, "ssim": ssim_meter.avg}
+    result = {"val_l1": loss_meter.avg, "psnr": psnr_meter.avg, "ssim": ssim_meter.avg}
+    if _lpips_fn is not None:
+        result["lpips"] = lpips_meter.avg
+    return result
 
 
 def main():

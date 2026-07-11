@@ -1,4 +1,4 @@
-# TFS-Net v6 Delta Flight3 Mod6 整体架构图 (2026-07-10)
+# TFS-Net v6 Delta Flight5 整体架构图 (2026-07-11)
 
 ## 图一：最简架构 (含 Flight3 Phase-Dependent + 三部保险)
 
