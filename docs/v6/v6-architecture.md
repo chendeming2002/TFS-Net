@@ -1,7 +1,7 @@
 # TFS-Net v6 Delta Flight3 模型架构设计文档
 
-> 日期：2026-07-11 (更新: Flight5 TCC曲线 + gain监督重定向 + soft_clamp)
-> 版本：v6 Delta Flight5
+> 日期：2026-07-12 (更新: Flight6 DOF再平衡 — 曲线3ch×4×↓+gain像素级)
+> 版本：v6 Delta Flight6
 > 训练配置：`configs/delta_flight3.yaml`，batch=4 (accum=2→eff=8), lr=8e-4, epochs=100
 > 参数量：1.47M
 
@@ -16,7 +16,7 @@ TSD-Net (Tri-Source Decoupled Network) 是一个端到端多帧低光视频增�
 | **WFR** | Wavelet Feature Router | Haar DWT 子带级分流 (LL→光照/噪声, HF→结构) |
 | **DPE** | Degradation Prior Estimator | 时域统计 + 多尺度空洞卷积 → s_illum, s_noise (Mark4 简化) |
 | **TCA** | Temporal Correspondence & Alignment | 4方向空间 WKV 扫描 + C_omega 时序矩阵 |
-| **ISPN** | Illumination-Source Processing Network | TargetConvergentCurve (Flight5: 6 iter, A∈[-4,4], α_target收敛) + gain_map |
+| **ISPN** | Illumination-Source Processing Network | TCC曲线(3ch×4×↓) + pixel-wise gain(1.25→[0.5,2.0], Flight6: DOF反转) |
 | **NDPN** | Noise Degradation Processing Network | C_omega 置信度引导去噪 (γ=0.01 → 10× stronger gradient flow) |
 | **MCPN** | Motion Compensation Processing Network | C_omega 运动强度补偿 (gamma=0.01, startup→pass-through) |
 | **CXG** | Cross-eXcitation Gate | 去噪↔运动 交叉激励门 (Mod3: 输出喂入SGRF, 不再pass-through原始NDPN/MCPN) |
@@ -377,7 +377,7 @@ pre_norm LayerNorm 在 R/K/V 投影前
 | v6 Delta Mark1 | WFR子带分流 + 命名统一 + 数值稳定 | 1.69M | ep15 loss收敛 |
 | **v6 Delta Mark2** | **Kendall不确定性加权 + PE Loss + 感知解耦 + 损失调度** | **1.69M** | 收敛停滞 |
 | **v6 Delta Mark3** | **两阶段渐进训练 + ISPN 隔离 + SGRF 中间监督 + 相位调度** | **1.69M** | PSNR 18→8.7 |
-| **v6 Delta Flight5** | **TCC curve (6 iter) + gain监督重定向 + soft_clamp + zero-mean δ** | **1.47M** | **训练中** |
+| **v6 Delta Flight6** | **DOF再平衡(曲线3ch 4×↓ + gain像素级) + TCC + soft_clamp + zero-mean δ** | **1.47M** | **训练中** |
 
 ---
 

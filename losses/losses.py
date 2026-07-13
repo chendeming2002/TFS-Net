@@ -345,23 +345,19 @@ class TFSNetLoss(nn.Module):
             L_ssim = 1.0 - ssim_map(pred, target).mean()
             L_illum_smooth = self._edge_aware_smooth(s_illum, target)
 
-            # gain_map supervision (Flight5: target=GT/img_curved, Phase 1 detach)
+            # gain_map supervision (Flight6: pixel-wise target=GT/img_curved, Phase 1 detach)
             L_gain_sup = pred.new_tensor(0.0)
-            if "gain_map" in outputs and "image_center" in outputs:
+            if "gain_map" in outputs and "img_curved" in outputs:
                 gain_pred = outputs["gain_map"]
-                if "img_curved" in outputs and outputs["img_curved"].numel() > 0:
-                    ic = F.interpolate(outputs["img_curved"], size=gain_pred.shape[-2:],
-                                       mode='bilinear', align_corners=False)
-                    gt_g = target.mean(dim=1, keepdim=True)
-                    ic = ic.detach()  # Phase 1: prevent gain_loss backprop into curve
-                    cg = ic.mean(dim=1, keepdim=True)
-                    gain_target = (gt_g / (cg + 1e-4)).clamp(0.5, 8.0)
-                else:
-                    img_c = outputs["image_center"]
-                    gt_g = target.mean(dim=1, keepdim=True)
-                    ic_g = img_c.mean(dim=1, keepdim=True)
-                    gain_target = (gt_g / (ic_g + 1e-4)).clamp(0.5, 8.0)
-                L_gain_sup = F.l1_loss(gain_pred, gain_target.expand_as(gain_pred))
+                ic = F.interpolate(outputs["img_curved"], size=gain_pred.shape[-2:],
+                                   mode='bilinear', align_corners=False)
+                ic = ic.detach()
+                ic_m = ic.mean(dim=1, keepdim=True)
+                gt_m = F.interpolate(target.mean(dim=1, keepdim=True),
+                                     size=gain_pred.shape[-2:],
+                                     mode='bilinear', align_corners=False)
+                gain_target = (gt_m / (ic_m + 1e-4)).clamp(0.5, 2.0)
+                L_gain_sup = F.l1_loss(gain_pred, gain_target)
 
             # WFR reg: keep alpha/gate near 0.5
             L_wfr_reg = pred.new_tensor(0.0)
@@ -429,24 +425,19 @@ class TFSNetLoss(nn.Module):
         # s_noise supervision (disabled)
         L_noise_sup = pred.new_tensor(0.0)
 
-        # gain_map supervision (Flight5: target=GT/img_curved, curve-aware)
-        # gain_map supervision (Flight5: target=GT/img_curved, Phase 2 joint)
+        # gain_map supervision (Flight6: pixel-wise target=GT/img_curved)
         L_gain_sup = pred.new_tensor(0.0)
-        if "gain_map" in outputs and "image_center" in outputs:
+        if "gain_map" in outputs and "img_curved" in outputs:
             gain_pred = outputs["gain_map"]
-            if "img_curved" in outputs and outputs["img_curved"].numel() > 0:
-                ic = F.interpolate(outputs["img_curved"], size=gain_pred.shape[-2:],
-                                   mode='bilinear', align_corners=False)
-                gt_g = target.mean(dim=1, keepdim=True)
-                # Phase 2: no detach — allows joint curve+gain fine-tuning
-                cg = ic.mean(dim=1, keepdim=True)
-                gain_target = (gt_g / (cg + 1e-4)).clamp(0.5, 8.0)
-            else:
-                img_c = outputs["image_center"]
-                gt_g = target.mean(dim=1, keepdim=True)
-                ic_g = img_c.mean(dim=1, keepdim=True)
-                gain_target = (gt_g / (ic_g + 1e-4)).clamp(0.5, 8.0)
-            L_gain_sup = F.l1_loss(gain_pred, gain_target.expand_as(gain_pred))
+            ic = F.interpolate(outputs["img_curved"], size=gain_pred.shape[-2:],
+                              mode='bilinear', align_corners=False)
+            ic = ic.detach()  # Phase 1/1.5: prevent gain_loss backprop into curve
+            ic_m = ic.mean(dim=1, keepdim=True)  # (B, 1, H, W) per-pixel mean
+            gt_m = F.interpolate(target.mean(dim=1, keepdim=True),
+                                 size=gain_pred.shape[-2:],
+                                 mode='bilinear', align_corners=False)
+            gain_target = (gt_m / (ic_m + 1e-4)).clamp(0.5, 2.0)
+            L_gain_sup = F.l1_loss(gain_pred, gain_target)
 
         # Intermediate supervision (Mark4: img_s2 × gain_map)
         L_inter = pred.new_tensor(0.0)
