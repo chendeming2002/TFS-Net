@@ -15,7 +15,7 @@ import torch.nn.functional as F
 
 class ISPN(nn.Module):
     def __init__(self, channels: int = 64, img_channels: int = 3,
-                 curve_iter: int = 6, ds_factor: int = 4,
+                 curve_iter: int = 6, ds_factor: int = 8,
                  gain_min: float = 0.5, gain_max: float = 2.0):
         super().__init__()
         self.curve_iter = curve_iter

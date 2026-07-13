@@ -1,9 +1,8 @@
 # TFS-Net v6 Delta Flight3 模型架构设计文档
 
-> 日期：2026-07-12 (更新: Flight6 DOF再平衡 — 曲线3ch×4×↓+gain像素级)
-> 版本：v6 Delta Flight6
-> 训练配置：`configs/delta_flight3.yaml`，batch=4 (accum=2→eff=8), lr=8e-4, epochs=100
-> 参数量：1.47M
+> 日期：2026-07-13 (更新: Flight7 梯度隔离 + TCC 8×↓ + NDPN/MCPN γ=0.05)
+> 版本：v6 Delta Flight7
+> 参数量：1.51M
 
 ---
 
@@ -126,40 +125,122 @@ $$p_{\text{illu}} = \text{SWD}_{\text{LL}}(F_t), \quad p_{\text{img}} = \text{di
 
 **动机**。RWKV 的 WKV 扫描需要足够长的序列来建立有意义的依赖关系。旧设计沿时间轴 $T=5$ 扫描，序列过短 ($L=5$)，WKV 无法学习帧内空间结构。新设计改为沿空间轴 $H\times W$ 扫描 ($L \gg 1000$)，帧内结构由 WKV 显式建模，帧间对应由显式 $C_{t,\Omega}$ 计算。
 
-**帧内空间扫描 (Bi-WKV)**。对每帧特征 $F_t$ 沿空间序列 $L=H\times W$ 做带衰减的递归：
+#### 2.2.1 RWKV 架构背景
+
+TCA 遵循 RWKV 系列的核心架构模式 [Peng et al., 2023]：**Spatial Mixing（WKV 注意力）+ Channel Mixing（Conv FFN）分离**，两者通过残差连接组合。
+
+**标准 RWKV 时间混合块**（语言模型版本）：
+
+$$y_t = \frac{\sum_{i=1}^{t} e^{w_{t-i} + k_i} v_i}{\sum_{i=1}^{t} e^{w_{t-i} + k_i}} + u \cdot e^{k_t} v_t \tag{WKV-4}$$
+
+其中 $w_{t-i} = -(t-i) \cdot \text{softplus}(w) < 0$ 保证指数衰减（receptance-weighted decay），$u$ 为当前 token bonus。通道混合块使用 Squared ReLU FFN：$W_v \cdot \text{ReLU}^2(W_k x)$。
+
+**Vision-RWKV 的空间适配** [Duan et al., 2024]：将时间维度的一维递归展开改为二维空间展开，核心创新是 **Bi-WKV（双向 WKV）**——沿空间序列的正反双向扫描后取平均，赋予每个像素对上下文的双向感知：
+
+$$y_\tau = \frac{\text{fwd}_\tau + \text{bwd}_\tau}{2}$$
+
+其中 $\text{fwd}_\tau$ 和 $\text{bwd}_\tau$ 分别是正向和反向的 WKV 递归结果。
+
+**RSRWKV 的四方向扫描** [He et al., 2025]：在 Vision-RWKV 基础上将通道均分为 4 组 $C/4$，每组沿一个方向展开为序列，实现了 2D 空间的全方向感受野覆盖，被 TCSVT 2025 接收。
+
+#### 2.2.2 TCA 的 RWKV 实现
+
+TCA 完整遵循 RWKV 的三步范式 [Peng et al., 2023]：**Token Shift → Spatial Mixing (WKV) → Channel Mixing (FFN)**，具体实现如下：
+
+**Step 1 — MVC-Shift (Token Shift)**（`pure_rwkv_sace.py:28-45`）：
+
+标准 RWKV 的时间域 Token Shift（Q-Shift）在 2D 空间上替换为 **MVC-Shift（Multi-View Context）** [He et al., 2025]——3 支空洞深度可分离卷积（d=1, 2, 3）捕捉不同空间感受野的上下文：
+
+$$\tilde{F}_t = F_t + \sum_{d \in \{1,2,3\}} \text{PWConv}(\text{DWConv}_{3\times3}^d(F_t))$$
+
+其中 $\text{DWConv}_{3\times3}^d$ 为 dilation=d 的 depthwise 卷积（groups=channels），$\text{PWConv}$ 为 1×1 pointwise 混合。MVC-Shift 相比标准 RWKV 的逐 token 偏移，更适合 2D 空间的局部邻域建模。
+
+**Step 2 — SpatialWKV2D (Spatial Mixing)**（`pure_rwkv_sace.py:107-206`）：
+
+这是 TCA 的 WKV 注意力核心，对应 RWKV 的"时间混合"在 2D 空间的投射。流程为：
+
+```
+输入 x(B,C,H,W) → pre_norm → R/K/V Linear投影 → 4方向 Bi-WKV → 融合 → post_norm → 输出
+```
+
+**pre_norm + R/K/V 投影**（RWKV-7 风格小初始化 [Peng et al., 2025]）：
+
+$$R = x \cdot W_r, \quad K = x \cdot W_k, \quad V = x \cdot W_v$$
+
+$W_k \sim \mathcal{U}(-\frac{0.05}{\sqrt{C}}, \frac{0.05}{\sqrt{C}})$, $W_r, W_v \sim \mathcal{U}(-\frac{0.5}{\sqrt{C}}, \frac{0.5}{\sqrt{C}})$。小初始化防止训练早期 WKV 输出幅值过大，配合 $W_{\text{out}}=0$（零初始化输出投影）保证残差路径的初始 identity 性质。
+
+**四方向独立 Bi-WKV**：通道均分为 4 组 $C/4$，每组沿一个方向展开 $(H \times W) \to L$ 序列：
+
+| 方向 | 扫描方式 | 物理语义 |
+|------|---------|---------|
+| 水平 $h$ | 行优先（raster） | 水平邻域信息传播 |
+| 垂直 $v$ | 列优先 | 垂直方向上下文 |
+| 主对角 $d$ | 按 $i+j$ 排序 | 对角线方向纹理 |
+| 副对角 $a$ | 按 $i-j+W-1$ 排序 | 反对角线方向纹理 |
+
+每方向独立进行 BiWKV 递归，采用 **chunk-wise cumsum**（CHUNK=256）防止长序列数值溢出：
 
 $$S_\tau = e^{w} \cdot S_{\tau-1} + e^{k_\tau} \odot v_\tau, \quad D_\tau = e^{w} \cdot D_{\tau-1} + e^{k_\tau}$$
 
-$$y_\tau^{(t)} = \frac{e^{u}\cdot e^{k_\tau}\odot v_\tau + S_\tau}{e^{u}\cdot e^{k_\tau} + D_\tau}, \quad \tau = 0,\dots,L-1$$
+$$y_\tau^{(h)} = \frac{e^{u}\cdot e^{k_\tau}\odot v_\tau + S_\tau}{e^{u}\cdot e^{k_\tau} + D_\tau}$$
 
-其中 $k_\tau = \text{proj}_k(\tilde{F}_t[\tau])$，$v_\tau = \text{proj}_v(\tilde{F}_t[\tau])$，$\tilde{F}_t = \text{MVC-Shift}(F_t)$（3 支空洞 DWConv, $d=1,2,3$）。$w = -\text{softplus}(\theta_w) < 0$ 保证 $e^w < 1$ 恒衰减，$u$ 为当前 token bonus。
+其中 $w = -\text{softplus}(\theta_w) < 0$ 数学保证 $e^w < 1$ 恒衰减 [Peng et al., 2023]；$u$ 为当前 token bonus（来自 `spatial_first` 参数）。每方向独立 Per-head LayerNorm 后，通过逆扫描恢复原始空间排列。
 
-**四方向扫描** (RSRWKV, TCSVT 2025)。通道均分为 4 组 $C/4$，每组沿一个方向展开 $(H\times W)\to L$ 序列：
+**四方向融合**：
 
-| 方向 | 排列方式 |
-|------|---------|
-| 水平 $h$ | 行优先 $(0,W),(0,W+1),\dots$ |
-| 垂直 $v$ | 列优先 $(0,W),(1,W),\dots$ |
-| 主对角 $d$ | 按 $i+j$ 排序 |
-| 副对角 $a$ | 按 $i-j+W-1$ 排序 |
+$$\mathbf{F}_t^{\text{wkv}} = \text{proj}_{\text{out}}\left(\sigma(R) \odot [y^{(h)}; y^{(v)}; y^{(d)}; y^{(a)}]\right)$$
 
-多方向融合：
+其中 $\sigma$ 为 Sigmoid 激活的 receptance gate，控制 WKV 输出流入残差路径的比例。$W_{\text{out}}$ 零初始化使初始 WKV 输出为零。
 
-$$\mathbf{F}_t^{\text{out}} = \mathbf{F}_t + \gamma \cdot \text{ChannelMix}\left(\sigma(R) \odot [y^{(t)}_h; y^{(t)}_v; y^{(t)}_d; y^{(t)}_a]\right)$$
+**Step 3 — Channel Mix (Conv FFN)**（`pure_rwkv_sace.py:326-331`）：
 
-**时序对应矩阵 $C_{t,\Omega}$**。中心帧与邻帧的空间 cosine similarity：
+对应 RWKV 的"通道混合"——空间上已通过 WKV 完成信息传播，通道间通过 1×1 Conv 做非线性变换：
+
+```python
+LayerNorm2d → Conv2d(C → 4C, 1×1) → GELU → Conv2d(4C → C, 1×1)
+```
+
+与标准 RWKV 的差异：使用 GELU 替代 Squared ReLU（$\text{ReLU}^2$），1×1 Conv2d 在空间上与 per-pixel Linear 等价。
+
+**Residual 连接**（RWKV 标准范式 [Peng et al., 2023]）：
+
+$$\mathbf{F}_t^{\text{out}} = \mathbf{F}_t + \gamma \cdot \mathbf{F}_t^{\text{channel}}$$
+
+其中 $\gamma \in \mathbb{R}^{1 \times C \times 1 \times 1}$ 为可学习的 residual scale（初始化为 0，等价于 LoRA B=0）。
+
+**上采样**：TCA 在 WFR 输出分辨率（$H/2 \times W/2$）上运行全部 Spatial/Channel Mix，然后 bilinear 上采样回全分辨率 $H \times W$。这节省约 4× 的 WKV 计算量（序列长度从 $HW$ 降到 $HW/4$）。
+
+#### 2.2.3 时序对应与聚合
+
+**时序对应矩阵 $C_{t,\Omega}$**。中心帧与邻帧的空间 cosine similarity——在前述 Spatial Mix → Channel Mix → Upsample 全分辨率处理后计算：
 
 $$\mathbf{q}_t = \text{proj}_q(F_t^{\text{out}}), \quad \mathbf{k}_{t'} = \text{proj}_k(F_{t'}^{\text{out}}), \quad t' \in \Omega$$
 
 $$C_{t,t'} = \text{softmax}\left(\frac{\mathbf{q}_t \cdot \mathbf{k}_{t'}^T}{\tau}\right), \quad \tau = \text{softplus}(\tau_{\text{raw}}) + 0.05$$
 
-$C_{t,t'}[i,j]$ 表示中心帧位置 $i$ 与邻帧位置 $j$ 的对齐置信度。对角线 $C_{t,t'}[i,i]$ 为静止对应（高值→静止，低值→运动）。
+$C_{t,t'}[i,j]$ 表示中心帧位置 $i$ 与邻帧位置 $j$ 的对齐置信度。对角线 $C_{t,t'}[i,i]$ 为静止对应（高值→静止，低值→运动）——这一性质被 NDPN（利用 diag 做去噪置信度）和 MCPN（利用 off-diag 做运动检测）共同使用。
 
 **时序聚合 $\hat{F}_t$**。用 $C_{t,\Omega}$ 将邻帧 warp 到中心帧坐标系，加权聚合：
 
 $$\hat{F}_t = \text{LN}\left(F_t^{\text{out}} + \sum_{t' \in \Omega} w_{t'} \cdot \left(C_{t,t'} \times F_{t'}^{\text{out}}\right)\right)$$
 
 其中 $w_{t'} = \text{frame\_gate}([F_t^{\text{out}}, C_{t,t'} \times F_{t'}^{\text{out}}])$ 为数据驱动的帧级可靠性权重。
+
+#### 2.2.4 RVK 架构对照表
+
+| 组件 | 标准 RWKV-4/7 | TCA 实现 | 对应论文 |
+|------|:-----------:|:--------:|:--------:|
+| Token Shift | Q-Shift（逐 token 偏移） | MVC-Shift（3 dilated DWConv） | [RSRWKV, He et al. 2025] |
+| Spatial Mixing | Time-Mixing（一维 WKV 递归） | SpatialWKV2D（四方向 Bi-WKV） | [Vision-RWKV, Duan et al. 2024] |
+| Channel Mixing | $W_v\cdot\text{ReLU}^2(W_k x)$ | 1×1 Conv(C→4C→C) + GELU | [RWKV-4, Peng et al. 2023] |
+| 衰减控制 | $w = -\text{softplus}(\theta)$ | 同，chunk-wise cumsum (256) | 同上 |
+| 双向扫描 | 无（自回归单向） | Bi-WKV=(fwd+bwd)/2 | [Vision-RWKV] |
+| R/K/V 初始化 | 标准 Xavier/Uniform | $\pm0.05\text{--}0.5/\sqrt{C}$ 小初始化 | [RWKV-7, Peng et al. 2025] |
+| pre/post norm | LayerNorm | LayerNorm | 同上 |
+| 多方向扫描 | 无 | 4 heads×C/4 (H/V/主对角/副对角) | [RSRWKV] |
+| Residual | $+x$ | $+\gamma \cdot \text{ChannelMix}$ | [RWKV-4] |
+
+**核心设计原则总结**：TCA 不是简单地将变压器注意力换成 WKV——它是 RWKV 架构模式的完整 Vision 实例化。通过将"时间混合+通道混合"的范式从 1D 语言序列适配到 2D 空间+时序对应，TCA 在低光视频中为后续的 NDPN（去噪）和 MCPN（运动补偿）提供了既有时序对齐保真度、又有 RWKV 线性复杂度优势的特征表示。
 
 ### 2.3 WFR — 空域小波分流 (Flight3: 取消 HF 噪声门控)
 
@@ -315,38 +396,84 @@ feat_tfde (B,T,C,H/2,W/2) from WFR
 **Mark4 问题**: Sigmoid 前无归一化 → F_fused 幅值失控 → s_illum=1.0 饱和。
 **Flight3 修复**: LayerNorm + head 零初始化 → 初始输出 0.5，训练中可自由学习。
 
-### 3.2 TCA — 时序对应对齐
+### 3.3 TCA — 时序对应对齐 (RWKV Spatial Mix + Channel Mix + Corr)
 
 **文件**: `models/modules/pure_rwkv_sace.py`
 
-**空间扫描 Bi-WKV**:
+**架构总览**：
+
 ```
-k.clamp(-8,8), v.clamp(-8,8)
-w = -F.softplus(spatial_decay)  → ew < 1 数学保证
-chunk-wise cumsum (CHUNK=256)  → 防长序列数值溢出
-双向 (fwd+bwd)/2
-per-direction independent BiWKV + per-head LayerNorm
-R/K/V RWKV-7 风格小初始化 ±0.05~0.5/√C
-pre_norm LayerNorm 在 R/K/V 投影前
+feat_tca (B,T,C,H/2,W/2) from WFR — 半分辨率, 节省 4× WKV 计算量
+  │
+  ├─ [MVC-Shift] 3支空洞DWConv(d=1,2,3) + 1×1混频 → x_shifted
+  │     RWKV Token Shift → 2D 空间局部上下文
+  │
+  ├─ [SpatialWKV2D] 四方向 Bi-WKV (Spatial Mixing)
+  │     ├─ pre_norm (LayerNorm)
+  │     ├─ Split C→4 heads × C/4
+  │     ├─ Head0/H1/H2/H3: 水平/垂直/主对角/副对角扫描
+  │     ├─ 每方向独立 BiWKV (chunk-wise cumsum=256, e^w<1)
+  │     ├─ Per-direction LayerNorm
+  │     └─ σ(R)⊙wkv → proj_out → post_norm
+  │
+  ├─ [Channel Mix] LN → Conv(C→4C,1×1)→GELU→Conv(4C→C,1×1) + γ×residual
+  │     └─ RWKV Channel Mixing 的 Conv/FFN 等效
+  │
+  ├─ [Upsample] H/2→H → tca_out (B,T,C,H,W)
+  │
+  ├─ [TemporalCorrespondence] proj_qk(C→C/4) → cosine_sim
+  │     ÷ softplus(τ)+0.05 → softmax(dim=-1)
+  │     → C_omega_list: (T-1)×(B,ds²,ds²), ds≤96
+  │
+  └─ [TemporalAggregation] C_omega warp 邻帧 → frame_gate 加权
+        → upsample + residual + LN → F_t_aligned (B,C,H,W)
 ```
 
-**四方向扫描**: 水平 / 垂直 / 主对角线 / 副对角线
+**RWKV 架构特点**：
 
-### 3.3 数值稳定性
+| 特点 | 值 | 说明 |
+|------|-----|------|
+| Norm 策略 | pre_norm (Spatial Mix前) + post_norm (融合后) | RWKV-7 风格 |
+| R/K/V 初始化 | $\pm0.05\text{--}0.5/\sqrt{C}$ 均匀分布 | 小初始化防溢出 |
+| 输出投影 | 零初始化 | 初始残差=identity |
+| 衰减保证 | $w = -\text{softplus}(\theta)$ → $e^w < 1$ | 数学强制 |
+| 长序列 | chunk-wise cumsum (CHUNK=256) | 防数值溢出 |
+| Channel Mix | 1×1 Conv(C→4C→C) + GELU | 等价 per-pixel FFN |
+| Token Shift | MVC-Shift(3 dilated DWConv) | 2D 空间上下文 |
+| 双向 | (fwd+bwd)/2 | Vision-RWKV Bi-WKV |
+| 多方向 | 4 heads (H/V/对角) × C/4 | RSRWKV |
 
-| 组件 | 措施 |
-|------|------|
-| BiWKV | `k.clamp(-8,8)`, `v.clamp(-8,8)` |
-| BiWKV | `w = -F.softplus(spatial_decay)` → ew < 1 |
-| BiWKV | chunk-wise cumsum (CHUNK=256) |
-| SpatialWKV2D | `pre_norm` LayerNorm 在 R/K/V 投影前 |
-| SpatialWKV2D | R/K/V RWKV-7 小初始化 |
-| WFR | `proj_tfde/proj_tca` 后 LayerNorm → norm≈1 |
-| Tau | `F.softplus(tau_raw) + 0.05` → 下界 0.05 |
-| DPE head | LayerNorm2d + 零初始化 → s_illum≈0.5 (居中, 防饱和) |
-| ISPN gain | softplus → dG/draw ∈ (0,1), 梯度不消失不爆炸 |
-| max_gain | 动态调度 4→16 → 防止早期梯度爆炸，后期扩大范围 |
-| CurveBranch | Tanh → $\alpha \in (-1,1)$, $I(1-I)$ 有界 → 曲线输出去稳 |
+### 3.4 数值稳定性
+
+| 组件 | 措施 | 文献 |
+|------|------|------|
+| BiWKV | `w = -F.softplus(spatial_decay)` → $e^w < 1$ 恒衰减 | [RWKV-4, Peng et al. 2023] |
+| BiWKV | chunk-wise cumsum (CHUNK=256) | 同上 |
+| BiWKV | `k.clamp(-8,8)`, `v.clamp(-8,8)` | 同上 |
+| BiWKV | 双向 (fwd+bwd)/2 | [Vision-RWKV, Duan et al. 2024] |
+| SpatialWKV2D | Per-head LayerNorm + pre_norm | [RSRWKV, He et al. 2025] |
+| SpatialWKV2D | R/K/V RWKV-7 风格小初始化 $\pm0.05\text{--}0.5/\sqrt{C}$ | [RWKV-7, Peng et al. 2025] |
+| SpatialWKV2D | $W_{\text{out}}$ 零初始化 → 初始残差=identity | 同上 |
+| WFR | `proj_tfde/proj_tca` 后 LayerNorm → norm≈1 | — |
+| Tau | `F.softplus(tau_raw) + 0.05` → 下界 0.05 | — |
+| DPE head | LayerNorm2d + 零初始化 → s_illum≈0.5 (居中, 防饱和) | — |
+| ISPN gain | sigmoid → 输出 $\in[0.5,2.0]$, 梯度不消失 | [Zero-DCE++, Li et al. 2022] |
+| CurveBranch | Tanh → $A \in [-4,4]$, TCC 有界收敛 | [Zero-DiDCE, 2024] |
+| TCC safety | soft_clamp(0.5+0.5·tanh(4·(le-0.5))) | — |
+
+### 3.5 参考文献
+
+| 文献 | 核心贡献 | 本模型使用位置 |
+|------|---------|:------------:|
+| **RWKV-4** [Peng et al., EMNLP 2023] "RWKV: Reinventing RNNs for the Transformer Era" | WKV 注意力 + Time/Channel Mix 分离 + $w=-\text{softplus}(\theta)$ 衰减保证 | TCA Spatial Mix + Channel Mix 架构范式 |
+| **Vision-RWKV** [Duan et al., 2024] "Efficient Visual Perception with RWKV-Like Architectures" | Bi-WKV 双向空间扫描 + quad-directional spatial mix | TCA Bi-WKV (fwd+bwd)/2 |
+| **RSRWKV** [He et al., TCSVT 2025] "2D-WKV for Vision" | 四方向并行空间扫描 + MVC-Shift | TCA SpatialWKV2D + MVC-Shift |
+| **RWKV-7** [Peng et al., 2025] | 小初始化 ($\pm0.05/\sqrt{C}$) + pre_norm + 零初始化输出投影 | TCA R/K/V 投影初始化 |
+| **Zero-DCE** [Guo et al., CVPR 2020] | LE-curve pixel-wise α + 迭代增强 | TCC 公式原型 (§2.4) |
+| **Zero-DCE++** [Li et al., TPAMI 2022] | 下采样鲁棒性 + 参数共享 + 轻量化 | TCC 下采样(8×) + A_map 复用 (§2.4) |
+| **Zero-DiDCE** [2024] | ALE-curve 收敛不动点 + 动态迭代 | TCC $(\alpha-LE)$ 收敛因子 (§2.4) |
+| **Physen-Noise2Noise** [2025] | 多帧有偏噪声联合优化 | NDPN 多帧去噪原理 (§2.5) |
+| **GR-VEF** [IJARCCE 2026] | 运动分类替代密集光流 | MCPN 运动补偿设计 (§2.6) |
 
 ---
 
@@ -377,7 +504,7 @@ pre_norm LayerNorm 在 R/K/V 投影前
 | v6 Delta Mark1 | WFR子带分流 + 命名统一 + 数值稳定 | 1.69M | ep15 loss收敛 |
 | **v6 Delta Mark2** | **Kendall不确定性加权 + PE Loss + 感知解耦 + 损失调度** | **1.69M** | 收敛停滞 |
 | **v6 Delta Mark3** | **两阶段渐进训练 + ISPN 隔离 + SGRF 中间监督 + 相位调度** | **1.69M** | PSNR 18→8.7 |
-| **v6 Delta Flight6** | **DOF再平衡(曲线3ch 4×↓ + gain像素级) + TCC + soft_clamp + zero-mean δ** | **1.47M** | **训练中** |
+| **v6 Delta Flight7** | **梯度隔离(sg[img_lit]) + TCC 8×↓ + NDPN/MCPN γ=0.05 + residual_head** | **1.51M** | **训练中** |
 
 ---
 

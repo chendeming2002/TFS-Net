@@ -264,6 +264,8 @@ class TFSNet(nn.Module):
             "img_s1":         sgrf_out["img_s1"],
             "img_s2":         sgrf_out["img_s2"],
             "img_curved":     sgrf_out.get("img_curved", sgrf_out["img_s2"]),
+            "img_lit":        sgrf_out.get("img_lit", sgrf_out.get("img_curved", sgrf_out["img_s2"])),
+            "residual":       sgrf_out.get("residual", torch.zeros_like(sgrf_out["res_t"])),
             "lit_up_map":     sgrf_out["lit_up_map"],
             "gain_map":       gain_map,
             "image_center":   image_center,

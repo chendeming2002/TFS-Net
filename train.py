@@ -325,19 +325,19 @@ def main():
     # Mark3: Phase-based lr schedule (replaces CosineAnnealing + Linear warmup)
     def get_phase(epoch):
         if epoch < 5:   return 'phase1_warmup'
-        elif epoch < 10: return 'phase1'         # Flight3: shortened to 5 epoch
-        elif epoch < 30: return 'phase1_5'       # 20-epoch unlock ramp
+        elif epoch < 15: return 'phase1'         # Flight7: extended to 15 epoch
+        elif epoch < 30: return 'phase1_5'       # Flight7: 15-epoch unlock ramp
         else:            return 'phase2'
 
     def get_unlock_ratio(epoch):
-        if epoch < 10: return 0.0
-        elif epoch < 30: return (epoch - 10) / 20.0   # 20-epoch linear ramp
+        if epoch < 15: return 0.0
+        elif epoch < 30: return (epoch - 15) / 15.0   # Flight7: 15-epoch linear ramp
         else: return 1.0
 
     def get_lr(epoch, base=cfg["train"]["lr"]):
         if epoch < 5: return base * (0.01 + 0.99 * epoch / 5)
-        elif epoch < 10: return base * 0.75
-        elif epoch < 30: return base * 0.75 * (1 - (epoch - 10) / 20 * 0.33)  # 6e-4→4e-4 over 20 epochs
+        elif epoch < 15: return base * 0.75   # Flight7: Phase 1 extended
+        elif epoch < 30: return base * 0.75 * (1 - (epoch - 15) / 15 * 0.33)  # Flight7: 15-epoch ramp
         elif epoch < 55: return base * 0.5
         elif epoch < 70: return base * 0.125
         elif epoch < 80: return base * 0.05

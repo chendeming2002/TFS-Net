@@ -311,6 +311,11 @@ class TFSNetLoss(nn.Module):
         s_illum = outputs["s_illum"]
         s_noise = outputs["s_noise"]
 
+        # Flight7: L_lit — independent supervision for Stage A brightening output
+        L_lit = pred.new_tensor(0.0)
+        if "img_lit" in outputs:
+            L_lit = charbonnier_loss(outputs["img_lit"], target) if self.use_pe_charbonnier else F.l1_loss(outputs["img_lit"], target)
+
         # --- Mark3 Phase 1 alignment losses ---
         losses = {}
         L_align_warp = pred.new_tensor(0.0)
@@ -380,7 +385,7 @@ class TFSNetLoss(nn.Module):
                 L = (self._uw(L_pix, 'pix') + self._uw(L_ssim, 'ssim')
                    + self._uw(L_illum_smooth, 'illum')
                    + self._uw(L_align_warp + L_diag_prior, 'ifpn')
-                   + 0.5 * L_gain_sup + 0.001 * L_wfr_reg
+                   + 0.3 * L_gain_sup + 0.001 * L_wfr_reg  # Flight7: reduced gain_sup weight
                    + 0.1 * L_dpe_prior)  # Flight3 B: DPE direct supervision
             else:
                 L = self.lambda_pix * L_pix + self.lambda_ssim * L_ssim + self.lambda_illum * L_illum_smooth
@@ -457,6 +462,11 @@ class TFSNetLoss(nn.Module):
                 g_mcpn = model.mcpn.gamma.abs().mean()
                 L_gamma_reg = L_gamma_reg + torch.relu(0.005 - g_mcpn)
 
+        # Flight7: residual regularization — prevent residual from becoming "second brightener"
+        L_residual_reg = pred.new_tensor(0.0)
+        if "residual" in outputs and outputs["residual"].numel() > 0:
+            L_residual_reg = outputs["residual"].abs().mean()
+
         # WFR reg (Mark4: shared)
         L_wfr_reg = pred.new_tensor(0.0)
         if model is not None and hasattr(model, 'wfr'):
@@ -493,6 +503,8 @@ class TFSNetLoss(nn.Module):
                 + 0.5 * L_gain_sup + 0.001 * L_wfr_reg
                 + 0.01 * L_dpe_prior  # Flight3 B: DPE supervision (reduced in Phase 2)
                 + 0.1 * L_gamma_reg  # Flight3 Mod3: gamma anti-collapse
+                + 0.5 * L_lit
+                + 0.1 * L_residual_reg  # Flight7: Stage A supervision + residual reg
             )
         else:
             L_total = (
@@ -514,6 +526,8 @@ class TFSNetLoss(nn.Module):
             "loss_inter":      L_inter.detach(),
             "loss_ifpn_sup":   L_diag_prior.detach(),
             "loss_gamma_reg":  L_gamma_reg.detach(),
+            "loss_lit":        L_lit.detach(),
+            "loss_residual_reg": L_residual_reg.detach(),
         }
         return L_total, loss_dict
 

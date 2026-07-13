@@ -121,15 +121,12 @@ class BrightenStage(nn.Module):
 
 
 class SGRF(nn.Module):
-    """Mark4: Stage-wise Guided Restoration & Fusion.
+    """Flight7: Two-stage gradient-isolated restoration.
 
-    Stage 1 (Denoise):  img_s1 = img_center + StageBlock_1(f_noise_out, img_center)
-    Stage 2 (Deblur):   img_s2 = img_s1 + StageBlock_2(f_motion_out, img_s1)
-    Stage 3 (Brighten): res_t = img_s2 × gain_map (Mod6: bias removed)
-
-    StageBlock uses zero-gate: gate=0 at init → no perturbation to Phase 1 output.
-    Mod5: delta zero-mean constraint → StageBlocks cannot shift global brightness.
-    Mod6: curve is pixel-wise with 8 iterations, bias_map removed.
+    Stage A (Brighten): TCC curve + gain → img_lit (L_lit supervised)
+    Stage B (Refine):  NDPN/MCPN → residual_head → residual (L_final supervised)
+    
+    Key: sg[img_lit] prevents Stage B gradients from backpropagating into ISPN.
     """
 
     def __init__(self, channels: int = 64, out_channels: int = 3, use_soft_clamp: bool = False,
@@ -149,6 +146,16 @@ class SGRF(nn.Module):
         self.brighten = BrightenStage(channels, out_channels,
                                        use_nafblock=use_nafblock)
 
+        # Flight7: residual refinement head (zero-init → starts at identity)
+        self.residual_head = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(channels, out_channels, 3, padding=1),
+        )
+        nn.init.zeros_(self.residual_head[-1].weight)
+        nn.init.zeros_(self.residual_head[-1].bias)
+        self.residual_scale = nn.Parameter(torch.zeros(1))
+
     def forward(
         self,
         gain_map: torch.Tensor,
@@ -159,25 +166,32 @@ class SGRF(nn.Module):
         alpha_target: torch.Tensor = None,
         curve_iter: int = 6,
     ) -> dict:
+        # === Stage A: Denoise → Deblur → TCC → img_lit ===
         img_s1, _ = self.stage_noise(f_noise_out, image_center)
         img_s2, _ = self.stage_motion(f_motion_out, img_s1)
 
-        # Flight5: Target-Convergent Curve — converges to α_target
         img_curved = img_s2
         if curve_A is not None and alpha_target is not None:
             for i in range(curve_iter):
                 A = curve_A[:, i]
                 delta = A * img_curved * (1.0 - img_curved) * (alpha_target - img_curved)
                 img_curved = img_curved + delta
-            # Safety net: soft clamp (should not be activated in normal operation)
             img_curved = 0.5 + 0.5 * torch.tanh(4.0 * (img_curved - 0.5))
 
-        res_t, lit_up = self.brighten(gain_map, img_curved)
+        img_lit, lit_up = self.brighten(gain_map, img_curved)
+
+        # === Stage B: NDPN/MCPN → residual → final output ===
+        f_combined = f_noise_out + f_motion_out
+        residual = self.residual_head(f_combined)
+        scale = torch.tanh(self.residual_scale)
+        res_t = 0.5 + 0.5 * torch.tanh(4.0 * (img_lit.detach() + residual * scale - 0.5))
 
         return {
             "res_t":       res_t,
             "img_s1":      img_s1,
             "img_s2":      img_s2,
             "img_curved":  img_curved,
+            "img_lit":     img_lit,
+            "residual":    residual * scale,
             "lit_up_map":  lit_up,
         }
