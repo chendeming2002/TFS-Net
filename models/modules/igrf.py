@@ -167,6 +167,7 @@ class SGRF(nn.Module):
         curve_iter: int = 6,
     ) -> dict:
         # === Stage A: Denoise → Deblur → TCC → img_lit ===
+        # Flight7.2: NO detach here — NDPN/MCPN get gradient through auxiliary losses
         img_s1, _ = self.stage_noise(f_noise_out, image_center)
         img_s2, _ = self.stage_motion(f_motion_out, img_s1)
 
@@ -184,7 +185,8 @@ class SGRF(nn.Module):
         f_combined = f_noise_out + f_motion_out
         residual = self.residual_head(f_combined)
         scale = torch.tanh(self.residual_scale)
-        res_t = 0.5 + 0.5 * torch.tanh(4.0 * (img_lit.detach() + residual * scale - 0.5))
+        # Flight7.1: no outer soft_clamp — img_lit is already soft_clamped by BrightenStage
+        res_t = img_lit.detach() + residual * scale
 
         return {
             "res_t":       res_t,

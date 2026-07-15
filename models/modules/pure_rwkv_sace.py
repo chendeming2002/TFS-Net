@@ -105,17 +105,14 @@ class BiWKV(nn.Module):
 # 3. SpatialWKV2D — 四方向空间扫描
 # ============================================================
 class SpatialWKV2D(nn.Module):
-    """RSRWKV 2D-WKV: 4方向, 每方向独立 BiWKV + per-head LN (Mod1)"""
+    """RSRWKV 2D-WKV: 4方向, 每方向独立 BiWKV (per-head LN removed — Vision-RWKV style)"""
 
     def __init__(self, channels: int):
         super().__init__()
         assert channels % 4 == 0
         self.channels = channels
         self.head_dim = channels // 4
-        # Mod1: 每方向独立 BiWKV
         self.bi_wkv_list = nn.ModuleList([BiWKV(self.head_dim) for _ in range(4)])
-        # Mod1: per-head LayerNorm
-        self.head_norms = nn.ModuleList([nn.LayerNorm(self.head_dim) for _ in range(4)])
 
         self.proj_r = nn.Linear(channels, channels, bias=False)
         self.proj_k = nn.Linear(channels, channels, bias=False)
@@ -199,9 +196,8 @@ class SpatialWKV2D(nn.Module):
             v_2d = v_head.transpose(1, 2).reshape(B, self.head_dim, H, W)
             k_seq = scan_fn(k_2d)
             v_seq = scan_fn(v_2d)
-            # Mod1: per-direction BiWKV + per-head LN
+            # Per-direction BiWKV (no per-head LN — post_norm handles fusion distribution)
             wkv_seq = self.bi_wkv_list[i](k_seq, v_seq, total_tokens=N)
-            wkv_seq = self.head_norms[i](wkv_seq)
             inv_idx = self._inv_scan(scan_fn, (B, self.head_dim, H, W), x_2d.device)
             wkv_restored = wkv_seq[:, inv_idx[0]]
             heads.append(wkv_restored)
@@ -324,7 +320,6 @@ class TCA(nn.Module):
         self.mvc_shift = MVCShift(channels)
         self.spatial_wkv = SpatialWKV2D(channels)
         self.channel_mix = nn.Sequential(
-            LayerNorm2d(channels),
             nn.Conv2d(channels, channels * 4, 1),
             nn.GELU(),
             nn.Conv2d(channels * 4, channels, 1),

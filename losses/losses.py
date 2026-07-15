@@ -321,6 +321,15 @@ class TFSNetLoss(nn.Module):
         if "residual" in outputs and outputs["residual"].numel() > 0:
             L_residual_reg = outputs["residual"].abs().mean()
 
+        # Flight7.2: NDPN aux (SSIM→img_s1) + MCPN aux (L1→img_s2)
+        L_ndpn_aux = pred.new_tensor(0.0)
+        L_mcpn_aux = pred.new_tensor(0.0)
+        if phase not in ('phase1', 'phase1_warmup'):
+            if "img_s1" in outputs:
+                L_ndpn_aux = 1.0 - ssim_map(outputs["img_s1"], target).mean()
+            if "img_s2" in outputs:
+                L_mcpn_aux = F.l1_loss(outputs["img_s2"], target)
+
         # --- Mark3 Phase 1 alignment losses ---
         losses = {}
         L_align_warp = pred.new_tensor(0.0)
@@ -392,7 +401,8 @@ class TFSNetLoss(nn.Module):
                    + self._uw(L_align_warp + L_diag_prior, 'ifpn')
                    + 0.3 * L_gain_sup + 0.001 * L_wfr_reg  # Flight7: reduced gain_sup weight
                     + 0.1 * L_dpe_prior  # Flight3 B: DPE direct supervision
-                    + 0.5 * L_lit + 0.1 * L_residual_reg)  # Flight7: Stage A supervision
+                    + 0.5 * L_lit + 0.1 * L_residual_reg  # Flight7: Stage A supervision
+                    + 0.2 * L_ndpn_aux + 0.1 * L_mcpn_aux)  # Flight7.2: aux losses
             else:
                 L = self.lambda_pix * L_pix + self.lambda_ssim * L_ssim + self.lambda_illum * L_illum_smooth
             losses.update({'loss_pix': L_pix.detach(), 'loss_ssim': L_ssim.detach(),
@@ -506,6 +516,7 @@ class TFSNetLoss(nn.Module):
                 + 0.1 * L_gamma_reg  # Flight3 Mod3: gamma anti-collapse
                 + 0.5 * L_lit
                 + 0.1 * L_residual_reg  # Flight7: Stage A supervision + residual reg
+                + 0.2 * L_ndpn_aux + 0.1 * L_mcpn_aux  # Flight7.2: aux losses for NDPN/MCPN
             )
         else:
             L_total = (
@@ -529,6 +540,8 @@ class TFSNetLoss(nn.Module):
             "loss_gamma_reg":  L_gamma_reg.detach(),
             "loss_lit":        L_lit.detach(),
             "loss_residual_reg": L_residual_reg.detach(),
+            "loss_ndpn_aux":    L_ndpn_aux.detach(),
+            "loss_mcpn_aux":    L_mcpn_aux.detach(),
         }
         return L_total, loss_dict
 
