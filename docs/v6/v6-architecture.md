@@ -1,7 +1,8 @@
 # TFS-Net v6 Delta Flight3 模型架构设计文档
 
-> 日期：2026-07-13 (更新: Flight7 梯度隔离 + TCC 8×↓ + NDPN/MCPN γ=0.05)
-> 版本：v6 Delta Flight7
+> 日期：2026-07-15 (更新: Flight7.2 辅助监督 + Stage A/B恢复梯度)
+> 版本：v6 Delta Flight7.2
+> 训练配置：`configs/delta_flight7d1.yaml`，batch=4 (accum=2→eff=8), lr=8e-4, epochs=100
 > 参数量：1.51M
 
 ---
@@ -322,7 +323,20 @@ $$\mathbf{f}_{\text{noise}}^{\text{out}} = \mathbf{f}_{\text{noise}} \odot \begi
 
 $$\mathbf{f}_{\text{motion}}^{\text{out}} = \mathbf{f}_{\text{motion}} \odot \begin{cases} \sigma(\text{SE}(\mathbf{f}_{\text{noise}})) & \text{train} \\ \bar{g}_m & \text{infer (deploy)} \end{cases}$$
 
-### 2.8 SGRF — 阶段式修复融合 (Flight5: TCC curve + soft_clamp)
+### 2.8 SGRF — 阶段式修复融合 (Flight7.2: Stage A/B + auxiliary losses)
+
+SGRF 拆分为两阶段：**Stage A**（提亮）和 **Stage B**（残差精修）。Flight7 引入 `sg[img_lit]` 隔离梯度。Flight7.2 恢复 NDPN/MCPN 进入 S1/S2 的梯度通路，并通过辅助损失为 NDPN/MCPN 提供独立优化目标。
+
+**Stage A — 提亮**（`igrf.py:162-174`）：
+$$\text{S1: } I_1 = \text{soft\_clamp}(I_t + \delta_1(\mathbf{f}_{\text{noise}}^{\text{out}})), \quad \text{S2: } I_2 = \text{soft\_clamp}(I_1 + \delta_2(\mathbf{f}_{\text{motion}}^{\text{out}}))$$
+$$\text{TCC: } I_{\text{curved}} = \text{TCC}_6(I_2, A, \alpha_{\text{target}}), \quad \mathbf{I}_{\text{lit}} = \text{soft\_clamp}(I_{\text{curved}} \odot \mathbf{G})$$
+
+**Stage B — 残差精修**（`igrf.py:176-181`）：
+$$\boldsymbol{\delta} = h_\theta(\mathbf{f}_{\text{noise}}^{\text{out}} + \mathbf{f}_{\text{motion}}^{\text{out}}) \cdot \tanh(\beta), \quad \hat{\mathbf{J}} = \text{sg}[\mathbf{I}_{\text{lit}}] + \boldsymbol{\delta}$$
+
+**Flight7.2 辅助监督**：
+$$\mathcal{L}_{\text{ndpn}} = 1 - \text{SSIM}(I_1, \text{GT}), \quad \mathcal{L}_{\text{mcpn}} = \|I_2 - \text{GT}\|_1$$
+这两个损失在 Phase 1.5+ 激活，为 NDPN（通过 S1 delta）和 MCPN（通过 S2 delta）提供不依赖 Stage B 的独立梯度通路。
 
 Flight4 用 soft_clamp 替代 hard clamp 消除了梯度截断。Flight5 将曲线升级为 TCC（自动收敛），并新增 Flight4 soft_clamp 保留——所有 StageBlock 和 BrightenStage 统一使用 Tanh 基 soft_clamp。
 
@@ -504,7 +518,7 @@ feat_tca (B,T,C,H/2,W/2) from WFR — 半分辨率, 节省 4× WKV 计算量
 | v6 Delta Mark1 | WFR子带分流 + 命名统一 + 数值稳定 | 1.69M | ep15 loss收敛 |
 | **v6 Delta Mark2** | **Kendall不确定性加权 + PE Loss + 感知解耦 + 损失调度** | **1.69M** | 收敛停滞 |
 | **v6 Delta Mark3** | **两阶段渐进训练 + ISPN 隔离 + SGRF 中间监督 + 相位调度** | **1.69M** | PSNR 18→8.7 |
-| **v6 Delta Flight7** | **梯度隔离(sg[img_lit]) + TCC 8×↓ + NDPN/MCPN γ=0.05 + residual_head** | **1.51M** | **训练中** |
+| **v6 Delta Flight7.2** | **SGRF Stage A/B + aux监督(L_ndpn+L_mcpn) + TCC 4×↓ + pixel-wise gain + soft_clamp** | **1.51M** | **训练中** |
 
 ---
 
@@ -592,7 +606,7 @@ $$L_{\text{total}} = \sum_{i} \frac{1}{2\exp(s_i)} L_i + \frac{1}{2}s_i$$
 
 7. **ZeroDCE 曲线增强 (Mod4→Mod6 渐进升级)**：ISPN 曲线分支从 per-image MLP(64→16→9, 3 iter) → MLP(64→16→15, 5 iter) → SpatialCurveBranch (Conv(64→32) + Conv(32→24), 8 iter pixel-wise)。Mod6 最终形式：从 refine 特征 h(64ch) 用 2 层 Conv 预测 per-pixel α ∈ ℝ^{B×8×3×H×W}，在 SGRF S2→S3 之间施加 ZeroDCE 曲线。零初始化 → Phase 1 为 identity。pixel-wise α 可逐像素自适应提亮强度（暗区更强、亮区保持），不再需要 bias_map 的空间补偿。
 
-9. **bias_map 移除 (Mod6)**：S3 变为纯乘法 `img_curved × gain_map`。ZeroDCE 曲线 $I+\alpha\cdot I\cdot(1-I)$ 已提供有界加性修正——α∈(-1,1) 且 I(1-I)∈[0,0.25]，天然的平滑提亮/压暗能力无需额外的独立 bias。移除 bias_map 消除了 §2.8 中诊断出的最后一个分解泄漏通道（bias 可被用于补偿错误的 curve/gain 估计，破坏三源分工）。
+10. **NDPN/MCPN 辅助监督 (Flight7.2)**：L_ndpn_aux = 1−SSIM(img_s1, GT)，L_mcpn_aux = L1(img_s2, GT)，权重 0.2/0.1。Flight7.1 中 NDPN/MCPN γ 完全冻结 40 epoch——因为 S1/S2 输入被 detach 截断且 Stage B 的 residual_head 零初始化。辅助损失绕过 Stage A/B 梯度流，直接将 SSIM/L1 监督施加在 S1/S2 输出端，为 NDPN（通过 S1 delta）和 MCPN（通过 S2 delta）恢复独立的学习信号。这是 Flight7.1→Flight7.2 的核心改进。
 
 ---
 
