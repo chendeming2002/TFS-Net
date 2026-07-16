@@ -1,9 +1,9 @@
 # TFS-Net v6 Delta Flight3 模型架构设计文档
 
-> 日期：2026-07-15 (更新: Flight7.2 辅助监督 + Stage A/B恢复梯度)
-> 版本：v6 Delta Flight7.2
-> 训练配置：`configs/delta_flight7d1.yaml`，batch=4 (accum=2→eff=8), lr=8e-4, epochs=100
-> 参数量：1.51M
+> 日期：2026-07-16 (更新: Flight7.2+WFR路由 — Encoder主输入TCA/DPE, WFR残差)
+> 版本：v6 Delta Flight7.2+WFR
+> 训练配置：`configs/delta_flight7d1.yaml`，batch=4 (accum=2→eff=8), epochs=85
+> 参数量：1.55M
 
 ---
 
@@ -41,12 +41,12 @@ TSD-Net (Tri-Source Decoupled Network) 是一个端到端多帧低光视频增�
   │
   ├─→ Encoder → F_{t-2}...F_{t+2}  (B, T, 64, H, W)
   │
-  ├─→ WFR (逐帧 HaarDWT) → F_tfde (B,T,C,H/2), F_tca (B,T,C,H/2)
+  ├─→ WFR (逐帧 HaarDWT) → feat_tfde (→ DPE, concat Enc center), feat_tca (→ TCA 残差)
   │
-  ├─→ DPE(F_tfde) → s_illum, s_noise
+  ├─→ DPE(feat_tfde + Encoder_center) → s_illum, s_noise
   │     s_illum → ISPN   s_noise → NDPN
   │
-  ├─→ TCA(F_tca) → {F_{t'}^{\text{out}}}_{t'=0}^{T-1}, C_{t,Ω}, \hat{F}_t, μ, σ
+  ├─→ TCA(Encoder_feats, wfr_residual=feat_tca) → F_out, C_{t,Ω}, \hat{F}_t, μ, σ
   │
   ├─→ ISPN(f_enc, s_illum) → curve_alpha (per-pixel), gain_map
   ├─→ NDPN({F^{\text{out}}}, s_noise, μ, σ, C_{t,Ω}, \hat{F}_t) → f_noise_out
@@ -54,11 +54,9 @@ TSD-Net (Tri-Source Decoupled Network) 是一个端到端多帧低光视频增�
   │
   ├─→ CXG(f_noise_out, f_motion_out) → f_noise_gated, f_motion_gated
   │
-  └─→ SGRF(gain, f_noise_gated, f_motion_gated, I_t, curve_α)
-        S1: I_1 = I_t + δ_1,  δ_1 = zero-mean(StageBlock_1)×gate  (Mod5)
-        S2: I_2 = I_1 + δ_2,  δ_2 = zero-mean(StageBlock_2)×gate  (Mod5)
-        S2.5 (Mod6): I_2 = ZeroDCE_curve(I_2, curve_α)  ← pixel-wise 8 iter
-        S3: \hat{X}_t = clamp(I_2 × gain, 0, 1)  (Mod6: bias removed)
+  └─→ SGRF(gain, f_noise_gated, f_motion_gated, I_t, curve_A)
+        Stage A: S1→S2→TCC×6→gain→img_lit,  Stage B: sg[img_lit]+residual→res_t
+        Aux losses: L_ndpn(SSIM→img_s1), L_mcpn(L1→img_s2)
 ```
 
 ---
@@ -504,7 +502,7 @@ feat_tca (B,T,C,H/2,W/2) from WFR — 半分辨率, 节省 4× WKV 计算量
 | CXG | ~8K |
 | SGRF | ~120K |
 | 其他 | ~10K |
-| **总计** | **~1.47M** |
+| **总计** | **~1.55M** |
 
 ---
 
@@ -518,7 +516,7 @@ feat_tca (B,T,C,H/2,W/2) from WFR — 半分辨率, 节省 4× WKV 计算量
 | v6 Delta Mark1 | WFR子带分流 + 命名统一 + 数值稳定 | 1.69M | ep15 loss收敛 |
 | **v6 Delta Mark2** | **Kendall不确定性加权 + PE Loss + 感知解耦 + 损失调度** | **1.69M** | 收敛停滞 |
 | **v6 Delta Mark3** | **两阶段渐进训练 + ISPN 隔离 + SGRF 中间监督 + 相位调度** | **1.69M** | PSNR 18→8.7 |
-| **v6 Delta Flight7.2** | **SGRF Stage A/B + aux监督(L_ndpn+L_mcpn) + TCC 4×↓ + pixel-wise gain + soft_clamp** | **1.51M** | **训练中** |
+| **v6 Delta Flight7.2+WFR** | **Encoder→TCA主输入+WFR残差, DPE concat Enc center, aux监督, TCC 4×↓, Stage A/B** | **1.55M** | **训练中** |
 
 ---
 
@@ -585,10 +583,10 @@ $$L_{\text{total}} = \sum_{i} \frac{1}{2\exp(s_i)} L_i + \frac{1}{2}s_i$$
 
 | 阶段 | Epoch | 损失 | NDPN/MCPN | CXG | lr |
 |------|-------|------|-----------|-----|-----|
-| **Phase 1 Warmup** | 0–4 | pix + ssim + illum_smooth + gain_sup + align+diag + wfr_reg | **zero** (输出置零) | bypass | 8e-6→8e-4 |
-| **Phase 1 Main** | 5–9 | 同上 | **zero** (但 γ=0.01 梯度流过) | bypass | 6e-4 |
-| **Phase 1.5** | 10–29 | ← + 0.1·L_gamma_reg (Mod3) | 线性解锁 0→100% (0.05/epoch) | ratio>0.3 启用 | 6e-4→4e-4 |
-| **Phase 2** | 30–89 | 全损失 (感知解耦 + freq + inter + L_gamma_reg; **diag_prior 取消**) | 100% | 启用 | 4e-4→0.16e-4 |
+| **Phase 1 Warmup** | 0–4 | pix + ssim + illum_smooth + gain_sup + align+diag + wfr_reg | **zero** | bypass | 8e-6→8e-4 |
+| **Phase 1 Main** | 5–10 | 同上 | **zero** (γ=0.01流过) | bypass | 6e-4 |
+| **Phase 1.5** | 11–30 | ← + L_ndpn_aux + L_mcpn_aux + L_gamma_reg | 线性解锁 0→100% | ratio>0.3启用 | 6e-4→4e-4 |
+| **Phase 2** | 31–85 | 全损失 (感知解耦+freq+inter+L_gamma_reg+L_ndpn+L_mcpn; diag_prior取消) | 100% | 启用 | 4e-4→1.6e-5 |
 
 **关键设计决策**：
 
@@ -618,7 +616,7 @@ $$L_{\text{total}} = \sum_{i} \frac{1}{2\exp(s_i)} L_i + \frac{1}{2}s_i$$
 |------|-----|------|
 | batch_size | 4 (accum=2) | eff batch=8 |
 | grad_accum_steps | **2** | 等效 batch=8 |
-| epochs | 90 | — |
+| epochs | 85 | Phase 1(0-10)+P1.5(11-30)+P2(31-85) |
 | lr (Phase 1 Warmup) | 8e-6 → 8e-4 | 线性 warmup |
 | lr (Phase 1 Main) | 6e-4 | 固定 |
 | lr (Phase 1.5) | 6e-4 → 4e-4 | 线性过渡 (20 epoch) |

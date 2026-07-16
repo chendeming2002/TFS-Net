@@ -195,7 +195,7 @@ class TFSNet(nn.Module):
         feat_tfde = wfr_out["feat_tfde"].reshape(B, T, -1, H // 2, W // 2)
         feat_tca = wfr_out["feat_tca"].reshape(B, T, -1, H // 2, W // 2)
 
-        dpe_out = self.dpe(feat_tfde)
+        dpe_out = self.dpe(feat_tfde, encoder_center=feats[:, center_idx])
         s_illum = dpe_out["s_illum"]
         s_noise_orig = dpe_out["s_noise"]
         # 上采样到 H×W (NDPN/ISPN 需要全分辨率)
@@ -203,7 +203,7 @@ class TFSNet(nn.Module):
         s_noise = F.interpolate(s_noise_orig, size=(H, W), mode='bilinear', align_corners=False)
 
         # Stage 3: TCA 时序对应对齐
-        tca_out = self.tca(feat_tca, dpe_out)
+        tca_out = self.tca(feat_tca, encoder_feats=feats)
         F_aligned_list = [tca_out["tca_out"][:, t] for t in range(T)]
         C_omega_list = tca_out.get("C_omega_list", [])
         F_t_aligned = tca_out["F_t_aligned"]

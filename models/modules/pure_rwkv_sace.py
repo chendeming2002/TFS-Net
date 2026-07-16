@@ -325,31 +325,35 @@ class TCA(nn.Module):
             nn.Conv2d(channels * 4, channels, 1),
         )
         self.spatial_gamma = nn.Parameter(torch.zeros(1, channels, 1, 1))
+        # WFR residual injection scale (init=0, safe start)
+        self.wfr_lambda = nn.Parameter(torch.zeros(1, channels, 1, 1))
 
         # --- 时序对应 ---
         self.corr_gen = TemporalCorrespondence(channels)
         self.temporal_agg = TemporalAggregation(channels)
 
     def forward(self, feats: torch.Tensor,
+                encoder_feats: torch.Tensor = None,
                 tfsi_out: Dict = None,
                 cached_lff: Dict = None) -> Dict:
         """
-        feats: (B, T, C, H, W) Encoder 输出特征
-        Returns:
-            sace_out: (B, T, C, H, W) 空间增强后的多帧特征
-            C_omega_list: list of (T-1) tensors, each (B, N, N)
-            F_t_aligned: (B, C, H, W) 中心帧对齐增强特征
-            mu_t_clean / sigma_t_clean: 兼容旧接口
+        feats: (B, T, C, H/2, W/2) — WFR feat_tca (now used as residual)
+        encoder_feats: (B, T, C, H, W) — Encoder original features (primary input)
         """
         B, T, C, H_ds, W_ds = feats.shape
-        H, W = H_ds * 2, W_ds * 2  # 原始分辨率 (SWD 已降采样到 H/2)
+        H, W = H_ds * 2, W_ds * 2
 
-        # Mark1: SWD 已输出 H/2×W/2，无需再降采样
-        x_flat = feats.reshape(B * T, C, H_ds, W_ds)
+        # Primary input: Encoder features (downsampled to H/2) or WFR feat_tca as fallback
+        if encoder_feats is not None:
+            x_flat = F.adaptive_avg_pool2d(encoder_feats.reshape(B * T, C, H, W), (H_ds, W_ds))
+        else:
+            x_flat = feats.reshape(B * T, C, H_ds, W_ds)
+
         x_shifted = self.mvc_shift(x_flat)
         x_wkv = self.spatial_wkv(x_shifted)
         x_cm = self.channel_mix(x_wkv)
-        sace_out_ds = x_flat + x_cm * self.spatial_gamma
+        wfr_residual = feats.reshape(B * T, C, H_ds, W_ds)
+        sace_out_ds = x_flat + x_cm * self.spatial_gamma + wfr_residual * self.wfr_lambda
 
         # 上采样回原始分辨率
         sace_out = F.interpolate(

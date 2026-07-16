@@ -27,7 +27,7 @@ model:
   use_pure_rwkv: true
 train:
   batch_size: 4
-  epochs: 100
+  epochs: 85   # Flight7.2: Phase 1(0-10)+Phase 1.5(11-30)+Phase 2(31-85)
   lr: 0.0008
   weight_decay: 0.0001
   amp: false

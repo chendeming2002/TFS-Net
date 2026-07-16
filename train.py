@@ -325,22 +325,22 @@ def main():
     # Mark3: Phase-based lr schedule (replaces CosineAnnealing + Linear warmup)
     def get_phase(epoch):
         if epoch < 5:   return 'phase1_warmup'
-        elif epoch < 10: return 'phase1'         # Flight7.1: restored to 10 epoch
-        elif epoch < 30: return 'phase1_5'       # 20-epoch unlock ramp
-        else:            return 'phase2'
+        elif epoch < 11: return 'phase1'         # Flight7.2: 0-10
+        elif epoch < 31: return 'phase1_5'       # 11-30
+        else:            return 'phase2'         # 31-85
 
     def get_unlock_ratio(epoch):
-        if epoch < 10: return 0.0
-        elif epoch < 30: return (epoch - 10) / 20.0   # 20-epoch linear ramp
+        if epoch < 11: return 0.0
+        elif epoch < 31: return (epoch - 11) / 20.0   # linear 0→1 over 20 epochs
         else: return 1.0
 
     def get_lr(epoch, base=cfg["train"]["lr"]):
         if epoch < 5: return base * (0.01 + 0.99 * epoch / 5)
-        elif epoch < 10: return base * 0.75       # Flight7.1: restored to 10 epoch
-        elif epoch < 30: return base * 0.75 * (1 - (epoch - 10) / 20 * 0.33)  # 20-epoch ramp
-        elif epoch < 55: return base * 0.5
-        elif epoch < 70: return base * 0.125
-        elif epoch < 80: return base * 0.05
+        elif epoch < 11: return base * 0.75      # Flight7.2: Phase 1 (5-10)
+        elif epoch < 31: return base * 0.75 * (1 - (epoch - 11) / 20 * 0.33)  # P1.5 ramp
+        elif epoch < 47: return base * 0.5        # scaled: 55×0.85
+        elif epoch < 60: return base * 0.125      # scaled: 70×0.85  
+        elif epoch < 68: return base * 0.05       # scaled: 80×0.85
         else: return base * 0.02
     scaler = GradScaler(enabled=cfg["train"]["amp"] and device.type == "cuda")
     grad_clip = cfg["train"].get("grad_clip", 1.0)

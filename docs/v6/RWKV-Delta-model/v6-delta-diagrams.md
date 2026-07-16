@@ -1,4 +1,4 @@
-# TFS-Net v6 Delta Flight7.2 整体架构图 (2026-07-15)
+# TFS-Net v6 Delta Flight7.2+WFR 整体架构图 (2026-07-16)
 
 ## 图一：最简架构 (含 Flight3 Phase-Dependent + 三部保险)
 

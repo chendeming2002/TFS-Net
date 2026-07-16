@@ -63,7 +63,7 @@ class DPE(nn.Module):
         self.norm = nn.GroupNorm(num_groups=8, num_channels=channels)
 
         self.ms_branch = MultiScaleSpatialBranch(
-            in_channels=channels * 3,
+            in_channels=channels * 4,  # Flight7.2: 3C(stats) + C(encoder)
             out_channels=fused_channels,
         )
 
@@ -81,7 +81,7 @@ class DPE(nn.Module):
         weights = F.softmax(-dist / tau, dim=dim)
         return (weights * x).sum(dim=dim)
 
-    def forward(self, feats: torch.Tensor) -> dict:
+    def forward(self, feats: torch.Tensor, encoder_center: torch.Tensor = None) -> dict:
         B, T, C, H, W = feats.shape
 
         feats_norm = self.norm(feats.reshape(B * T, C, H, W)).reshape(B, T, C, H, W)
@@ -96,6 +96,10 @@ class DPE(nn.Module):
         snr = mu_t / (sigma_t + self.eps)
 
         stats = torch.cat([mu_t, sigma_t, snr], dim=1)
+        # Flight7.2: concat Encoder center frame (downsampled) for richer context
+        if encoder_center is not None:
+            ec = F.adaptive_avg_pool2d(encoder_center, (H, W))
+            stats = torch.cat([stats, ec], dim=1)
         f_fused = self.ms_branch(stats)
 
         # Flight3 A: LayerNorm before sigmoid (anti-saturation)
