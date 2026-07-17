@@ -166,11 +166,11 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
     meter_gamma_reg = AverageMeter()
 
     progress = tqdm(enumerate(loader), total=len(loader), desc="train", leave=False)
+    diag_cache = {"s_illum": None, "gain": None, "g_ndpn": 0.0, "g_mcpn": 0.0, "ca": None}
     for step, (clip, target, _) in progress:
         clip = clip.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
 
-        # gradient accumulation: scale loss so effective batch = batch × accum_steps
         with autocast(enabled=use_amp):
             outputs = model(clip, phase=phase)
         model._unlock_ratio = unlock_ratio
@@ -179,10 +179,11 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
         if not torch.isfinite(loss):
             logger.warning("Skipping non-finite loss at step %d", step + 1)
             optimizer.zero_grad(set_to_none=True)
+            del outputs, loss, loss_dict, clip, target
             continue
 
-        loss = loss / grad_accum_steps
-        scaler.scale(loss).backward()
+        loss_scaled = loss / grad_accum_steps
+        scaler.scale(loss_scaled).backward()
 
         if (step + 1) % grad_accum_steps == 0:
             scaler.unscale_(optimizer)
@@ -220,7 +221,6 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
                 meter_inter.avg,
                 meter_ifpn.avg,
             )
-            # Flight3 G: diagnostic logging for DPE/ISPN/WFR health
             with torch.no_grad():
                 s_ill = outputs.get("s_illum")
                 gain = outputs.get("gain_map")
@@ -236,9 +236,13 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
                         g_ndpn, g_mcpn,
                     )
                     if ca is not None:
-                        # Show curve alpha mean per iteration
                         ca_mean = ca.abs().mean().item()
                         logger.info("      curve_α|mean|=%.4f", ca_mean)
+
+        # Release intermediate tensors after each step
+        del outputs, loss, loss_dict, clip, target
+        if (step + 1) % (grad_accum_steps * 50) == 0:
+            torch.cuda.empty_cache()
     return {
         "loss_total": meter_total.avg,
         "loss_pix": meter_pix.avg,
@@ -256,6 +260,8 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
 @torch.no_grad()
 def validate(model, loader, device, tile_size, tile_overlap, use_amp, val_crop_size=None, phase='phase2'):
     model.eval()
+    if hasattr(model, 'clear_frame_cache'):
+        model.clear_frame_cache()
     psnr_meter = AverageMeter()
     ssim_meter = AverageMeter()
     loss_meter = AverageMeter()
@@ -325,22 +331,22 @@ def main():
     # Mark3: Phase-based lr schedule (replaces CosineAnnealing + Linear warmup)
     def get_phase(epoch):
         if epoch < 5:   return 'phase1_warmup'
-        elif epoch < 10: return 'phase1'         # Flight3: shortened to 5 epoch
-        elif epoch < 30: return 'phase1_5'       # 20-epoch unlock ramp
+        elif epoch < 11: return 'phase1'
+        elif epoch < 36: return 'phase1_5'
         else:            return 'phase2'
 
     def get_unlock_ratio(epoch):
-        if epoch < 10: return 0.0
-        elif epoch < 30: return (epoch - 10) / 20.0   # 20-epoch linear ramp
+        if epoch < 11: return 0.0
+        elif epoch < 36: return (epoch - 11) / 25.0   # linear 0→1 over 25 epochs
         else: return 1.0
 
     def get_lr(epoch, base=cfg["train"]["lr"]):
         if epoch < 5: return base * (0.01 + 0.99 * epoch / 5)
-        elif epoch < 10: return base * 0.75
-        elif epoch < 30: return base * 0.75 * (1 - (epoch - 10) / 20 * 0.33)  # 6e-4→4e-4 over 20 epochs
-        elif epoch < 55: return base * 0.5
-        elif epoch < 70: return base * 0.125
-        elif epoch < 80: return base * 0.05
+        elif epoch < 11: return base * 0.75
+        elif epoch < 36: return base * 0.75 * (1 - (epoch - 11) / 25 * 0.33)
+        elif epoch < 66: return base * 0.5
+        elif epoch < 82: return base * 0.125
+        elif epoch < 92: return base * 0.05
         else: return base * 0.02
     scaler = GradScaler(enabled=cfg["train"]["amp"] and device.type == "cuda")
     grad_clip = cfg["train"].get("grad_clip", 1.0)
@@ -423,6 +429,11 @@ def main():
         unlock = get_unlock_ratio(epoch)
         logger.info("Epoch %d / %d [%s] lr=%.2e unlock=%.2f", epoch + 1, total_epochs, phase, lr, unlock)
 
+        # Clear frame cache at epoch boundary to prevent VRAM creep
+        if hasattr(model, 'clear_frame_cache'):
+            model.clear_frame_cache()
+            torch.cuda.empty_cache()
+
         # Set lr
         for pg in optimizer.param_groups:
             pg['lr'] = lr
@@ -437,7 +448,7 @@ def main():
         # Phase transition actions
         if epoch == 10:
             logger.info("Phase 1.5: Unlocking NDPN/MCPN/CXG")
-        if epoch == 30:
+        if epoch == 35:
             logger.info("Phase 2: Full tri-source restoration")
 
         train_stats = train_one_epoch(
@@ -484,7 +495,7 @@ def main():
             os.path.join(output_dir, "latest.pth"),
         )
         # Flight3 Mod3: per-phase checkpoint saving
-        phase_ckpt_map = {5: "phase1_warmup.pth", 10: "phase1.pth", 30: "phase15.pth"}
+        phase_ckpt_map = {5: "phase1_warmup.pth", 10: "phase1.pth", 35: "phase15.pth"}
         if epoch + 1 in phase_ckpt_map:
             phase_path = os.path.join(output_dir, phase_ckpt_map[epoch + 1])
             save_checkpoint(

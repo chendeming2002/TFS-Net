@@ -1,4 +1,79 @@
-# TFS-Net v6 Delta Flight7.2+WFR 整体架构图 (2026-07-17, final)
+# TFS-Net v6 Delta Flight8 整体架构图 (2026-07-17, current)
+
+## 图一：最简架构 (Flight8 Multi-Scale + 帧缓存)
+
+```mermaid
+flowchart TD
+    subgraph 输入
+        IN["多帧低光输入<br/>x : (B, T, 3, H, W)"]
+    end
+
+    subgraph 编码分流["编码 + 小波分流 (Flight8: multi-scale)"]
+        ENC["Encoder (逐帧)<br/>→ l1_lat(64,H,W), l2_lat(64,H/2), l3_lat(64,H/4)<br/>Flight8: skip FPN, 多尺度输出 + LRU帧缓存"]
+        WFR["WFR 小波特征路由器 (l1_lat)<br/>HaarDWT → alpha(LL) + HF_cat<br/>→ feat_tca (H/2) — Flight8: 仅TCA残差路径"]
+    end
+
+    subgraph 诊断["退化估计 (Flight8: 3-stage progressive scan)"]
+        DPE["DPE<br/>l3@H/4 → l2@H/2 → l1@H (coarse-to-fine)<br/>+ gray(RGB.mean) + lum(RGB.max) per stage<br/>+ cls_token(零初始化) → head → s_illum, s_noise"]
+    end
+
+    subgraph 对齐["时序对应对齐 (Flight8: Internal FPN + Full-Res WKV)"]
+        TCA["TCA<br/>Internal FPN: l3→l2→l1 bottom-up → full-res(256×256)<br/>+ MVC-Shift + SpatialWKV2D + ChannelMix → sace_out<br/>+ WFR feat_tca × wfr_λ → 残差注入<br/>C_omega: WFR feat_tca @ H/2 → C_omega_list + F_t_aligned"]
+    end
+
+    subgraph 处理层["三源退化并行建模<br/>Phase 1: NDPN/MCPN 截断=0"]
+        ISPN["ISPN 光照源处理<br/>f_enc + s_illum → h(64ch)<br/>→ curve_α(3ch×4×↓, 6iter) + gain([0.5,2.0])"]
+        NDPN["NDPN 噪声处理 (Phase 1 = zero, γ=0.01)<br/>C_omega置信度引导 + s_noise注入"]
+        MCPN["MCPN 运动补偿 (Phase 1 = zero, γ=0.01)<br/>window_corr + motion_estimator + compensation"]
+    end
+
+    subgraph 融合层["CXG 交叉激励门"]
+        CXG["CXG<br/>gate_noise(f_motion)→f_noise_gated<br/>gate_motion(f_noise)→f_motion_gated"]
+    end
+
+    subgraph 执行层["SGRF 阶段式修复融合"]
+        SGRF["SGRF<br/>Stage A: S1(denoise) → S2(deblur) → TCC×6 → gain → img_lit<br/>Stage B: sg[img_lit] + residual_head × tanh(scale) → res_t<br/>Aux losses: L_ndpn(SSIM→img_s1), L_mcpn(L1→img_s2)"]
+    end
+
+    OUT["输出 res_t"]
+
+    IN --> ENC
+    ENC -- "l1_lat" --> WFR
+    ENC -- "l1_lat, l2_lat, l3_lat" --> DPE
+    ENC -- "l1_lat, l2_lat, l3_lat" --> TCA
+    WFR -- "feat_tca (WFR residual)" --> TCA
+    DPE -- "s_illum" --> ISPN
+    DPE -- "s_noise" --> NDPN
+
+    TCA -- "tca_out" --> ISPN
+    TCA -- "F_aligned, C_omega, mu, sigma" --> NDPN
+    TCA -- "F_aligned, C_omega, sigma" --> MCPN
+
+    ISPN -- "gain_map + curve_α" --> SGRF
+    NDPN -- "f_noise" --> CXG
+    MCPN -- "f_motion" --> CXG
+    CXG -- "f_noise_gated, f_motion_gated" --> SGRF
+
+    IN -- "img_center" --> SGRF
+    SGRF --> OUT
+```
+
+### Flight8 关键设计要点
+
+- **Multi-Scale Encoder (Flight8 核心)**: Encoder 输出 l1_lat(64ch,H,W), l2_lat(64ch,H/2), l3_lat(64ch,H/4) 三尺度特征。取消 FPN 融合——各模块直接从最适合的尺度取特征。
+- **DPE 3-Stage Scan**: 粗 → 细 渐进扫描：Stage1(l3@H/4) → upsample → Stage2(l2@H/2) → upsample → Stage3(l1@H) + cls_token → head。每阶段 concat gray(RGB.mean) + lum(RGB.max) 物理先验，补偿 WFR 丢失的全局光照信息。
+- **TCA Internal FPN + Full-Res WKV**: 内部自底向上聚合 l3→l2→l1 → 256×256 全分辨率 WKV 扫描。batch_size=2 + grad_accum=8 (eff=16) 支撑全分辨率。C_omega 仍在 WFR feat_tca @ H/2 计算（对齐精度足够）。
+- **LRU Frame Cache**: 推理滑动窗口复用 4/5 encoder+WFR 特征，LRU 淘汰上限 64 帧 (~1.6GB)。训练路径 batch 编码 B*T 帧一次性通过。
+- **零初始化 sigmoid 末端**: NDPN.conf_proj, NDPN.denoise_strength, MCPN.motion_estimator, MCPN.comp_gate 四层 sigmoid 前 Conv/Linear 全部 weight+bias=0 → 初始输出 0.5，防训练早期饱和。
+
+### Flight8 多阶段训练策略 (epochs=100)
+
+| 阶段 | Epoch | lr | NDPN/MCPN | SGRF gate | 损失项 |
+|------|-------|-----|-----------|-----------|--------|
+| Phase 1 Warmup | 0-4 | 8e-6→8e-4 | zero | gate=0 | pix+ssim+illum+gain_sup+wfr_reg+ifpn |
+| Phase 1 Main | 5-10 | 6e-4 | zero (γ=0.01) | gate=0 | 同上 |
+| Phase 1.5 | 11-35 | 6e-4→4.4e-4 | 线性 0→100% | 渐进 | +L_ndpn_aux+L_mcpn_aux+L_gamma_reg |
+| Phase 2 | 36-100 | 4e-4→1.6e-5 | 100%+CXG | 已学习 | +percep+freq+inter (diag_prior取消) |
 
 ## 图一：最简架构 (含 Flight3 Phase-Dependent + 三部保险)
 
@@ -85,8 +160,8 @@ flowchart TD
 flowchart TD
     IN["多帧低光输入<br/>x : (B, T, 3, H, W)"]
 
-    subgraph Encoder["Encoder"]
-        ENC["PyramidEncoder<br/>[32,64,96] → 64ch<br/>→ F_stack (B,T,64,H,W)"]
+    subgraph Encoder["Encoder (Flight8: Multi-Scale)"]
+        ENC["PyramidEncoder [32,64,96]<br/>→ l1_lat(64,H,W), l2_lat(64,H/2), l3_lat(64,H/4)<br/>Flight8: 取消FPN融合, 输出三尺度 lateral"]
     end
 
     subgraph SWD["WFR 小波特征路由器"]
@@ -186,29 +261,34 @@ flowchart TD
     SGRF_S1 --> SGRF_S2 --> SGRF_CURVE --> SGRF_S3 --> OUT
 ```
 
-### TCA 空间扫描详解
+### TCA 空间扫描详解 (Flight8: Internal FPN + Full-Res WKV)
 
 ```
-feat_tca (B,T,C,H/2,W/2) from WFR — 已是半分辨率, 无需再降采样
+feat_tca (B,T,C,H/2,W/2) from WFR — WFR残差信号 (H/2)
+l1_lat, l2_lat, l3_lat from Encoder — 多尺度 lateral features
+  │
+  ├─ [Internal FPN] l3 → l2 → l1 bottom-up aggregation → full-res x_flat (B*T,64,H,W)
+  │     Flight8: 全分辨率 WKV 扫描, batch=2 + accum=8 补偿显存
   │
   ├─ [MVC-Shift] 3分支空洞DWConv(d=1,2,3) + 1x1混频 → x_shifted
   │
-  ├─ [SpatialWKV2D] 4方向 Bi-WKV
+  ├─ [SpatialWKV2D] 4方向 Bi-WKV (full-res H×W)
   │     ├─ Split C→4 heads × C/4
-  │     ├─ pre_norm (LayerNorm) — 稳定 R/K/V 投影输入
+  │     ├─ pre_norm (LayerNorm)
   │     ├─ Head0/H1/H2/H3: 水平/垂直/主对角/副对角扫描
   │     ├─ 每方向独立 BiWKV (chunk-wise cumsum=256, e^w<1 强制衰减)
   │     └─ Concat 4 heads → σ(R)⊙wkv → proj_out → post_norm
   │
   ├─ [Channel Mix] LN → Conv(C→4C) → GELU → Conv(4C→C) → + x * gamma
   │
-  ├─ [Upsample] H/2 → H×W → tca_out (B,T,C,H,W)
+  ├─ [WFR Residual] + feat_tca (upsampled to H) × wfr_lambda (λ=0 at init)
+  │     → sace_out (B,T,C,H,W)
   │
-  ├─ [TemporalCorrespondence]
+  ├─ [TemporalCorrespondence] on WFR feats @ H/2 (对齐够用, 节省C_omega显存)
   │     proj_qk (C→C/4) → cosine_sim → ÷ softplus(tau)+0.05 → softmax(dim=-1)
   │     → C_omega_list: [(B, ds², ds²) × (T-1)], ds=min(H,W)//4 capped≤96
   │
-  └─ [TemporalAggregation]
+  └─ [TemporalAggregation] on full-res sace_out @ H
         C_omega × neighbor_ds → warp → frame_gate → softmax加权
         → upsample + residual + LayerNorm → F_t_aligned (B,C,H,W)
 ```
@@ -275,7 +355,21 @@ SGRF gate         →  零 (四重保险: 分支零 × gate零 × unlock零 × c
 | **gain_map** | `softplus(raw_gain).clamp(1.0, max_gain)` → 物理合理范围 |
 | **bias_map** | — | — | **Mod6: removed — curve provides additive correction** |
 
-### Flight3 vs Mark3/Mark1 核心差异
+### Flight8 vs Flight7.2 核心差异
+
+| 维度 | Flight7.2+WFR | **Flight8** |
+|------|---------------|-----------|
+| **Encoder** | FPN fused (H×W) | **Multi-scale l1/l2/l3 (64ch each)** |
+| **DPE** | 单尺度 multi-dilation | **3-stage coarse-to-fine + gray/lum + cls_token** |
+| **TCA** | Enc feats + WFR残差 H/2 WKV | **Internal FPN + Full-res(H) WKV + WFR残差** |
+| **WKV res** | H/2 (128×128) | **Full H×W (256×256)** |
+| **WFR** | feat_tfde + feat_tca | **仅 feat_tca (DPE已直连encoder)** |
+| **batch** | 4/2 → eff=8 | **2/8 → eff=16** |
+| **Params** | 1.55M | **1.85M** |
+| **Epochs** | 85 | **100** |
+| **Cache** | 无 | **LRU frame_cache (64帧)** |
+
+### Flight7.2+WFR vs Flight3 差异 (已过期)
 
 | 维度 | Mark1 | Mark3 | **Flight3** |
 |------|-------|-------|-----------|

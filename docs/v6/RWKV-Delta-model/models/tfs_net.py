@@ -159,12 +159,28 @@ class TFSNet(nn.Module):
                          use_soft_clamp=use_soft_clamp, use_nafblock=use_nafblock,
                          num_res_blocks=num_igrf_res_blocks)
 
-        # 逐帧特征缓存
+        # 逐帧特征缓存 (key: frame_global_index → {l1_lat, l2_lat, l3_lat, feat_tca})
         self.frame_cache: Dict[int, Dict[str, torch.Tensor]] = {}
+        self._cache_max_size = 64
+        self._cache_access_order: List[int] = []
 
     def clear_frame_cache(self):
-        """清空逐帧特征缓存（切换序列或释放显存时调用）。"""
         self.frame_cache.clear()
+        self._cache_access_order.clear()
+
+    def _cache_evict_lru(self):
+        while len(self._cache_access_order) > self._cache_max_size:
+            oldest = self._cache_access_order.pop(0)
+            if oldest in self.frame_cache:
+                del self.frame_cache[oldest]
+
+    def _cache_put(self, gidx: int, key: str, tensor: torch.Tensor):
+        if gidx not in self.frame_cache:
+            self.frame_cache[gidx] = {}
+        self.frame_cache[gidx][key] = tensor.detach()
+        if gidx not in self._cache_access_order:
+            self._cache_access_order.append(gidx)
+        self._cache_evict_lru()
 
     def forward(
         self,
@@ -182,28 +198,69 @@ class TFSNet(nn.Module):
         center_idx = T // 2
         image_center = x[:, center_idx]
 
-        # Stage 0: Encoder → F_stack (B,T,C,H,W)
-        feats_list: List[torch.Tensor] = []
-        for i in range(T):
-            f = self.encoder.forward_single(x[:, i], return_coarse=False)
-            feats_list.append(f)
-        feats = torch.stack(feats_list, dim=1)
+        # Stage 0: Encoder → lateral features with frame cache
+        use_cache = frame_indices is not None
+        if use_cache:
+            l1_list, l2_list, l3_list = [], [], []
+            for i in range(T):
+                gidx = frame_indices[i]
+                if gidx in self.frame_cache and "l1_lat" in self.frame_cache[gidx]:
+                    l1_list.append(self.frame_cache[gidx]["l1_lat"])
+                    l2_list.append(self.frame_cache[gidx]["l2_lat"])
+                    l3_list.append(self.frame_cache[gidx]["l3_lat"])
+                    self._cache_access_order.remove(gidx)
+                    self._cache_access_order.append(gidx)
+                else:
+                    l1, l2, l3 = self.encoder.forward_single_lateral(x[:, i])
+                    l1_list.append(l1)
+                    l2_list.append(l2)
+                    l3_list.append(l3)
+                    self._cache_put(gidx, "l1_lat", l1)
+                    self._cache_put(gidx, "l2_lat", l2)
+                    self._cache_put(gidx, "l3_lat", l3)
+            l1_lat = torch.stack(l1_list, dim=1)
+            l2_lat = torch.stack(l2_list, dim=1)
+            l3_lat = torch.stack(l3_list, dim=1)
+        else:
+            x_flat = x.reshape(B * T, C_in, H, W)
+            l1_flat, l2_flat, l3_flat = self.encoder.forward_single_lateral(x_flat)
+            l1_lat = l1_flat.reshape(B, T, *l1_flat.shape[1:])
+            l2_lat = l2_flat.reshape(B, T, *l2_flat.shape[1:])
+            l3_lat = l3_flat.reshape(B, T, *l3_flat.shape[1:])
+        feats = l1_lat
 
-        # Stage 1: SWD 小波分流 (逐帧 → B*T,C,H,W → DWT → feat_tfde/feat_tca)
-        feats_flat = feats.reshape(B * T, -1, H, W)
-        wfr_out = self.wfr(feats_flat)
-        feat_tfde = wfr_out["feat_tfde"].reshape(B, T, -1, H // 2, W // 2)
-        feat_tca = wfr_out["feat_tca"].reshape(B, T, -1, H // 2, W // 2)
+        # Stage 1: WFR on l1_lat (H×W) → feat_tca (H/2×W/2) with cache
+        if use_cache:
+            feat_tca_list = []
+            for i in range(T):
+                gidx = frame_indices[i]
+                if gidx in self.frame_cache and "feat_tca" in self.frame_cache[gidx]:
+                    feat_tca_list.append(self.frame_cache[gidx]["feat_tca"])
+                    self._cache_access_order.remove(gidx)
+                    self._cache_access_order.append(gidx)
+                else:
+                    fi = l1_list[i]
+                    if fi.dim() == 3:
+                        fi = fi.unsqueeze(0)
+                    wfr_out_i = self.wfr(fi)
+                    ft = wfr_out_i["feat_tca"]
+                    self._cache_put(gidx, "feat_tca", ft)
+                    feat_tca_list.append(ft)
+            feat_tca = torch.cat(feat_tca_list, dim=0).unsqueeze(0)  # (1, T, 64, H/2, W/2)
+        else:
+            feats_flat = l1_lat.reshape(B * T, -1, H, W)
+            wfr_out = self.wfr(feats_flat)
+            feat_tca = wfr_out["feat_tca"].reshape(B, T, -1, H // 2, W // 2)
 
-        dpe_out = self.dpe(feat_tfde, encoder_center=feats[:, center_idx])
+        # Stage 2: DPE — 3-stage progressive scan with gray/lum priors
+        dpe_out = self.dpe(l1_lat, l2_lat, l3_lat, center_frame=image_center)
         s_illum = dpe_out["s_illum"]
         s_noise_orig = dpe_out["s_noise"]
-        # 上采样到 H×W (NDPN/ISPN 需要全分辨率)
         s_illum = F.interpolate(s_illum, size=(H, W), mode='bilinear', align_corners=False)
         s_noise = F.interpolate(s_noise_orig, size=(H, W), mode='bilinear', align_corners=False)
 
-        # Stage 3: TCA 时序对应对齐
-        tca_out = self.tca(feat_tca, encoder_feats=feats)
+        # Stage 3: TCA — internal FPN + full-res WKV
+        tca_out = self.tca(feat_tca, encoder_lats=(l1_lat, l2_lat, l3_lat))
         F_aligned_list = [tca_out["tca_out"][:, t] for t in range(T)]
         C_omega_list = tca_out.get("C_omega_list", [])
         F_t_aligned = tca_out["F_t_aligned"]

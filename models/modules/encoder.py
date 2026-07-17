@@ -111,6 +111,15 @@ class PyramidEncoder(nn.Module):
             return fused, coarse
         return fused
 
+    def forward_single_lateral(self, x):
+        """Flight8: return l1_lat, l2_lat, l3_lat — skip FPN fusion for downstream modules."""
+        l1 = self.stage1(x)
+        l2 = self.stage2(l1)
+        l3 = self.stage3(l2)
+        if self.bottleneck is not None:
+            l3 = self.bottleneck(l3)
+        return self.lateral1(l1), self.lateral2(l2), self.lateral3(l3)
+
     def forward(self, x, return_coarse=False):
         """
         Args:

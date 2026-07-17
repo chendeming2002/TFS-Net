@@ -1,9 +1,9 @@
-# TFS-Net v6 Delta Flight3 模型架构设计文档
+# TFS-Net v6 Delta Flight8 模型架构设计文档
 
-> 日期：2026-07-17 (更新: Flight7.2+WFR — 70 epoch验证, 三源同时激活, PSNR=17.07)
-> 版本：v6 Delta Flight7.2+WFR (final)
-> 训练配置：`configs/delta_flight7d1.yaml`，batch=4 (accum=2→eff=8), epochs=85
-> 参数量：1.55M
+> 日期：2026-07-17
+> 版本：v6 Delta Flight8 (current)
+> 训练配置：`configs/delta_flight8.yaml`，batch=2 (accum=8→eff=16), epochs=100
+> 参数量：1.85M
 
 ---
 
@@ -13,9 +13,9 @@ TSD-Net (Tri-Source Decoupled Network) 是一个端到端多帧低光视频增�
 
 | 模块 | 缩写 | 功能 |
 |------|------|------|
-| **WFR** | Wavelet Feature Router | Haar DWT 子带级分流 (LL→光照/噪声, HF→结构) |
-| **DPE** | Degradation Prior Estimator | 时域统计 + 多尺度空洞卷积 → s_illum, s_noise (Mark4 简化) |
-| **TCA** | Temporal Correspondence & Alignment | 4方向空间 WKV 扫描 + C_omega 时序矩阵 |
+| **WFR** | Wavelet Feature Router | Haar DWT 子带级分流 (LL→光照/噪声, HF→结构) — Flight3取消噪声门控 |
+| **DPE** | Degradation Prior Estimator | 3-stage coarse-to-fine scan (l3@H/4→l2@H/2→l1@H) + gray(RGB.mean)+lum(RGB.max) physics priors |
+| **TCA** | Temporal Correspondence & Alignment | Internal FPN(l3→l2→l1 bottom-up) → full-res 4方向空间 WKV 扫描 + C_omega 时序矩阵 |
 | **ISPN** | Illumination-Source Processing Network | TCC曲线(3ch×4×↓) + pixel-wise gain(1.25→[0.5,2.0], Flight6: DOF反转) |
 | **NDPN** | Noise Degradation Processing Network | C_omega 置信度引导去噪 (γ=0.01 → 10× stronger gradient flow) |
 | **MCPN** | Motion Compensation Processing Network | C_omega 运动强度补偿 (gamma=0.01, startup→pass-through) |
@@ -34,19 +34,24 @@ TSD-Net (Tri-Source Decoupled Network) 是一个端到端多帧低光视频增�
 | IGRF | **SGRF** | 阶段式引导修复融合 |
 | CrossFusionGate | **CXG** | 交叉激励门 |
 
-### 完整数据流 (Mod4)
+### 完整数据流 (Flight8)
 
 ```
 输入: I_{t-2}, I_{t-1}, I_t, I_{t+1}, I_{t+2}  (T=5 窗口)
   │
-  ├─→ Encoder → F_{t-2}...F_{t+2}  (B, T, 64, H, W)
+  ├─→ Encoder (逐帧) → l1_lat(64ch,H,W), l2_lat(64ch,H/2), l3_lat(64ch,H/4)
+  │     Flight8: skip FPN, 输出多尺度 lateral features
   │
-  ├─→ WFR (逐帧 HaarDWT) → feat_tfde (→ DPE, concat Enc center), feat_tca (→ TCA 残差)
+  ├─→ WFR(l1_lat) → feat_tca (H/2×W/2) — HaarDWT 子带分流
   │
-  ├─→ DPE(feat_tfde + Encoder_center) → s_illum, s_noise
+  ├─→ DPE(l1_lat, l2_lat, l3_lat, I_t) → s_illum, s_noise
+  │     Flight8: 3-stage progressive scan (l3@H/4→l2@H/2→l1@H) + gray/lum priors
   │     s_illum → ISPN   s_noise → NDPN
   │
-  ├─→ TCA(Encoder_feats, wfr_residual=feat_tca) → F_out, C_{t,Ω}, \hat{F}_t, μ, σ
+  ├─→ TCA(feat_tca, encoder_lats) → tca_out, C_{t,Ω}, \hat{F}_t, μ, σ
+  │     Flight8: internal FPN(l3→l2→l1 bottom-up) → full-res WKV @ 256×256
+  │              ChannelMix → sace_out + WFR residual
+  │              C_omega from WFR feat_tca at H/2
   │
   ├─→ ISPN(f_enc, s_illum) → curve_alpha (per-pixel), gain_map
   ├─→ NDPN({F^{\text{out}}}, s_noise, μ, σ, C_{t,Ω}, \hat{F}_t) → f_noise_out
@@ -241,7 +246,7 @@ $$\hat{F}_t = \text{LN}\left(F_t^{\text{out}} + \sum_{t' \in \Omega} w_{t'} \cdo
 
 **核心设计原则总结**：TCA 不是简单地将变压器注意力换成 WKV——它是 RWKV 架构模式的完整 Vision 实例化。通过将"时间混合+通道混合"的范式从 1D 语言序列适配到 2D 空间+时序对应，TCA 在低光视频中为后续的 NDPN（去噪）和 MCPN（运动补偿）提供了既有时序对齐保真度、又有 RWKV 线性复杂度优势的特征表示。
 
-### 2.3 WFR — 空域小波分流 (Flight3: 取消 HF 噪声门控)
+### 2.3 WFR — 空域小波分流 (Flight3: 取消 HF 噪声门控, Flight8: 仅输出 feat_tca)
 
 **动机**。旧 DWT-LFF 通过 IDWT 重建全分辨率特征，两条分支接收几乎相同的信息（仅 LL 略有差异），退化分离失效。
 
@@ -382,33 +387,38 @@ Encoder feat → [HaarDWT] → LL, LH, HL, HH
 
 **Flight3 简化**: 已删除 `noise_gate` (Conv→Sigmoid) 和 `hf_tca_norm` (LayerNorm)——消除 "高能量=噪声" 的归纳偏置误判。
 
-### 3.2 DPE — 退化先验估计器 (Flight3)
+### 3.2 DPE — 退化先验估计器 (Flight8: 3-stage progressive scan)
 
 **文件**: `models/modules/tfsi_v2.py`
 
+**Flight8 3-stage coarse-to-fine扫描**:
 ```
-feat_tfde (B,T,C,H/2,W/2) from WFR
+l3_lat(B,C,H/4,W/4) from Encoder — 最粗尺度
+  ├─ Stage1: refine(l3) + gray(I_t↓H/4) + lum(I_t↓H/4) → s_c3
   │
-  ├─ GroupNorm (逐帧)
-  ├─ 时域统计: soft-median(μ), var(σ), μ/σ(SNR) 沿 T 维
-  ├─ Concat [μ, σ, SNR] → (B, 3C, H/2, W/2)
+l2_lat(B,C,H/2,W/2)
+  └─ Stage2: refine(l2) + upsample(s_c3) + gray(I_t↓H/2) + lum(I_t↓H/2) → s_c2
   │
-  ├─ MultiScaleSpatialBranch
-  │     ├─ 3×3 (d=1): 局部纹理 → mid ch
-  │     ├─ 3×3 (d=2): 中尺度光照 → mid ch
-  │     └─ 3×3 (d=4): 大尺度区域 → wide ch
-  │
-  ├─ Concat + 1×1 fuse → F_fused
-  │
-  ├─ Flight3 A: LayerNorm2d → 归一化幅值 (anti-saturation)
-  └─ Conv(→2ch, 零初始化) → Sigmoid → s_illum[:,0:1], s_noise[:,1:2]
-   初始输出 s_illum≈0.5, s_noise≈0.5 (居中, 有上下学习空间)
+l1_lat(B,C,H,W)
+  └─ Stage3: refine(l1) + upsample(s_c2) + gray(I_t) + lum(I_t) + cls_token → head → s_illum, s_noise
 ```
+
+**gray/lum physics priors**: `gray = I_t.mean(dim=1, keepdim=True)` (亮度), `lum = I_t.max(dim=1, keepdim=True).values` (最大值) — 提供原始光照信息，补偿 WFR 子带分流中可能丢失的全局光照上下文。
+
+**cls_token**: 可学习参数 (1,1,C,1,1)，提供全局统计偏差，防止 DPE 在所有示例上都输出 s_illum≈0.5。初始化为零 → Phase 1 warmup 输出 0.5，后续学习。
 
 **Mark4 问题**: Sigmoid 前无归一化 → F_fused 幅值失控 → s_illum=1.0 饱和。
 **Flight3 修复**: LayerNorm + head 零初始化 → 初始输出 0.5，训练中可自由学习。
 
-### 3.3 TCA — 时序对应对齐 (RWKV Spatial Mix + Channel Mix + Corr)
+### 3.3 TCA — 时序对应对齐 (Flight8: Internal FPN + Full-Res WKV)
+
+**文件**: `models/modules/pure_rwkv_sace.py`
+
+**Flight8 架构升级**:
+- **Internal FPN**: l3_lat→l2_lat→l1_lat 自底向上聚合，产生全分辨率 (H×W) WKV 输入
+- **Full-Res WKV**: 从 Flight7.2 的 H/2(WFR) 升级到 H×H(256×256)，通过 batch_size 2 + grad_accum 8 补偿显存
+- **WFR Residual**: feat_tca 注入路径：`sace_out += wfr_feat_tca × wfr_lambda` (λ 零初始化)
+- **C_omega at H/2**: 时序对应矩阵仍在 WFR feat_tca 半分辨率计算 (H/2 对对齐足够)
 
 **文件**: `models/modules/pure_rwkv_sace.py`
 
@@ -516,7 +526,8 @@ feat_tca (B,T,C,H/2,W/2) from WFR — 半分辨率, 节省 4× WKV 计算量
 | v6 Delta Mark1 | WFR子带分流 + 命名统一 + 数值稳定 | 1.69M | ep15 loss收敛 |
 | **v6 Delta Mark2** | **Kendall不确定性加权 + PE Loss + 感知解耦 + 损失调度** | **1.69M** | 收敛停滞 |
 | **v6 Delta Mark3** | **两阶段渐进训练 + ISPN 隔离 + SGRF 中间监督 + 相位调度** | **1.69M** | PSNR 18→8.7 |
-| **v6 Delta Flight7.2+WFR** | **Encoder→TCA主输入+WFR残差, DPE concat Enc center, aux监督, TCC 4×↓, Stage A/B** | **1.55M** | **训练中** |
+| **v6 Delta Flight7.2+WFR** | **Encoder→TCA主输入+WFR残差, DPE concat Enc center, aux监督, TCC 4×↓, Stage A/B** | **1.55M** | PSNR 17.10@ep80 |
+| **v6 Delta Flight8** | **Multi-scale encoder(l1/l2/l3), DPE 3-stage scan+gray/lum, TCA internal FPN+full-res WKV, batch=2 grad_accum=8** | **1.85M** | **训练中** |
 
 ---
 
@@ -614,13 +625,13 @@ $$L_{\text{total}} = \sum_{i} \frac{1}{2\exp(s_i)} L_i + \frac{1}{2}s_i$$
 
 | 参数 | 值 | 说明 |
 |------|-----|------|
-| batch_size | 4 (accum=2) | eff batch=8 |
-| grad_accum_steps | **2** | 等效 batch=8 |
-| epochs | 85 | Phase 1(0-10)+P1.5(11-30)+P2(31-85) |
+| batch_size | 2 (accum=8) | eff batch=16 (full-res WKV support) |
+| grad_accum_steps | **8** | 等效 batch=16 |
+| epochs | 100 | P1 Warmup(0-4)+P1 Main(5-10)+P1.5(11-35)+P2(36-100) |
 | lr (Phase 1 Warmup) | 8e-6 → 8e-4 | 线性 warmup |
 | lr (Phase 1 Main) | 6e-4 | 固定 |
-| lr (Phase 1.5) | 6e-4 → 4e-4 | 线性过渡 (20 epoch) |
-| lr (Phase 2) | 4e-4 → 1.6e-5 | Cosine annealing (60 epoch) |
+| lr (Phase 1.5) | 6e-4 → 4.4e-4 | 线性过渡 (25 epoch) |
+| lr (Phase 2) | 4e-4 → 1.6e-5 | 阶梯衰减 (65 epoch) |
 | max_gain ramp | 4→16 over 30 epoch | Flight3 I: 匹配新 Phase 1.5 |
 | optimizer | AdamW | — |
 | weight_decay | 1e-4 | L2 正则 |
@@ -633,22 +644,22 @@ $$L_{\text{total}} = \sum_{i} \frac{1}{2\exp(s_i)} L_i + \frac{1}{2}s_i$$
 ```python
 def get_phase(epoch):
     if epoch < 5:   return 'phase1_warmup'
-    elif epoch < 10: return 'phase1'         # Flight3: shortened to 5 epoch
-    elif epoch < 30: return 'phase1_5'       # 20-epoch unlock ramp
+    elif epoch < 11: return 'phase1'
+    elif epoch < 36: return 'phase1_5'
     else:            return 'phase2'
 
 def get_unlock_ratio(epoch):
-    if epoch < 10: return 0.0
-    if epoch >= 30: return 1.0
-    return (epoch - 10) / 20.0  # 线性 0→1
+    if epoch < 11: return 0.0
+    if epoch >= 36: return 1.0
+    return (epoch - 11) / 25.0  # 线性 0→1 over 25 epochs
 
 def get_lr(epoch, base_lr=8e-4):
     if epoch < 5:   return base_lr * (0.01 + 0.99 * epoch / 5)
-    elif epoch < 10: return 0.75 * base_lr
-    elif epoch < 30: return base_lr * 0.75 * (1 - (epoch - 10) / 20 * 0.33)
-    elif epoch < 55: return base_lr * 0.5
-    elif epoch < 70: return base_lr * 0.125
-    elif epoch < 80: return base_lr * 0.05
+    elif epoch < 11: return 0.75 * base_lr
+    elif epoch < 36: return base_lr * 0.75 * (1 - (epoch - 11) / 25 * 0.33)
+    elif epoch < 66: return base_lr * 0.5
+    elif epoch < 82: return base_lr * 0.125
+    elif epoch < 92: return base_lr * 0.05
     else:            return base_lr * 0.02
 ```
 
@@ -683,22 +694,27 @@ elif phase == 'phase2':
 ### 7.5 训练监控
 
 ```bash
-tail -f outputs/sdsd_flight3/nohup.out
-grep "Train stats" outputs/sdsd_flight3/nohup.out | tail -20
-grep "non-finite\|NaN" outputs/sdsd_flight3/nohup.out
+tail -f outputs/sdsd_f8/train.log
+grep "Train stats" outputs/sdsd_f8/train.log | tail -20
+grep "non-finite\|NaN" outputs/sdsd_f8/train.log
 ```
 
-### 7.6 Epoch 5 过渡检查清单
+### Flight8 与 Flight7.2 核心差异
 
-| 检查项 | 健康阈值 | 不健康信号 |
-|-------|---------|-----------|
-| `pix` 趋势 | 持续下降到 <0.12 | 平台期或上升 |
-| `ssim` 趋势 | 持续下降到 <0.40（即 SSIM>0.60） | 停滞在 >0.45 |
-| `lit_up_map` 值域 | 均值在 [2.0, 6.0] | <1.0 或 >10.0 |
-| `i_sup` | 下降到 <2.0 | >5.0 (gain_map 未激活) |
-| WFR α 均值 | 在 [0.5, 0.9] | <0.1 或 >0.95 |
-| `diag_prior` | 从 ~4.0 下降到 <2.0 | 上升（C_Ω 退化） |
-| 梯度 norm | Encoder/ISPN/SGRF 同数量级 | 某模块爆炸或消失 |
+| 维度 | Flight7.2+WFR | **Flight8** |
+|------|---------------|-----------|
+| **Encoder 输出** | FPN fused (H×W) | **Multi-scale l1/l2/l3 lateral (64ch each)** |
+| **DPE 输入** | feat_tfde + Enc center | **l1_lat, l2_lat, l3_lat + gray/lum priors** |
+| **DPE 架构** | 单尺度 multi-dilation | **3-stage coarse-to-fine scan + cls_token** |
+| **TCA 输入** | Enc feats (H×W) + WFR残差 | **Internal FPN(l3→l2→l1) → full-res(H) + WFR残差** |
+| **WKV 分辨率** | H/2 (128×128) | **Full-res H×W (256×256)** |
+| **C_omega 计算** | TCA内部 @ 降采样 | **WFR feat_tca @ H/2 (对齐够用)** |
+| **WFR 输出** | feat_tfde + feat_tca | **仅 feat_tca (DPE已直连encoder)** |
+| **batch/accum** | 4/2 → eff=8 | **2/8 → eff=16** |
+| **参数量** | 1.55M | **1.85M (+300K in DPE 3-stage + TCA FPN)** |
+| **Epochs** | 85 | **100** |
+| **DPE health** | s_illum→1.0 饱和 | **灰度+亮度先验 + ds_init 0.5** |
+| **帧缓存** | 无 | **LRU frame_cache (64帧), 滑动窗口复用80%** |
 
 ---
 
@@ -716,5 +732,5 @@ grep "non-finite\|NaN" outputs/sdsd_flight3/nohup.out
 | `models/modules/igrf.py` | SGRF (zero-gate StageBlock, BrightenStage) |
 | `models/tfs_net.py` | CXG, TFSNet (数据流编排) |
 | `losses/losses.py` | TFSNetLoss (Kendall UW + gain_sup + Phase Schedule) |
-| `train.py` | 训练循环 (grad accum + phase lr + metric logging) |
-| `configs/delta_flight3.yaml` | 训练配置 (batch=4, epochs=90) |
+| `train.py` | 训练循环 (grad accum + phase lr + metric logging + frame_cache管理) |
+| `configs/delta_flight8.yaml` | 训练配置 (batch=2, accum=8, epochs=100) |

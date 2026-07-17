@@ -1,19 +1,20 @@
-# RWKV-Delta 代码快照
+# RWKV-Delta 代码快照 — Flight8
 
-> Delta 是 TFS-Net v6 架构的第四个变体，对 SACE 进行全面重构：
-> 1. **SpatialWKV2D**：四方向空间扫描 (水平/垂直/主对/副对)，替代帧间 RWKV
-> 2. **MVC-Shift**：多尺度空洞 Depthwise Conv 替代 Q-Shift
-> 3. **C_omega_list**：显式时序对应矩阵 (cosine similarity)，注入 NDPN/MRPN
-> 4. **F_t_aligned**：时序对齐锚，NDPN/MRPN 的统一参考
-> 5. **A_illu**：s_illum 经 IFPN s_illum_proj → 传入 IGRF
-> 6. **CrossFusionGate**：deploy 模式支持重参数化
+> Flight8 是 TFS-Net v6 的最新一代架构，对编码器和模块路由进行全面重构：
+> 1. **Multi-Scale Encoder**: 输出 l1/l2/l3 三尺度特征，取消 FPN 融合
+> 2. **DPE 3-Stage Scan**: 粗→细渐进扫描 (l3@H/4→l2@H/2→l1@H) + gray/lum 物理先验
+> 3. **TCA Internal FPN**: 自底向上聚合三尺度 → 全分辨率 (256×256) WKV 扫描
+> 4. **LRU Frame Cache**: 推理滑动窗口复用 80% 编码特征，64帧上限
+> 5. **Sigmoid-Terminal Zero-Init**: NDPN/MCPN 4层 sigmoid 末端全部零初始化
+> 6. **训练** batch=2, accum=8 (eff=16), epochs=100, 参数量 1.85M
 
 ## 文件结构
 
 ```
 docs/v6/RWKV-Delta-model/
 ├── configs/
-│   ├── v6_charlie.yaml        # 训练超参
+│   ├── delta_flight8.yaml     # 当前训练配置 (batch=2, accum=8, epochs=100)
+│   ├── delta_flight3.yaml     # Flight3 旧配置
 │   └── loss_weights.yaml      # 损失权重
 ├── datasets/
 │   ├── __init__.py
@@ -21,63 +22,76 @@ docs/v6/RWKV-Delta-model/
 │   └── transforms.py          # 视频增强
 ├── losses/
 │   ├── __init__.py
-│   └── losses.py              # Charbonnier + Perceptual + SSIM
+│   └── losses.py              # TFSNetLoss (Kendall UW + phase schedule)
 ├── models/
 │   ├── __init__.py            # 导出 TFSNet
-│   ├── blocks.py              # ConvBlock, ResBlock, NAFBlock, 窗口函数 (175行)
-│   ├── dwt_lff.py             # SpatialDWTLFFAdapter + HaarDWT2D (84行)
-│   └── tfs_net.py             # TFSNet 完整模型 (1919行, 合并23个类)
-├── train.py                   # 训练+推理 (259行)
+│   ├── tfs_net.py             # TFSNet + CXG + LRU frame_cache (348行, Flight8)
+│   ├── swd.py                 # WFR (HaarDWT子带分流, Flight3取消噪声门控)
+│   ├── pure_rwkv_sace.py      # TCA (Internal FPN + full-res WKV + C_omega)
+│   ├── ndpn.py                # NDPN (C_omega置信度引导 + zero-init sigmoid)
+│   ├── mrpn.py                # MCPN (motion_estimator + zero-init sigmoid)
+│   ├── igrf.py                # SGRF (Stage A/B + auxiliary losses)
+│   └── modules/
+│       ├── blocks.py          # ConvBlock, ResBlock, NAFBlock, LayerNorm
+│       └── encoder.py         # PyramidEncoder (3-stage + lateral convs)
+├── utils/
+│   ├── inference.py           # tiled_forward (with cache support)
+│   └── ...
+├── train.py                   # 训练脚本 (phase schedule for 100 epochs)
 ├── README.md                  # 本文件
-└── v6-delta-diagrams.md       # 架构图 (Mermaid)
+└── v6-delta-diagrams.md       # 架构图 (Mermaid, Flight8 updated)
 ```
 
 ## 整体架构概览
 
 ```
-输入 → [Encoder] → ┬─ [TFSI] → s_illum, s_noise
-                    └─ [SACE] → sace_out, C_omega, F_t_aligned
-                         └→ [IFPN/NDPN/MRPN] (三源并行)
-                            → [CrossFusionGate] (交叉门控)
-                            → [IGRF] (修正去噪) → 输出
+输入 → [Encoder(l1/l2/l3)] → ┬─ [WFR(l1)] → feat_tca (H/2) → TCA 残差
+                              ├─ [DPE(l1/l2/l3)] → s_illum, s_noise
+                              └─ [TCA(l1/l2/l3 + WFR)] → tca_out, C_omega, F_t_aligned
+                                   └→ [ISPN/NDPN/MCPN] (三源并行)
+                                      → [CXG] (交叉门控)
+                                      → [SGRF] (阶段式修复) → 输出
 ```
 
-> 详见: [`v6-delta-diagrams.md`](v6-delta-diagrams.md)
+### Flight8 核心模块
 
-## 核心模块 (models/tfs_net.py, 1864行, 23个类)
-
-| 类 | 所属模块 | Delta 创新 |
+| 类 | 模块 | Flight8 创新 |
 |------|------|-----------|
-| `PyramidEncoder` | Encoder | 3级金字塔编码 |
-| `TFSI` | 时频诊断 | temporal_fuse 多帧 FrequencyBranch |
-| `MVCShift` | SACE | 3分支空洞DWConv 替代 Q-Shift |
-| `SpatialWKV2D` | SACE | 4方向空间 Bi-WKV 扫描 |
-| `TemporalCorrespondence` | SACE | cosine similarity → C_omega_list |
-| `TemporalAggregation` | SACE | C_omega-warp + frame_gate → F_t_aligned |
-| `PureRWKVSACE` | SACE | 空间扫描+时序对应, 移除DWT-LFF |
-| `IFPN` | 光照 | s_illum_proj → A_illu 输出 |
-| `NDPN` | 去噪 | conf_proj + noise_extract + denoise_strength + s_noise |
-| `MRPN` | 运动 | motion_estimator + sigma_proj + comp_gate + motion_refine + γ |
-| `CrossFusionGate` | 交叉 | deploy 重参数化 |
-| `IGRF` | 合成 | A_illu 替代 s_illum 直接注入 |
+| `PyramidEncoder` | Encoder | 3级金字塔 + lateral convs → l1/l2/l3 三尺度 |
+| `WFR` | 小波分流 | HaarDWT LL/HF 子带级分流 (Flight3取消噪声门控) |
+| `DPE` | 退化估计 | 3-stage coarse-to-fine scan + gray/lum priors + cls_token |
+| `TCA` | 时序对齐 | Internal FPN(l3→l2→l1) → full-res 256×256 WKV + WFR残差 |
+| `MVCShift` | TCA | 3分支空洞DWConv (RSRWKV) |
+| `SpatialWKV2D` | TCA | 4方向Bi-WKV 空间扫描 |
+| `TemporalCorrespondence` | TCA | cosine similarity → C_omega_list @ H/2 |
+| `TemporalAggregation` | TCA | C_omega-warp + frame_gate → F_t_aligned |
+| `ISPN` | 光照 | TCC曲线 6iter 4×↓ + pixel-wise gain [0.5,2.0] |
+| `NDPN` | 去噪 | conf_proj + noise_extract + denoise_strength (zero-init sigmoid) |
+| `MCPN` | 运动 | motion_estimator + comp_gate (zero-init sigmoid) + window_corr |
+| `CXG` | 交叉 | cross-excitation gate, deploy重参数化 |
+| `SGRF` | 合成 | Stage A/B + sg[img_lit] + residual_head |
 
 ## 数据流
 
 ```
-TFSI → s_illum → IFPN s_illum_proj → A_illu → IGRF Stage3
-TFSI → s_noise → NDPN noise_proj (条件) + IGRF Stage1 (加法)
-SACE → C_omega_list → NDPN conf_map + MRPN motion_mag
-SACE → F_t_aligned → NDPN/MRPN 对齐参考
-CrossFusionGate → f_noise↔f_motion 交叉调制 → IGRF
+Encoder → l1, l2, l3 (多尺度 lateral)
+  ├─ WFR(l1) → feat_tca (H/2) → TCA 残差路径
+  ├─ DPE(l1,l2,l3) + gray/lum → s_illum → ISPN
+  │                           → s_noise → NDPN
+  └─ TCA(l1,l2,l3 + WFR residual) → tca_out → ISPN
+                                    → C_omega → NDPN conf_map + MCPN motion_mag
+                                    → F_t_aligned → NDPN/MCPN 对齐参考
+CXG → f_noise↔f_motion 交叉调制 → SGRF
 ```
 
-## 已移除 (vs 生产代码)
+## 已移除 / 变更 (vs 生产代码)
 
-| 移除组件 | 原因 |
-|----------|------|
+| 组件 | 原因 |
+|------|------|
+| FPN fusion in Encoder | Flight8: 取消融合, 多尺度 lateral 直接路由各模块 |
+| feat_tfde from WFR | Flight8: DPE 改由 encoder l1/l2/l3 输入 → WFR 仅输出 feat_tca |
+| H/2 WKV in TCA | Flight8: 升级为 Internal FPN → full-res 256×256 WKV |
 | DeformableCrossAttention | PureRWKVSACE 替代 |
-| VRWKVStyleSpatialMix | SpatialWKV2D 替代 |
-| AmpEnhance | 实验性, 未使用 |
-| LFFFeatureAdapter | DWT-LFF 替代 |
-| DWT-LFF in SACE | Delta 直接使用 Encoder 特征 |
+| AmpEnhance | 实验性, 未启用 |
+| LFFFeatureAdapter | DWT-LFF / WFR 替代 |
 | edge_prompt | Delta 移除边缘门控 |
