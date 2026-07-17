@@ -1,7 +1,7 @@
 # TFS-Net v6 Delta Flight3 模型架构设计文档
 
-> 日期：2026-07-16 (更新: Flight7.2+WFR路由 — Encoder主输入TCA/DPE, WFR残差)
-> 版本：v6 Delta Flight7.2+WFR
+> 日期：2026-07-17 (更新: Flight7.2+WFR — 70 epoch验证, 三源同时激活, PSNR=17.07)
+> 版本：v6 Delta Flight7.2+WFR (final)
 > 训练配置：`configs/delta_flight7d1.yaml`，batch=4 (accum=2→eff=8), epochs=85
 > 参数量：1.55M
 
@@ -604,7 +604,7 @@ $$L_{\text{total}} = \sum_{i} \frac{1}{2\exp(s_i)} L_i + \frac{1}{2}s_i$$
 
 7. **ZeroDCE 曲线增强 (Mod4→Mod6 渐进升级)**：ISPN 曲线分支从 per-image MLP(64→16→9, 3 iter) → MLP(64→16→15, 5 iter) → SpatialCurveBranch (Conv(64→32) + Conv(32→24), 8 iter pixel-wise)。Mod6 最终形式：从 refine 特征 h(64ch) 用 2 层 Conv 预测 per-pixel α ∈ ℝ^{B×8×3×H×W}，在 SGRF S2→S3 之间施加 ZeroDCE 曲线。零初始化 → Phase 1 为 identity。pixel-wise α 可逐像素自适应提亮强度（暗区更强、亮区保持），不再需要 bias_map 的空间补偿。
 
-10. **NDPN/MCPN 辅助监督 (Flight7.2)**：L_ndpn_aux = 1−SSIM(img_s1, GT)，L_mcpn_aux = L1(img_s2, GT)，权重 0.2/0.1。Flight7.1 中 NDPN/MCPN γ 完全冻结 40 epoch——因为 S1/S2 输入被 detach 截断且 Stage B 的 residual_head 零初始化。辅助损失绕过 Stage A/B 梯度流，直接将 SSIM/L1 监督施加在 S1/S2 输出端，为 NDPN（通过 S1 delta）和 MCPN（通过 S2 delta）恢复独立的学习信号。这是 Flight7.1→Flight7.2 的核心改进。
+11. **WFR 路由重构 (Flight7.2+WFR)**：WFR 从"主路径滤器"降级为"残差增强信号"。TCA 主输入改为 Encoder 原始特征（完整信息用于帧间对齐 + DWT 下采样到 H/2），WFR feat_tca 通过可学习的 `wfr_lambda`（初始=0）注入残差 `sace_out += wfr_feat_tca × wfr_lambda`。DPE 同时接收 WFR feat_tfde（时域统计）和 Encoder 中心帧特征（提供原始纹理上下文，concat 到统计量后进入 ms_branch）。设计原则：光源分离（WFR）不再以牺牲信息量为代价——Decoder 级模块各自有权访问完整特征，WFR 提供增量而非替代。
 
 ---
 

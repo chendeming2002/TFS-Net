@@ -1,4 +1,4 @@
-# TFS-Net v6 Delta Flight7.2+WFR 整体架构图 (2026-07-16)
+# TFS-Net v6 Delta Flight7.2+WFR 整体架构图 (2026-07-17, final)
 
 ## 图一：最简架构 (含 Flight3 Phase-Dependent + 三部保险)
 
@@ -14,15 +14,15 @@ flowchart TD
     end
 
     subgraph 诊断["退化估计 (Flight3: 纯空域多尺度)"]
-        TFDE["DPE<br/>多尺度空洞卷积 (d=1,2,4)<br/>时域统计 [μ,σ,SNR] → s_illum + s_noise"]
+        TFDE["DPE (Flight7.2: feat_tfde + Enc center)<br/>WFR feat_tfde(μ,σ,SNR) + Enc center → MultiScale → s_illum + s_noise"]
     end
 
     subgraph 对齐["时序对应对齐"]
-        TCA["TCA<br/>MVC-Shift + SpatialWKV2D<br/>4方向空间扫描 Bi-WKV<br/>→ F_out_list + C_omega + F_t_aligned"]
+        TCA["TCA (Flight7.2: Enc主输入 + WFR残差)<br/>Encoder feats → +MVC-Shift+SpatialWKV2D+ChannelMix → sace_out<br/>+ WFR feat_tca × wfr_λ → 残差注入<br/>→ C_omega_list + F_t_aligned"]
     end
 
     subgraph 处理层["三源退化并行建模<br/>Phase 1: NDPN/MCPN 截断=0"]
-        ISPN["ISPN 光照源处理 (Mod6: spatial curve + gain only)<br/>f_enc + s_illum → h(64ch) → curve_α(8iter pixel-wise) + gain<br/>curve: Conv(64→32)→GELU→Conv(32→24)→A ∈ (B,8,3,H,W)<br/>gain=0.5+softplus*(max-0.5)/softplus(4)∈[0.5,max]<br/>Mod6: bias removed — curve provides additive correction"]
+        ISPN["ISPN 光照源处理 (Flight7.2+WFR: TCC 6iter 4×↓ + gain)<br/>f_enc + s_illum → h(64ch) → A(3ch×4×↓) + gain([0.5,2.0])<br/>TCC: A∈[-4,4] × 6iter → α_target收敛<br/>gain: Conv(64→16)→Conv(16→1)→sigmoid"]
         NDPN["NDPN 噪声处理 (Phase 1 = zero, γ=0.01)"]
         MCPN["MCPN 运动补偿 (Phase 1 = zero, γ=0.01)<br/>Mod3: gamma=0.01, refine=0, startup_gate=1"]
     end
@@ -32,15 +32,17 @@ flowchart TD
     end
 
     subgraph 执行层["SGRF 阶段式修复融合 (Mod4: ZeroDCE曲线 + gain/bias)"]
-        SGRF["SGRF (Mod6: spatial curve + no bias)<br/>S1: δ₁=zero-mean(StageBlock(f_noise)), gate=0 → img_s1<br/>S2: δ₂=zero-mean(StageBlock(f_motion)), gate=0 → img_s2<br/>S2.5: ZeroDCE_curve(img_s2, A(xy)), pixel-wise 8 iter → img_curved<br/>S3: img_curved × gain → res_t (Mod6: bias removed)"]
+        SGRF["SGRF (Flight7.2+WFR: Stage A/B)<br/>Stage A: S1(zero-mean δ) → S2(zero-mean δ) → TCC×6 → gain → img_lit<br/>Stage B: sg[img_lit] + residual_head(NDPN+MCPN)×scale → res_t<br/>Aux: L_ndpn(SSIM→img_s1), L_mcpn(L1→img_s2)"]
     end
 
     OUT["输出 res_t"]
 
     IN --> ENC
     ENC --> SWD
+    ENC -- "Encoder feats" --> TCA
+    ENC -- "Enc center" --> TFDE
     SWD -- "feat_tfde" --> TFDE
-    SWD -- "feat_tca" --> TCA
+    SWD -- "feat_tca(WFR residual)" --> TCA
     TFDE -- "s_illum" --> ISPN
     TFDE -- "s_noise" --> NDPN
 
@@ -66,14 +68,14 @@ flowchart TD
 - **Mod3 γ=0.01**：NDPN 和 MCPN 的 γ 从 Flight3 的 0.001 提升到 0.01——Phase 1.5/2 允许 10× 更强的梯度流过噪声/运动分支。配合 CXG 路由修复 (SGRF 接收 CXG 门控特征)，gamma 直接影响最终输出。
 - **Mod5 StageBlock 零均值约束**：δ = δ - mean(δ)。强制 S1/S2 的 delta 每通道空间均值为零——StageBlock 只能重新排列像素（去噪/去模糊），不能改变整体亮度。所有亮度变化必须走 curve → gain 路径，阻止 S2 抄近路成为主要提亮器（f3mk5mod1 中 S2 delta 有 12× 的非零均值）。
 
-### Flight3 多阶段训练策略
+### Flight7.2+WFR 多阶段训练策略
 
 | 阶段 | Epoch | lr | NDPN/MCPN | SGRF gate | 损失项 |
 |------|-------|-----|-----------|-----------|--------|
-| Phase 1 Warmup | 0-4 | 8e-6→8e-4 | zero | gate=0 | pix+ssim+illum+gain_sup+wfr_reg+ifpn(align+diag) |
-| Phase 1 Main | 5-9 | 6e-4 | zero (γ=0.01) | gate=0 | 同上 |
-| Phase 1.5 | 10-29 | 6e-4→4e-4 | 线性 0→100% | 渐进学习 | 同上 |
-| Phase 2 | 30-89 | 4e-4→0.16e-4 | 100%+CXG | 已学习 | +perceptual(SSIM→S1,VGG→S2)+freq+inter (diag_prior取消) |
+| Phase 1 Warmup | 0-4 | 8e-6→8e-4 | zero | gate=0 | pix+ssim+illum+gain_sup+wfr_reg+ifpn |
+| Phase 1 Main | 5-10 | 6e-4 | zero (γ=0.01) | gate=0 | 同上 |
+| Phase 1.5 | 11-30 | 6e-4→4e-4 | 线性 0→100% | 渐进 | +L_ndpn_aux+L_mcpn_aux+L_gamma_reg |
+| Phase 2 | 31-85 | 4e-4→1.6e-5 | 100%+CXG | 已学习 | +percep+freq+inter (diag_prior取消) |
 
 ---
 
@@ -289,11 +291,12 @@ SGRF gate         →  零 (四重保险: 分支零 × gate零 × unlock零 × c
 | **CXG routing** | output unused | output unused | **Mod3: CXG→SGRF (不再pass-through)** |
 | **Phase 2 启动** | 剧烈扰动 | PSNR 18→8.7 暴跌 | **三重保险 (无扰动)** |
 | **Phase 1.5** | 5 epoch (20-25) | 同 | **20 epoch (10-30)** |
-| **参数** | 1.69M | 1.69M | **1.47M** |
+| **参数** | 1.69M | 1.69M | **1.55M** |
 | **DPE head** | — | 直接Sigmoid→饱和 | **LayerNorm+零初始化** |
-| **ISPN gain** | — | exp→梯度异常 | **softplus+动态max_gain, base 0.5** |
+| **DPE input** | feats only | 同 | **feat_tfde + Enc center concat (Flight7.2)** |
+| **TCA input** | feat_tca (WFR) | 同 | **Encoder主输入 + WFR残差 (Flight7.2)** |
+| **ISPN gain** | — | exp→梯度异常 | **sigmoid [0.5,2.0], bias=0** |
 | **WFR HF** | — | noise_gate 误分流 | **共享HF, proj隐式分化** |
-| **CurveBranch** | — | — | **Mod6: spatial Conv(64→32→24), pixel-wise 8 iter (24ch)** |
-| **StageBlock δ** | 自由均值 | 自由均值 | **Mod5: δ=δ-mean(δ), 零均值约束** |
-| **S3 formula** | img×gain+bias | 同 | **Mod6: img_curved×gain, bias removed** |
-| **Epochs** | — | 90 | **100** |
+| **CurveBranch** | — | — | **TCC: 3ch 4×↓ 6iter, A∈[-4,4] (Flight7.2)** |
+| **Stage A/B** | — | — | **Flight7.2: sg[img_lit]+residual+aux loss** |
+| **Epochs** | — | 90 | **85** |
