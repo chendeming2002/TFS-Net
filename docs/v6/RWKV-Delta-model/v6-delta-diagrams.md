@@ -1,6 +1,6 @@
-# TFS-Net v6 Delta Flight8 整体架构图 (2026-07-17, current)
+# TFS-Net v6 Delta Flight9 整体架构图 (2026-07-20, current)
 
-## 图一：最简架构 (Flight8 Multi-Scale + 帧缓存)
+## 图一：简化架构 (No WFR, Single-Scale DPE, H/2 TCA)
 
 ```mermaid
 flowchart TD
@@ -8,389 +8,168 @@ flowchart TD
         IN["多帧低光输入<br/>x : (B, T, 3, H, W)"]
     end
 
-    subgraph 编码分流["编码 + 小波分流 (Flight8: multi-scale)"]
-        ENC["Encoder (逐帧)<br/>→ l1_lat(64,H,W), l2_lat(64,H/2), l3_lat(64,H/4)<br/>Flight8: skip FPN, 多尺度输出 + LRU帧缓存"]
-        WFR["WFR 小波特征路由器 (l1_lat)<br/>HaarDWT → alpha(LL) + HF_cat<br/>→ feat_tca (H/2) — Flight8: 仅TCA残差路径"]
+    subgraph 编码["Encoder (多尺度直连)"]
+        ENC["PyramidEncoder → 三尺度 lateral<br/>l1_lat(64,H,W), l2_lat(64,H/2), l3_lat(64,H/4)<br/>+ LRU帧缓存(64帧) + 训练batch编码 b×T"]
     end
 
-    subgraph 诊断["退化估计 (Flight8: 3-stage progressive scan)"]
-        DPE["DPE<br/>l3@H/4 → l2@H/2 → l1@H (coarse-to-fine)<br/>+ gray(RGB.mean) + lum(RGB.max) per stage<br/>+ cls_token(零初始化) → head → s_illum, s_noise"]
+    subgraph 诊断["DPE (Flight9: single-scale softplus)"]
+        DPE["DPE @ H/4<br/>l3_lat → 时域统计(μ,σ,SNR) + gray/lum<br/>→ Conv→GELU→DWConv→LayerNorm<br/>→ IllumHead(softplus+s_max, base=0.3, max=3.0)<br/>→ NoiseHead(sigmoid, zero-init)<br/>Loss: L_spatial(-log std) + L_tv(edge-aware)"]
     end
 
-    subgraph 对齐["时序对应对齐 (Flight8: Internal FPN + Full-Res WKV)"]
-        TCA["TCA<br/>Internal FPN: l3→l2→l1 bottom-up → full-res(256×256)<br/>+ MVC-Shift + SpatialWKV2D + ChannelMix → sace_out<br/>+ WFR feat_tca × wfr_λ → 残差注入<br/>C_omega: WFR feat_tca @ H/2 → C_omega_list + F_t_aligned"]
+    subgraph 对齐["TCA @ H/2 (Flight9: no WFR, no FPN)"]
+        TCA["TCA: l2_lat(64,H/2,W/2) 直连<br/>→ MVC-Shift(d=1,2,3) → SpatialWKV2D 4方向<br/>→ ChannelMix + γ*residual<br/>C_omega @ H/2 → TemporalAggregation → F_t_aligned<br/>↑ upsample to H×W for NDPN/MCPN"]
     end
 
-    subgraph 处理层["三源退化并行建模<br/>Phase 1: NDPN/MCPN 截断=0"]
-        ISPN["ISPN 光照源处理<br/>f_enc + s_illum → h(64ch)<br/>→ curve_α(3ch×4×↓, 6iter) + gain([0.5,2.0])"]
-        NDPN["NDPN 噪声处理 (Phase 1 = zero, γ=0.01)<br/>C_omega置信度引导 + s_noise注入"]
-        MCPN["MCPN 运动补偿 (Phase 1 = zero, γ=0.01)<br/>window_corr + motion_estimator + compensation"]
+    subgraph 三源["三源并行处理"]
+        ISPN["ISPN @ l1<br/>f_enc + s_illum → TCC 6iter + gain[0.5,2.0]"]
+        NDPN["NDPN (γ≤0.03)<br/>C_omega conf + noise_extract + s_noise<br/>→ f_noise_out"]
+        MCPN["MCPN (γ=0.01)<br/>window_corr + motion_estimator + compensation<br/>→ f_motion_out"]
     end
 
-    subgraph 融合层["CXG 交叉激励门"]
-        CXG["CXG<br/>gate_noise(f_motion)→f_noise_gated<br/>gate_motion(f_noise)→f_motion_gated"]
-    end
-
-    subgraph 执行层["SGRF 阶段式修复融合"]
-        SGRF["SGRF<br/>Stage A: S1(denoise) → S2(deblur) → TCC×6 → gain → img_lit<br/>Stage B: sg[img_lit] + residual_head × tanh(scale) → res_t<br/>Aux losses: L_ndpn(SSIM→img_s1), L_mcpn(L1→img_s2)"]
+    subgraph 融合["CXG + SGRF"]
+        CXG["CXG 交叉激励门<br/>gate_noise(f_motion)→f_noise_gated<br/>gate_motion(f_noise)→f_motion_gated"]
+        SGRF["SGRF 阶段式修复<br/>S1(denoise)→S2(deblur)→TCC×6→gain→img_lit<br/>sg[img_lit]+residual×tanh(β)→res_t<br/>Aux: L_ndpn(SSIM→s1) + L_mcpn(L1→s2)"]
     end
 
     OUT["输出 res_t"]
 
     IN --> ENC
-    ENC -- "l1_lat" --> WFR
-    ENC -- "l1_lat, l2_lat, l3_lat" --> DPE
-    ENC -- "l1_lat, l2_lat, l3_lat" --> TCA
-    WFR -- "feat_tca (WFR residual)" --> TCA
+    ENC -- "l3 (H/4)" --> DPE
+    ENC -- "l2 (H/2)" --> TCA
+    ENC -- "l1 (H)" --> ISPN
     DPE -- "s_illum" --> ISPN
     DPE -- "s_noise" --> NDPN
-
-    TCA -- "tca_out" --> ISPN
-    TCA -- "F_aligned, C_omega, mu, sigma" --> NDPN
-    TCA -- "F_aligned, C_omega, sigma" --> MCPN
-
-    ISPN -- "gain_map + curve_α" --> SGRF
-    NDPN -- "f_noise" --> CXG
-    MCPN -- "f_motion" --> CXG
-    CXG -- "f_noise_gated, f_motion_gated" --> SGRF
-
+    TCA -- "F_aligned↑, C_omega, μ, σ" --> NDPN
+    TCA -- "F_aligned↑, C_omega, σ" --> MCPN
+    ISPN -- "gain + curve_α" --> SGRF
+    NDPN --> CXG
+    MCPN --> CXG
+    CXG --> SGRF
     IN -- "img_center" --> SGRF
     SGRF --> OUT
 ```
 
-### Flight8 关键设计要点
+### Flight9 关键设计点
 
-- **Multi-Scale Encoder (Flight8 核心)**: Encoder 输出 l1_lat(64ch,H,W), l2_lat(64ch,H/2), l3_lat(64ch,H/4) 三尺度特征。取消 FPN 融合——各模块直接从最适合的尺度取特征。
-- **DPE 3-Stage Scan**: 粗 → 细 渐进扫描：Stage1(l3@H/4) → upsample → Stage2(l2@H/2) → upsample → Stage3(l1@H) + cls_token → head。每阶段 concat gray(RGB.mean) + lum(RGB.max) 物理先验，补偿 WFR 丢失的全局光照信息。
-- **TCA Internal FPN + Full-Res WKV**: 内部自底向上聚合 l3→l2→l1 → 256×256 全分辨率 WKV 扫描。batch_size=2 + grad_accum=8 (eff=16) 支撑全分辨率。C_omega 仍在 WFR feat_tca @ H/2 计算（对齐精度足够）。
-- **LRU Frame Cache**: 推理滑动窗口复用 4/5 encoder+WFR 特征，LRU 淘汰上限 64 帧 (~1.6GB)。训练路径 batch 编码 B*T 帧一次性通过。
-- **零初始化 sigmoid 末端**: NDPN.conf_proj, NDPN.denoise_strength, MCPN.motion_estimator, MCPN.comp_gate 四层 sigmoid 前 Conv/Linear 全部 weight+bias=0 → 初始输出 0.5，防训练早期饱和。
+- **取消 WFR**: Encoder l1/l2/l3 三尺度直连替代小波分流—l3(H/4)天然低频→DPE, l2(H/2)中等分辨率→TCA, l1(H)全分辨率→ISPN/NDPN/MCPN
+- **DPE softplus+soft_clamp**: s_illum 不再是 [0,1] 概率而是连续光照强度(base=0.3, asymptotic max=3.0)。softplus 提供全值域非零梯度, soft_clamp x/(1+x/s_max) 物理上界
+- **L_illum_spatial**: `-log(std(s_illum) + 1e-6)` — std→0 时损失→∞, 根除常数解(比 sigmoid 的"鼓励极值"梯度方向更合理)
+- **TCA H/2**: 128×128 WKV扫描, batch=4 恢复样本多样性(vs Flight8 batch=2), accum=4 保持 eff=16
+- **Gamma clamp**: NDPN.gamma = clamp(gamma_raw, max=0.03), 防止 DPE 饱和期间 gn 暴走
 
-### Flight8 多阶段训练策略 (epochs=100)
+### 多阶段训练策略 (epochs=80)
 
-| 阶段 | Epoch | lr | NDPN/MCPN | SGRF gate | 损失项 |
-|------|-------|-----|-----------|-----------|--------|
-| Phase 1 Warmup | 0-4 | 8e-6→8e-4 | zero | gate=0 | pix+ssim+illum+gain_sup+wfr_reg+ifpn |
-| Phase 1 Main | 5-10 | 6e-4 | zero (γ=0.01) | gate=0 | 同上 |
-| Phase 1.5 | 11-35 | 6e-4→4.4e-4 | 线性 0→100% | 渐进 | +L_ndpn_aux+L_mcpn_aux+L_gamma_reg |
-| Phase 2 | 36-100 | 4e-4→1.6e-5 | 100%+CXG | 已学习 | +percep+freq+inter (diag_prior取消) |
-
-## 图一：最简架构 (含 Flight3 Phase-Dependent + 三部保险)
-
-```mermaid
-flowchart TD
-    subgraph 输入
-        IN["多帧低光输入<br/>x : (B, T, 3, H, W)"]
-    end
-
-    subgraph 编码分流["编码 + 小波分流"]
-        ENC["Encoder<br/>3级金字塔编码 → F_stack"]
-        SWD["WFR 小波特征路由器<br/>HaarDWT → alpha(LL) + HF_cat(两路共享, Flight3取消噪声门控)<br/>→ feat_tfde (光照+噪声) H/2<br/>→ feat_tca (光照无关+结构) H/2"]
-    end
-
-    subgraph 诊断["退化估计 (Flight3: 纯空域多尺度)"]
-        TFDE["DPE (Flight7.2: feat_tfde + Enc center)<br/>WFR feat_tfde(μ,σ,SNR) + Enc center → MultiScale → s_illum + s_noise"]
-    end
-
-    subgraph 对齐["时序对应对齐"]
-        TCA["TCA (Flight7.2: Enc主输入 + WFR残差)<br/>Encoder feats → +MVC-Shift+SpatialWKV2D+ChannelMix → sace_out<br/>+ WFR feat_tca × wfr_λ → 残差注入<br/>→ C_omega_list + F_t_aligned"]
-    end
-
-    subgraph 处理层["三源退化并行建模<br/>Phase 1: NDPN/MCPN 截断=0"]
-        ISPN["ISPN 光照源处理 (Flight7.2+WFR: TCC 6iter 4×↓ + gain)<br/>f_enc + s_illum → h(64ch) → A(3ch×4×↓) + gain([0.5,2.0])<br/>TCC: A∈[-4,4] × 6iter → α_target收敛<br/>gain: Conv(64→16)→Conv(16→1)→sigmoid"]
-        NDPN["NDPN 噪声处理 (Phase 1 = zero, γ=0.01)"]
-        MCPN["MCPN 运动补偿 (Phase 1 = zero, γ=0.01)<br/>Mod3: gamma=0.01, refine=0, startup_gate=1"]
-    end
-
-    subgraph 融合层["CXG 交叉激励门<br/>Phase 1: bypass<br/>Phase 1.5: ratio激活<br/>Phase 2: 正常"]
-        CXG["CXG<br/>Mod3: 输出 f_noise_gated, f_motion_gated → SGRF<br/>training:动态交叉调制<br/>infer:静态重参数化"]
-    end
-
-    subgraph 执行层["SGRF 阶段式修复融合 (Mod4: ZeroDCE曲线 + gain/bias)"]
-        SGRF["SGRF (Flight7.2+WFR: Stage A/B)<br/>Stage A: S1(zero-mean δ) → S2(zero-mean δ) → TCC×6 → gain → img_lit<br/>Stage B: sg[img_lit] + residual_head(NDPN+MCPN)×scale → res_t<br/>Aux: L_ndpn(SSIM→img_s1), L_mcpn(L1→img_s2)"]
-    end
-
-    OUT["输出 res_t"]
-
-    IN --> ENC
-    ENC --> SWD
-    ENC -- "Encoder feats" --> TCA
-    ENC -- "Enc center" --> TFDE
-    SWD -- "feat_tfde" --> TFDE
-    SWD -- "feat_tca(WFR residual)" --> TCA
-    TFDE -- "s_illum" --> ISPN
-    TFDE -- "s_noise" --> NDPN
-
-    TCA -- "F_aligned_list" --> ISPN
-    TCA -- "F_aligned, C_omega, mu, sigma" --> NDPN
-    TCA -- "F_aligned, C_omega, sigma" --> MCPN
-
-    ISPN -- "gain_map + curve_α" --> SGRF
-    NDPN -- "f_noise (Zero if Phase1)" --> CXG
-    MCPN -- "f_motion (Zero if Phase1)" --> CXG
-    CXG -- "f_noise_gated, f_motion_gated" --> SGRF
-
-    IN -- "img_center" --> SGRF
-    SGRF --> OUT
-```
-
-### 框架要点
-
-- **WFR 子带分流 (Flight3: 取消噪声门控)**：HaarDWT 在子带级分离 LL→光照/噪声 (DPE), HF→结构 (TCA)。alpha_net(LL) 可学习 α ∈ (0,1) 分配 LL，受 `(ᾱ-0.7)²` 弱正则（允许 DPE 获取更多 LL）。HF 两路共享，各自 proj 层独立学习。
-- **DPE (Flight3 简化)**：移除 FrequencyBranch/LFF/phase_conf，用多尺度空洞卷积 (d=1,2,4) 提取时域统计量 [μ,σ,SNR] 的空域特征。梯度路径从 `feats→LFF→DWT→phase→s_noise` 简化为 `feats→统计量→Conv→head`。
-- **ISPN (Mod6: spatial curve, pixel-wise, 8 iter)**：SpatialCurveBranch——refine 特征 h (64ch) → Conv(64→32)+GELU+Conv(32→24) → Tanh → per-pixel A ∈ (B,8,3,H,W)。在 SGRF S2→S3 之间施加 ZeroDCE 曲线 I_{n+1}=I_n+A_n·I_n·(1-I_n)。零初始化 → Phase 1 为 identity。gain 基值 0.5，gain_sup 目标改为 GT/img_s2。Mod6 移除 bias_map——曲线 $I+\alpha·I·(1-I)$ 提供有界加性修正，无需独立 bias。
-- **TCA 空间扫描**：输入 WFR 的 H/2 特征。MVC-Shift(3 dilated DWConv) → 4方向 Bi-WKV → Channel Mix → H 上采样。C_omega 行 softmax 归一化，L_diag_prior Phase 1 自监督 (Phase 2 取消)。
-- **Mod3 γ=0.01**：NDPN 和 MCPN 的 γ 从 Flight3 的 0.001 提升到 0.01——Phase 1.5/2 允许 10× 更强的梯度流过噪声/运动分支。配合 CXG 路由修复 (SGRF 接收 CXG 门控特征)，gamma 直接影响最终输出。
-- **Mod5 StageBlock 零均值约束**：δ = δ - mean(δ)。强制 S1/S2 的 delta 每通道空间均值为零——StageBlock 只能重新排列像素（去噪/去模糊），不能改变整体亮度。所有亮度变化必须走 curve → gain 路径，阻止 S2 抄近路成为主要提亮器（f3mk5mod1 中 S2 delta 有 12× 的非零均值）。
-
-### Flight7.2+WFR 多阶段训练策略
-
-| 阶段 | Epoch | lr | NDPN/MCPN | SGRF gate | 损失项 |
-|------|-------|-----|-----------|-----------|--------|
-| Phase 1 Warmup | 0-4 | 8e-6→8e-4 | zero | gate=0 | pix+ssim+illum+gain_sup+wfr_reg+ifpn |
-| Phase 1 Main | 5-10 | 6e-4 | zero (γ=0.01) | gate=0 | 同上 |
-| Phase 1.5 | 11-30 | 6e-4→4e-4 | 线性 0→100% | 渐进 | +L_ndpn_aux+L_mcpn_aux+L_gamma_reg |
-| Phase 2 | 31-85 | 4e-4→1.6e-5 | 100%+CXG | 已学习 | +percep+freq+inter (diag_prior取消) |
+| 阶段 | Epoch | lr | NDPN/MCPN | 损失项 |
+|------|-------|-----|-----------|--------|
+| Phase 1 Warmup | 0-4 | 8e-6→8e-4 | zero | pix+ssim+illum+gain_sup+L_spatial+L_tv+ifpn |
+| Phase 1 Main | 5-10 | 6e-4 | zero (γ=0.01) | 同上 |
+| Phase 1.5 | 11-25 | 6e-4→4.4e-4 | 线性 0→100% | +L_ndpn_aux+L_mcpn_aux+L_gamma_reg |
+| Phase 2 | 26-80 | 4e-4→1.6e-5 | 100%+CXG | +percep+freq+inter (diag_prior取消) |
 
 ---
 
-## 图二：带细节架构
+## 图二：详细架构
 
 ```mermaid
 flowchart TD
-    IN["多帧低光输入<br/>x : (B, T, 3, H, W)"]
+    IN["多帧低光输入"]
 
-    subgraph Encoder["Encoder (Flight8: Multi-Scale)"]
-        ENC["PyramidEncoder [32,64,96]<br/>→ l1_lat(64,H,W), l2_lat(64,H/2), l3_lat(64,H/4)<br/>Flight8: 取消FPN融合, 输出三尺度 lateral"]
+    subgraph Encoder["Encoder"]
+        ENC["PyramidEncoder [32,64,96]<br/>→ l1(64,H,W), l2(64,H/2), l3(64,H/4)"]
     end
 
-    subgraph SWD["WFR 小波特征路由器"]
-        direction TB
-        DWT["HaarDWT2D<br/>→ LL, LH, HL, HH (H/2×W/2)"]
-        ALPHA["alpha_net(LL)<br/>DWConv3x3 → GELU → Conv1x1 → Sigmoid<br/>α ∈ (0,1) — 光照分配比"]
-        LL_DIV["LL分流: α·LL → DPE<br/>(1-α)·LL + IN → TCA"]
-        HF_SHARED["HF完整共享 (Flight3: 取消noise_gate)<br/>cat(LH,HL,HH) → 两路各自 proj"]
-        PROJ["proj_tfde/proj_tca: Conv(4C→C)+GELU+LN<br/>→ feat_tfde, feat_tca (B,T,C,H/2,W/2)"]
-        DWT --> ALPHA --> LL_DIV
-        DWT --> HF_SHARED
-        LL_DIV --> PROJ
-        HF_SHARED --> PROJ
+    subgraph DPE["DPE (H/4, softplus)"]
+        DPE_STATS["时域统计: GroupNorm→soft-median(μ),var(σ),μ/σ(SNR)"]
+        DPE_PRIOR["物理先验: gray=I.mean, lum=I.max→downsample"]
+        DPE_FUSE["Concat[3C+2]→proj(C/1)→DWConv+GELU→LayerNorm"]
+        DPE_ILLUM["IllumHead: Conv1x1→softplus+base(0.3)→soft_clamp(max=3.0)"]
+        DPE_NOISE["NoiseHead: Conv1x1→sigmoid(zero-init)"]
+        DPE_STATS --> DPE_FUSE
+        DPE_PRIOR --> DPE_FUSE
+        DPE_FUSE --> DPE_ILLUM
+        DPE_FUSE --> DPE_NOISE
     end
 
-    subgraph TFDE["DPE 退化估计器 (Flight3: 纯空域)"]
-        direction TB
-        TFDE_STATS["时域统计量<br/>GroupNorm → soft-median(μ), var(σ), μ/σ(SNR)<br/>→ concat[μ,σ,SNR] (B, 3C, H, W)"]
-        TFDE_MS["MultiScaleSpatialBranch<br/>3×3(d=1): 局部纹理 → mid ch<br/>3×3(d=2): 中尺度光照 → mid ch<br/>3×3(d=4): 大尺度区域 → wide ch<br/>Concat + 1×1 fuse → F_fused"]
-        TFDE_HD["LayerNorm → Conv(→2ch,零初始化) → Sigmoid<br/>s_illum = [:,0:1], s_noise = [:,1:2]"]
-        TFDE_STATS --> TFDE_MS --> TFDE_HD
+    subgraph TCA["TCA (H/2, l2直连)"]
+        TCA_MVC["MVC-Shift: 3 DWConv(d=1,2,3)+1×1"]
+        TCA_WKV["SpatialWKV2D: 4方向Bi-WKV(H/V/对角)<br/>pre_norm→R/K/V→BiWKV(cumsum=256,e^w<1)<br/>→σ(R)⊙wkv→proj_out(zero-init)→post_norm"]
+        TCA_CM["ChannelMix: LN→Conv(64→256)→GELU→Conv(256→64)"]
+        TCA_CORR["CorrGen: proj_qk→cosine_sim→/τ→softmax→C_omega"]
+        TCA_AGG["TempAgg: C_omega warp→frame_gate→softmax→F_t_aligned"]
+        TCA_MVC --> TCA_WKV --> TCA_CM --> TCA_CORR --> TCA_AGG
     end
 
-    subgraph TCA["TCA 时序对应对齐"]
-        direction TB
-
-        subgraph TCA_SPATIAL["空间扫描 Bi-WKV"]
-            TCA_MVC["MVC-Shift<br/>3分支空洞DWConv(d=1,2,3) + 1x1融合"]
-            TCA_WKV["SpatialWKV2D<br/>4方向(chunk=4) H/V/主对角/副对角<br/>pre_norm → R/K/V proj → BiWKV cumsum<br/>→ σ(R)⊙wkv → proj_out → post_norm"]
-            TCA_CM["Channel Mix<br/>LN → Conv(64→256)→GELU→Conv(256→64) + γ×residual"]
-            TCA_UP["上采样 H/2→H → tca_out (B,T,64,H,W)"]
-            TCA_MVC --> TCA_WKV --> TCA_CM --> TCA_UP
-        end
-
-        subgraph TCA_TEMP["时序对应 + 聚合"]
-            TCORR["TemporalCorrespondence<br/>proj_qk(Q,K:64→16) → cosine_sim<br/>÷ softplus(tau)+0.05 → softmax(dim=-1)<br/>→ C_omega_list: (T-1)×(B,N,N) N=ds², ds≤96"]
-            TAGG["TemporalAggregation<br/>C_omega warp 邻帧 → frame_gate 加权<br/>→ upsample + LN → F_t_aligned (B,64,H,W)"]
-            TCORR --> TAGG
-        end
-
-        TCA_SPATIAL --> TCORR
+    subgraph ISPN["ISPN"]
+        ISPN_REF["refine: Conv(f_enc+s_illum)→GELU→Conv→GELU→h"]
+        ISPN_CURVE["SpatialCurveBranch: h→Conv→GELU→Conv→Tanh→A(B,6,3,H,W)"]
+        ISPN_GAIN["gain_head: Conv→GELU→Conv→softplus, base=0.5→[0.5,2.0]"]
+        ISPN_REF --> ISPN_CURVE
+        ISPN_REF --> ISPN_GAIN
     end
 
-    subgraph ISPN["ISPN 光照源处理 (Mod6: spatial curve + gain only)"]
-        direction TB
-        ISPN_REFINE["refine: Conv(f_enc + s_illum, 65→64)<br/>→ GELU → Conv(64→64) → GELU → h"]
-        ISPN_CURVE["Mod6 SpatialCurveBranch: h → Conv(64→32)→GELU→Conv(32→24)→ Tanh<br/>→ A (B, 8iter, 3ch, H, W) pixel-wise | 零初始化 → identity"]
-        ISPN_GAIN["gain_head: Conv(64→16)→GELU→Conv(16→1)<br/>→ softplus(raw_gain), base=0.5"]
-        ISPN_REFINE --> ISPN_CURVE
-        ISPN_REFINE --> ISPN_GAIN
+    subgraph NDPN["NDPN (γ≤0.03)"]
+        NDPN_CONF["conf_proj: diag(C_omega)→Linear→GELU→Linear→Sigmoid(zero-init)"]
+        NDPN_NOISE["noise_extract: concat(enc,F_align)→Conv→GELU→Conv<br/>denoise_strength: concat(noise,conf)→Conv→GELU→Conv→Sigmoid(zero-init)"]
+        NDPN_OUT["f_noise = enc - γ·noise·strength + noise_proj(s_noise)"]
+        NDPN_CONF --> NDPN_NOISE --> NDPN_OUT
     end
 
-    subgraph NDPN["NDPN 噪声退化处理 (Phase 1: zero截断)"]
-        NDPN_CONF["conf_proj: C_omega diag → conf_map<br/>noise_extract: |enc - F_t_aligned| → residual"]
-            NDPN_STR["f_noise = enc - γ·residual·strength + noise_proj(s_noise)<br/>γ=0.01 → f_noise含实际降噪成分 (Mod3: 10× stronger)"]
-        NDPN_CONF --> NDPN_STR
+    subgraph MCPN["MCPN (γ=0.01)"]
+        MCPN_MOT["motion_estimator: diag(C_omega)→Conv→GELU→Conv→Sigmoid(zero-init)"]
+        MCPN_COMP["comp_gate: concat(center,motion)→Conv→GELU→Conv→Sigmoid(zero-init)"]
+        MCPN_FUSE["g_t·center+(1-g_t)·omega+γ·delta·comp→refine→output"]
+        MCPN_MOT --> MCPN_COMP --> MCPN_FUSE
     end
 
-    subgraph MCPN["MCPN 运动补偿处理 (Phase 1: zero截断, Flight3 静默启动)"]
-        MCPN_MOT["motion_estimator + window_corr → f_omega_aligned"]
-        MCPN_GATE["gate + startup_bias → g_t (初→1.0)<br/>f_fuse = g_t·f_center + (1-g_t)·f_omega + 0.01·δ"]
-        MCPN_REF["refine(conv2=0) + f_center·out_scale(0)<br/>→ f_motion≈f_center (pass-through)"]
-        MCPN_MOT --> MCPN_GATE --> MCPN_REF
-    end
-
-    subgraph CXG["CXG 交叉激励门 (Phase 2 启用)"]
-        CXG_G["gate_noise(f_motion) → f_noise_gated<br/>gate_motion(f_noise) → f_motion_gated"]
-    end
-
-    subgraph SGRF["SGRF 阶段式修复融合 (Flight3: zero-gate + gain/bias)"]
-        direction LR
-        SGRF_S1["S1: Denoise<br/>f_noise_gated + img_center<br/>→ StageBlock(gate=0) → img_s1"]
-        SGRF_S2["S2: Deblur<br/>f_motion_gated + img_s1<br/>→ StageBlock(gate=0) → img_s2"]
-        SGRF_CURVE["S2.5 (Mod6): ZeroDCE Curve (pixel-wise)<br/>img_s2 += A_n·img_s2·(1-img_s2)<br/>8 iterations, A(xy) predicted from h"]
-        SGRF_S3["S3: Brighten (Mod6: no bias)<br/>img_curved × gain_map<br/>+ refine(0-gate) → clamp → res_t"]
+    subgraph SGRF["SGRF (Stage A/B)"]
+        SGRF_S1["S1 Denoise: f_noise_gated+img→StageBlock(gate=0)→soft_clamp"]
+        SGRF_S2["S2 Deblur: f_motion_gated+img_s1→StageBlock(gate=0)→soft_clamp"]
+        SGRF_TCC["S2.5 TCC: img_s2+=A_n·img_s2·(1-img_s2)×6iter"]
+        SGRF_S3["S3 Brighten: img_curved×gain→refine→res_t"]
+        SGRF_S1 --> SGRF_S2 --> SGRF_TCC --> SGRF_S3
     end
 
     OUT["输出 res_t"]
 
     IN --> ENC
-    ENC --> DWT
-    PROJ -- "feat_tfde" --> TFDE_STATS
-    PROJ -- "feat_tca" --> TCA_MVC
-    TFDE_HD -- "s_illum" --> ISPN_REFINE
-    TFDE_HD -- "s_noise" --> NDPN_STR
-    TCA_UP -- "F_aligned_list" --> ISPN_REFINE
-    TCA_TEMP -- "F_t_aligned" --> ISPN_REFINE
-    TCA_TEMP -- "C_omega" --> NDPN_CONF
-    TCA_TEMP -- "C_omega" --> MCPN_MOT
-    ISPN_CURVE -- "curve_α" --> SGRF_CURVE
+    ENC -- "l3" --> DPE_STATS
+    ENC -- "l2" --> TCA_MVC
+    ENC -- "l1" --> ISPN_REF
+    DPE_ILLUM -- "s_illum" --> ISPN_REF
+    DPE_NOISE -- "s_noise" --> NDPN_OUT
+    TCA_AGG -- "F_aligned↑" --> NDPN_NOISE
+    TCA_CORR -- "C_omega" --> NDPN_CONF
+    TCA_CORR -- "C_omega" --> MCPN_MOT
+    ISPN_CURVE -- "curve_α" --> SGRF_TCC
     ISPN_GAIN --> SGRF_S3
-    NDPN_STR -- "f_noise" --> CXG_G
-    MCPN_REF -- "f_motion" --> CXG_G
-    CXG_G -- "f_noise_gated" --> SGRF_S1
-    CXG_G -- "f_motion_gated" --> SGRF_S2
+    NDPN_OUT --> SGRF_S1
+    MCPN_FUSE --> SGRF_S2
     IN -- "img_center" --> SGRF_S1
-    SGRF_S1 --> SGRF_S2 --> SGRF_CURVE --> SGRF_S3 --> OUT
+    SGRF_S3 --> OUT
 ```
 
-### TCA 空间扫描详解 (Flight8: Internal FPN + Full-Res WKV)
-
-```
-feat_tca (B,T,C,H/2,W/2) from WFR — WFR残差信号 (H/2)
-l1_lat, l2_lat, l3_lat from Encoder — 多尺度 lateral features
-  │
-  ├─ [Internal FPN] l3 → l2 → l1 bottom-up aggregation → full-res x_flat (B*T,64,H,W)
-  │     Flight8: 全分辨率 WKV 扫描, batch=2 + accum=8 补偿显存
-  │
-  ├─ [MVC-Shift] 3分支空洞DWConv(d=1,2,3) + 1x1混频 → x_shifted
-  │
-  ├─ [SpatialWKV2D] 4方向 Bi-WKV (full-res H×W)
-  │     ├─ Split C→4 heads × C/4
-  │     ├─ pre_norm (LayerNorm)
-  │     ├─ Head0/H1/H2/H3: 水平/垂直/主对角/副对角扫描
-  │     ├─ 每方向独立 BiWKV (chunk-wise cumsum=256, e^w<1 强制衰减)
-  │     └─ Concat 4 heads → σ(R)⊙wkv → proj_out → post_norm
-  │
-  ├─ [Channel Mix] LN → Conv(C→4C) → GELU → Conv(4C→C) → + x * gamma
-  │
-  ├─ [WFR Residual] + feat_tca (upsampled to H) × wfr_lambda (λ=0 at init)
-  │     → sace_out (B,T,C,H,W)
-  │
-  ├─ [TemporalCorrespondence] on WFR feats @ H/2 (对齐够用, 节省C_omega显存)
-  │     proj_qk (C→C/4) → cosine_sim → ÷ softplus(tau)+0.05 → softmax(dim=-1)
-  │     → C_omega_list: [(B, ds², ds²) × (T-1)], ds=min(H,W)//4 capped≤96
-  │
-  └─ [TemporalAggregation] on full-res sace_out @ H
-        C_omega × neighbor_ds → warp → frame_gate → softmax加权
-        → upsample + residual + LayerNorm → F_t_aligned (B,C,H,W)
-```
-
-### Flight3 五重零保证 (Mod5: zero-mean约束)
-
-```
-Phase 1 → Phase 1.5 → Phase 2 过渡
-
-NDPN:   f_noise  = f_enc - 0.01·noise·strength + noise_proj(s_noise)
-          γ=0.01 → CXG-gated output → SGRF (Mod3: CXG路由修复)
-          noise_proj 零初始化 → 第二项 = 0
-
-MCPN:   g_t = sigmoid(raw_gate + startup_gate=1) → ≈0.73
-          f_fuse = g_t·f_center + (1-g_t)·f_omega + δ·0.01
-          refine(conv2=0, out_scale=0) → f_motion ≈ f_center
-
-SGRF:   StageBlock gate = 0 → delta = 0 → img unchanged
-        Mod5: δ = zero-mean(ConvBlock(f_branch, img)·gate) → brightening forbidden
-        Mod4: curve_α=0 (零初始化) → curve=identity → 无扰动
-                ↓
-           五重零保证: 分支零 × gate零 × unlock零 × curve零 × delta零均值
-           Phase 2 启动时输出 ≡ Phase 1 输出
-```
-
-### Flight3 损失函数架构
-
-```
-                    Phase 1 Warmup (0-4)         Phase 1 Main (5-9)
-                    ─────────────────────        ─────────────────────
-res_t    ←→ GT  ─→  pix (PECharbonnier)          pix
-                    ssim (1-SSIM)                 ssim
-gain_map ← GT/I̅ ─→  gain_sup (L1, 0.5× 固定权重)   gain_sup
-s_illum          ─→  illum_smooth (edge-TV)       illum_smooth
-WFR α            ─→  wfr_reg (0.001固定)          wfr_reg
-C_omega          ─→                               align_warp (L1 warp一致性)
-                                                  diag_prior (-log(diag)自监督)
-NDPN/MCPN         →  零截断 (不参与训练)
-CXG               →  bypass (不参与训练)
-SGRF gate         →  零 (四重保险: 分支零 × gate零 × unlock零 × curve零)
-
-                    Phase 1.5 (10-29)             Phase 2 (30-89)
-                    ─────────────────────        ────────────────────
-                    损失同上, NDPN/MCPN           img_s1 ←→ GT → ssim_s1
-                    线性unlock_ratio              img_s2 ←→ GT → perc_s2 (VGG)
-                    SGRF gate 渐进学习             img_s2×gain ← GT → inter
-                    CXG: ratio>0.3启用            res_t ←→ GT → freq (FFT L1)
-                                                  diag_prior Phase 2 取消
-                            all via Kendall UW (learnable log_vars)
-```
-
-### 数值稳定性保证
+### 数值稳定性
 
 | 组件 | 措施 |
 |------|------|
-| **BiWKV** | `w = -F.softplus(spatial_decay)` → e^w < 1 恒衰减 |
-| **BiWKV** | chunk-wise cumsum (CHUNK=256), `k.clamp(-8,8)`, `v.clamp(-8,8)` |
-| **SpatialWKV2D** | `pre_norm` LayerNorm 在 R/K/V 投影前, R/K/V RWKV-7 小初始化 |
-| **SWD** | proj_tfde/proj_tca 后 LayerNorm → IntensityHead norm≈1 |
-| **SWD** | alpha_net: sigmoid初始≈0.6 (bias≈0.4) → 偏TFDE但不极端 |
+| **DPE IllumHead** | softplus (`log(1+e^x)` 梯度>0 全值域) + soft_clamp `x/(1+x/s_max)` asymptotic max |
+| **L_illum_spatial** | `-log(std+1e-6)` → 零方差损失∞, 强制空间分布 |
+| **L_illum_tv** | `|∇s|·exp(-10|∇I|)` → 边缘处允许突变, 平坦区强制平滑 |
+| **BiWKV** | `w = -F.softplus(spatial_decay)` → e^w < 1 恒衰减, chunk-wise cumsum(256) |
 | **Tau** | `F.softplus(tau_raw) + 0.05` → 下界 0.05 防除零 |
-| **C_omega** | ds capped ≤ 96 → N≤9216 → C_omega≤340MB, 防OOM |
-| **diag_prior** | `C_omega.diag().clamp(min=1e-6)` → -log防数值爆炸 |
-| **gain_map** | `softplus(raw_gain).clamp(1.0, max_gain)` → 物理合理范围 |
-| **bias_map** | — | — | **Mod6: removed — curve provides additive correction** |
+| **Gamma** | NDPN.gamma = clamp(raw, max=0.03) → 硬上限防暴走 |
+| **C_omega** | ds capped ≤ 96 → N≤9216 → C_omega≤340MB |
 
-### Flight8 vs Flight7.2 核心差异
+### Flight9 vs 前代核心差异
 
-| 维度 | Flight7.2+WFR | **Flight8** |
-|------|---------------|-----------|
-| **Encoder** | FPN fused (H×W) | **Multi-scale l1/l2/l3 (64ch each)** |
-| **DPE** | 单尺度 multi-dilation | **3-stage coarse-to-fine + gray/lum + cls_token** |
-| **TCA** | Enc feats + WFR残差 H/2 WKV | **Internal FPN + Full-res(H) WKV + WFR残差** |
-| **WKV res** | H/2 (128×128) | **Full H×W (256×256)** |
-| **WFR** | feat_tfde + feat_tca | **仅 feat_tca (DPE已直连encoder)** |
-| **batch** | 4/2 → eff=8 | **2/8 → eff=16** |
-| **Params** | 1.55M | **1.85M** |
-| **Epochs** | 85 | **100** |
-| **Cache** | 无 | **LRU frame_cache (64帧)** |
-
-### Flight7.2+WFR vs Flight3 差异 (已过期)
-
-| 维度 | Mark1 | Mark3 | **Flight3** |
-|------|-------|-------|-----------|
-| **TFDE** | Spatial+Freq+LFF | 同Mark1 | **纯空域多尺度空洞卷积** |
-| **ISPN** | 多帧cosine attention | 同Mark1 | **gain/bias Retinex 头** |
-| **SGRF Stage3** | lit_up_map×(1+A_illu) | 同Mark1 | **img×gain+bias** |
-| **StageBlock** | 标准ResBlock | 同Mark1 | **zero-gate 零初始化** |
-| **MCPN** | 随机初始化 | startup_gate=1 | **gamma=0.01 + refine=0** |
-| **NDPN** | gamma=0 | 同 | **gamma=0.01 (10x 梯度)** |
-| **L_diag_prior** | Phase 1+2 | Phase 1+2 | **Phase 1 only (P2取消)** |
-| **L_wfr_reg** | — | (ᾱ-0.5)² | **(ᾱ-0.7)²** |
-| **L_gamma_reg** | — | — | **relu(0.005−|γ|) 防坍缩 (Mod3)** |
-| **CXG routing** | output unused | output unused | **Mod3: CXG→SGRF (不再pass-through)** |
-| **Phase 2 启动** | 剧烈扰动 | PSNR 18→8.7 暴跌 | **三重保险 (无扰动)** |
-| **Phase 1.5** | 5 epoch (20-25) | 同 | **20 epoch (10-30)** |
-| **参数** | 1.69M | 1.69M | **1.55M** |
-| **DPE head** | — | 直接Sigmoid→饱和 | **LayerNorm+零初始化** |
-| **DPE input** | feats only | 同 | **feat_tfde + Enc center concat (Flight7.2)** |
-| **TCA input** | feat_tca (WFR) | 同 | **Encoder主输入 + WFR残差 (Flight7.2)** |
-| **ISPN gain** | — | exp→梯度异常 | **sigmoid [0.5,2.0], bias=0** |
-| **WFR HF** | — | noise_gate 误分流 | **共享HF, proj隐式分化** |
-| **CurveBranch** | — | — | **TCC: 3ch 4×↓ 6iter, A∈[-4,4] (Flight7.2)** |
-| **Stage A/B** | — | — | **Flight7.2: sg[img_lit]+residual+aux loss** |
-| **Epochs** | — | 90 | **85** |
+| 维度 | Flight7.2 | Flight8 | **Flight9** |
+|------|-----------|---------|-----------|
+| **WFR** | feat_tfde + feat_tca | feat_tca 残差 | **取消 (Encoder直连)** |
+| **DPE激活** | sigmoid | sigmoid | **softplus+soft_clamp** |
+| **DPE尺度** | 单尺 multi-dilation | 3-stage cascade | **单尺 H/4** |
+| **TCA WKV** | H/2 128×128 | H 256×256 | **H/2 128×128** |
+| **TCA输入** | WFR+Enc feats | Internal FPN+WFR | **l2_lat 直连** |
+| **batch/accum** | 4/2 | 2/8 | **4/4** |
+| **Loss** | UW-only | UW-only | **+L_spatial+L_tv** |
+| **Gamma** | 无限制 | 无限制 | **≤0.03** |
+| **Epochs** | 85 | 100→ep22终止 | **80** |

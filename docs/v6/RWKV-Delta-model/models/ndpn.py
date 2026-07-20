@@ -85,8 +85,12 @@ class NDPN(nn.Module):
         nn.init.zeros_(self.denoise_strength[-2].weight)
         nn.init.zeros_(self.denoise_strength[-2].bias)
 
-        # Flight3: γ=0.001 → gradient flows through noise branch without visible output
-        self.gamma = nn.Parameter(torch.full((1, channels, 1, 1), 0.01))
+        # Flight3: γ=0.01 → gradient flows through noise branch without visible output
+        self.gamma_raw = nn.Parameter(torch.full((1, channels, 1, 1), 0.01))
+
+    @property
+    def gamma(self):
+        return self.gamma_raw.clamp(max=0.03)
 
     def forward(
         self,

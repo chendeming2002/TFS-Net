@@ -1,32 +1,38 @@
-# TFS-Net v6 Delta Flight8 模型架构设计文档
+# TFS-Net v6 Delta Flight9 模型架构设计文档
 
-> 日期：2026-07-17
-> 版本：v6 Delta Flight8 (current)
-> 训练配置：`configs/delta_flight8.yaml`，batch=2 (accum=8→eff=16), epochs=100
-> 参数量：1.85M
+> 日期：2026-07-20
+> 版本：v6 Delta Flight9 (current)
+> 训练配置：`configs/delta_flight9.yaml`，batch=4 (accum=4→eff=16), epochs=80
+> 参数量：~1.5M (取消 WFR -25K)
+> 核心变更：取消 WFR, DPE sigmoid→softplus, TCA H/2, L_illum_spatial+tv, gamma clamp
 
 ---
 
 ## 1. 概述
 
-TSD-Net (Tri-Source Decoupled Network) 是一个端到端多帧低光视频增强网络，基于 **TSDR (Tri-Source Decoupled Restoration)** 框架。核心思想是**时域差分引导的三源解耦 → 并行重建 → 阶段式融合**。
+TFS-Net (Tri-Source Fusion & Synthesis Network) 是一个端到端多帧低光视频增强网络。Flight9 核心变更:
+1. **取消 WFR** — Encoder l1/l2/l3 直连各模块,天然频率分离
+2. **DPE softplus** — sigmoid→softplus+soft_clamp,单尺度 H/4,根除饱和
+3. **TCA H/2** — 128×128 WKV, batch=4 恢复样本多样性
+4. **L_illum_spatial + L_illum_tv** — 反零方差 + 边缘感知 TV
+5. **Gamma clamp** — NDPN gamma max=0.03
 
-| 模块 | 缩写 | 功能 |
+| 模块 | 缩写 | Flight9 功能 |
 |------|------|------|
-| **WFR** | Wavelet Feature Router | Haar DWT 子带级分流 (LL→光照/噪声, HF→结构) — Flight3取消噪声门控 |
-| **DPE** | Degradation Prior Estimator | 3-stage coarse-to-fine scan (l3@H/4→l2@H/2→l1@H) + gray(RGB.mean)+lum(RGB.max) physics priors |
-| **TCA** | Temporal Correspondence & Alignment | Internal FPN(l3→l2→l1 bottom-up) → full-res 4方向空间 WKV 扫描 + C_omega 时序矩阵 |
-| **ISPN** | Illumination-Source Processing Network | TCC曲线(3ch×4×↓) + pixel-wise gain(1.25→[0.5,2.0], Flight6: DOF反转) |
-| **NDPN** | Noise Degradation Processing Network | C_omega 置信度引导去噪 (γ=0.01 → 10× stronger gradient flow) |
-| **MCPN** | Motion Compensation Processing Network | C_omega 运动强度补偿 (gamma=0.01, startup→pass-through) |
-| **CXG** | Cross-eXcitation Gate | 去噪↔运动 交叉激励门 (Mod3: 输出喂入SGRF, 不再pass-through原始NDPN/MCPN) |
-| **SGRF** | Stage-wise Guided Restoration & Fusion | S1:去噪 → S2:去模糊 → S2.5:TCC曲线(Flight5:6 iter, α收敛) → S3:soft_clamp(gain×img) |
+| **Encoder** | PyramidEncoder | 3级金字塔 → l1(64,H,W), l2(64,H/2), l3(64,H/4) 多尺度直连 |
+| **DPE** | Degradation Prior Estimator | 单尺度 H/4, softplus+s_max_clamp, L_spatial+L_tv 反饱和 |
+| **TCA** | Temporal Correspondence & Alignment | H/2 WKV 扫描 (l2_lat 直连) + C_omega 时序矩阵 |
+| **ISPN** | Illumination-Source Processing Network | TCC曲线(3ch×4×↓) + pixel-wise gain([0.5,2.0]) |
+| **NDPN** | Noise Degradation Processing Network | C_omega 置信度引导去噪 (γ clamp≤0.03) |
+| **MCPN** | Motion Compensation Processing Network | C_omega 运动补偿 (gamma=0.01, startup→pass-through) |
+| **CXG** | Cross-eXcitation Gate | 去噪↔运动 交叉激励门 |
+| **SGRF** | Stage-wise Guided Restoration & Fusion | S1:去噪→S2:去模糊→TCC×6→gain→res_t |
 
 ### 命名变更总表
 
 | 原缩写 | 新缩写 | 中文全名 |
 |--------|--------|----------|
-| DWT-LFF | **WFR** | 小波特征路由器 |
+| DWT-LFF | **Encoder直连** | 多尺度 Encoder 替代小波分流 |
 | TFSI | **DPE** | 退化先验估计器 |
 | SACE | **TCA** | 时序对应对齐 |
 | IFPN | **ISPN** | 光照源处理网络 |
@@ -34,34 +40,29 @@ TSD-Net (Tri-Source Decoupled Network) 是一个端到端多帧低光视频增�
 | IGRF | **SGRF** | 阶段式引导修复融合 |
 | CrossFusionGate | **CXG** | 交叉激励门 |
 
-### 完整数据流 (Flight8)
+### 完整数据流 (Flight9)
 
 ```
 输入: I_{t-2}, I_{t-1}, I_t, I_{t+1}, I_{t+2}  (T=5 窗口)
   │
-  ├─→ Encoder (逐帧) → l1_lat(64ch,H,W), l2_lat(64ch,H/2), l3_lat(64ch,H/4)
-  │     Flight8: skip FPN, 输出多尺度 lateral features
+  ├─→ Encoder → l1_lat(64,H,W), l2_lat(64,H/2), l3_lat(64,H/4)  多尺度直连
   │
-  ├─→ WFR(l1_lat) → feat_tca (H/2×W/2) — HaarDWT 子带分流
-  │
-  ├─→ DPE(l1_lat, l2_lat, l3_lat, I_t) → s_illum, s_noise
-  │     Flight8: 3-stage progressive scan (l3@H/4→l2@H/2→l1@H) + gray/lum priors
+  ├─→ DPE(l3_lat, I_t) → s_illum(softplus), s_noise(sigmoid)
+  │     Flight9: 单尺度 H/4, softplus+soft_clamp(max=3.0), L_spatial 反零方差
   │     s_illum → ISPN   s_noise → NDPN
   │
-  ├─→ TCA(feat_tca, encoder_lats) → tca_out, C_{t,Ω}, \hat{F}_t, μ, σ
-  │     Flight8: internal FPN(l3→l2→l1 bottom-up) → full-res WKV @ 256×256
-  │              ChannelMix → sace_out + WFR residual
-  │              C_omega from WFR feat_tca at H/2
+  ├─→ TCA(l2_lat) → tca_out(B,T,C,H/2,W/2), C_{t,Ω}, \hat{F}_t, μ, σ
+  │     Flight9: H/2 WKV 直连, 无 internal FPN, 无 WFR 残差
+  │     ↑ upsample to H×W for NDPN/MCPN/SGRF
   │
-  ├─→ ISPN(f_enc, s_illum) → curve_alpha (per-pixel), gain_map
-  ├─→ NDPN({F^{\text{out}}}, s_noise, μ, σ, C_{t,Ω}, \hat{F}_t) → f_noise_out
-  ├─→ MCPN({F^{\text{out}}}, σ, C_{t,Ω}, \hat{F}_t) → f_motion_out
+  ├─→ ISPN(l1_center, s_illum) → curve_α, gain_map
+  ├─→ NDPN({F_out}, s_noise, μ, σ, C_{t,Ω}, \hat{F}_t) → f_noise_out  (γ≤0.03)
+  ├─→ MCPN({F_out}, σ, C_{t,Ω}, \hat{F}_t) → f_motion_out
   │
   ├─→ CXG(f_noise_out, f_motion_out) → f_noise_gated, f_motion_gated
   │
   └─→ SGRF(gain, f_noise_gated, f_motion_gated, I_t, curve_A)
         Stage A: S1→S2→TCC×6→gain→img_lit,  Stage B: sg[img_lit]+residual→res_t
-        Aux losses: L_ndpn(SSIM→img_s1), L_mcpn(L1→img_s2)
 ```
 
 ---
@@ -246,7 +247,7 @@ $$\hat{F}_t = \text{LN}\left(F_t^{\text{out}} + \sum_{t' \in \Omega} w_{t'} \cdo
 
 **核心设计原则总结**：TCA 不是简单地将变压器注意力换成 WKV——它是 RWKV 架构模式的完整 Vision 实例化。通过将"时间混合+通道混合"的范式从 1D 语言序列适配到 2D 空间+时序对应，TCA 在低光视频中为后续的 NDPN（去噪）和 MCPN（运动补偿）提供了既有时序对齐保真度、又有 RWKV 线性复杂度优势的特征表示。
 
-### 2.3 WFR — 空域小波分流 (Flight3: 取消 HF 噪声门控, Flight8: 仅输出 feat_tca)
+### 2.3 DPE — 退化先验估计器 (Flight9: softplus + L_spatial 反饱和)
 
 **动机**。旧 DWT-LFF 通过 IDWT 重建全分辨率特征，两条分支接收几乎相同的信息（仅 LL 略有差异），退化分离失效。
 
@@ -410,7 +411,7 @@ l1_lat(B,C,H,W)
 **Mark4 问题**: Sigmoid 前无归一化 → F_fused 幅值失控 → s_illum=1.0 饱和。
 **Flight3 修复**: LayerNorm + head 零初始化 → 初始输出 0.5，训练中可自由学习。
 
-### 3.3 TCA — 时序对应对齐 (Flight8: Internal FPN + Full-Res WKV)
+### 3.3 TCA — 时序对应对齐 (Flight9: H/2 WKV 直连, 无 internal FPN)
 
 **文件**: `models/modules/pure_rwkv_sace.py`
 
@@ -527,7 +528,8 @@ feat_tca (B,T,C,H/2,W/2) from WFR — 半分辨率, 节省 4× WKV 计算量
 | **v6 Delta Mark2** | **Kendall不确定性加权 + PE Loss + 感知解耦 + 损失调度** | **1.69M** | 收敛停滞 |
 | **v6 Delta Mark3** | **两阶段渐进训练 + ISPN 隔离 + SGRF 中间监督 + 相位调度** | **1.69M** | PSNR 18→8.7 |
 | **v6 Delta Flight7.2+WFR** | **Encoder→TCA主输入+WFR残差, DPE concat Enc center, aux监督, TCC 4×↓, Stage A/B** | **1.55M** | PSNR 17.10@ep80 |
-| **v6 Delta Flight8** | **Multi-scale encoder(l1/l2/l3), DPE 3-stage scan+gray/lum, TCA internal FPN+full-res WKV, batch=2 grad_accum=8** | **1.85M** | **训练中** |
+| **v6 Delta Flight8** | Multi-scale encoder, DPE 3-stage+gray/lum, TCA internal FPN+full-res WKV, batch=2 accum=8 | 1.85M | 提前终止 (dpe_si=0.92/0.00) |
+| **v6 Delta Flight9** | **取消WFR, DPE softplus单尺度H/4, TCA H/2, L_illum_spatial+tv, gamma clamp, batch=4** | **~1.5M** | **训练中** |
 
 ---
 
@@ -625,41 +627,41 @@ $$L_{\text{total}} = \sum_{i} \frac{1}{2\exp(s_i)} L_i + \frac{1}{2}s_i$$
 
 | 参数 | 值 | 说明 |
 |------|-----|------|
-| batch_size | 2 (accum=8) | eff batch=16 (full-res WKV support) |
-| grad_accum_steps | **8** | 等效 batch=16 |
-| epochs | 100 | P1 Warmup(0-4)+P1 Main(5-10)+P1.5(11-35)+P2(36-100) |
+| batch_size | 4 (accum=4) | eff batch=16 |
+| grad_accum_steps | **4** | 等效 batch=16 |
+| epochs | 80 | P1W(0-4)+P1(5-10)+P1.5(11-25)+P2(26-80) |
 | lr (Phase 1 Warmup) | 8e-6 → 8e-4 | 线性 warmup |
 | lr (Phase 1 Main) | 6e-4 | 固定 |
-| lr (Phase 1.5) | 6e-4 → 4.4e-4 | 线性过渡 (25 epoch) |
-| lr (Phase 2) | 4e-4 → 1.6e-5 | 阶梯衰减 (65 epoch) |
-| max_gain ramp | 4→16 over 30 epoch | Flight3 I: 匹配新 Phase 1.5 |
+| lr (Phase 1.5) | 6e-4 → 4.4e-4 | 线性过渡 (15 epoch) |
+| lr (Phase 2) | 4e-4 → 1.6e-5 | 阶梯衰减 (55 epoch) |
 | optimizer | AdamW | — |
 | weight_decay | 1e-4 | L2 正则 |
 | grad_clip | 0.5 | 梯度裁剪 |
+| L_illum_spatial | 0.1 | 反零方差 (DPE 防饱和) |
+| L_illum_tv | 0.05 | 边缘感知 TV |
+| gamma clamp (NDPN) | max=0.03 | 防暴走 |
 
-### 7.2 相位判定函数
-
-**文件**: `train.py`
+### 7.2 相位判定函数 (epochs=80)
 
 ```python
 def get_phase(epoch):
     if epoch < 5:   return 'phase1_warmup'
     elif epoch < 11: return 'phase1'
-    elif epoch < 36: return 'phase1_5'
+    elif epoch < 26: return 'phase1_5'
     else:            return 'phase2'
 
 def get_unlock_ratio(epoch):
     if epoch < 11: return 0.0
-    if epoch >= 36: return 1.0
-    return (epoch - 11) / 25.0  # 线性 0→1 over 25 epochs
+    if epoch >= 26: return 1.0
+    return (epoch - 11) / 15.0
 
 def get_lr(epoch, base_lr=8e-4):
     if epoch < 5:   return base_lr * (0.01 + 0.99 * epoch / 5)
     elif epoch < 11: return 0.75 * base_lr
-    elif epoch < 36: return base_lr * 0.75 * (1 - (epoch - 11) / 25 * 0.33)
-    elif epoch < 66: return base_lr * 0.5
-    elif epoch < 82: return base_lr * 0.125
-    elif epoch < 92: return base_lr * 0.05
+    elif epoch < 26: return base_lr * 0.75 * (1 - (epoch - 11) / 15 * 0.33)
+    elif epoch < 51: return base_lr * 0.5
+    elif epoch < 65: return base_lr * 0.125
+    elif epoch < 73: return base_lr * 0.05
     else:            return base_lr * 0.02
 ```
 
@@ -694,27 +696,21 @@ elif phase == 'phase2':
 ### 7.5 训练监控
 
 ```bash
-tail -f outputs/sdsd_f8/train.log
-grep "Train stats" outputs/sdsd_f8/train.log | tail -20
-grep "non-finite\|NaN" outputs/sdsd_f8/train.log
+tail -f outputs/sdsd_f9/train.log
+grep "diag:" outputs/sdsd_f9/train.log | tail -10
+grep "Val stats" outputs/sdsd_f9/train.log | tail -10
 ```
 
-### Flight8 与 Flight7.2 核心差异
+### Flight9 关键设计决策
 
-| 维度 | Flight7.2+WFR | **Flight8** |
-|------|---------------|-----------|
-| **Encoder 输出** | FPN fused (H×W) | **Multi-scale l1/l2/l3 lateral (64ch each)** |
-| **DPE 输入** | feat_tfde + Enc center | **l1_lat, l2_lat, l3_lat + gray/lum priors** |
-| **DPE 架构** | 单尺度 multi-dilation | **3-stage coarse-to-fine scan + cls_token** |
-| **TCA 输入** | Enc feats (H×W) + WFR残差 | **Internal FPN(l3→l2→l1) → full-res(H) + WFR残差** |
-| **WKV 分辨率** | H/2 (128×128) | **Full-res H×W (256×256)** |
-| **C_omega 计算** | TCA内部 @ 降采样 | **WFR feat_tca @ H/2 (对齐够用)** |
-| **WFR 输出** | feat_tfde + feat_tca | **仅 feat_tca (DPE已直连encoder)** |
-| **batch/accum** | 4/2 → eff=8 | **2/8 → eff=16** |
-| **参数量** | 1.55M | **1.85M (+300K in DPE 3-stage + TCA FPN)** |
-| **Epochs** | 85 | **100** |
-| **DPE health** | s_illum→1.0 饱和 | **灰度+亮度先验 + ds_init 0.5** |
-| **帧缓存** | 无 | **LRU frame_cache (64帧), 滑动窗口复用80%** |
+| 决策 | 动机 | 文献支持 |
+|------|------|---------|
+| DPE sigmoid→softplus | 光照是线性/连续的(sigmoid S形梯度→极值吸引子) | IllumFlow (2025): illumination≈linear parametric |
+| 取消 3-stage cascade | 级联放大饱和(每级 sigmoid 推高前级输出) | NID-LLIE (2026): stabilize intermediate representations |
+| 取消 WFR | 多尺度 Encoder 已是天然频域分离器(l3=低频,l1=高频) | EvLIR (2025): 无小波分流, 达 25.63dB SDSD |
+| TCA 回退 H/2 | full-res 256 需 batch=2→样本多样性↓50% | EvLIR: 局部时序建模足够, 全局依赖过度设计 |
+| L_illum_spatial | -log(std) 无限惩罚零方差 | QRetinex-Net (2025): freq-aware regularization |
+| Gamma clamp 0.03 | DPE 饱和→NDPN gamma 暴走 5× 补偿 | Dynamic Nonlinear Net (2026): explicit noise-illum coupling |
 
 ---
 
@@ -722,9 +718,8 @@ grep "non-finite\|NaN" outputs/sdsd_f8/train.log
 
 | 文件 | 模块 |
 |------|------|
-| `models/modules/swd.py (legacy)` | WFR (Wavelet Feature Router, HaarDWT2D) |
-| `models/modules/pure_rwkv_sace.py` | TCA, BiWKV, SpatialWKV2D, MVCShift, TemporalCorrespondence, TemporalAggregation |
-| `models/modules/tfsi_v2.py` | DPE, MultiScaleSpatialBranch |
+| `models/modules/tfsi_v2.py` | DPE (softplus IllumHead, single-scale H/4) |
+| `models/modules/pure_rwkv_sace.py` | TCA (H/2 WKV, l2_lat 直连) |
 | `models/modules/ispn_v2.py` | ISPN (Mod6: SpatialCurveBranch + gain_head, bias removed) |
 | `models/modules/ifpn.py` | ISPN (legacy, Mark3) |
 | `models/modules/ndpn.py` | NDPN |
@@ -733,4 +728,4 @@ grep "non-finite\|NaN" outputs/sdsd_f8/train.log
 | `models/tfs_net.py` | CXG, TFSNet (数据流编排) |
 | `losses/losses.py` | TFSNetLoss (Kendall UW + gain_sup + Phase Schedule) |
 | `train.py` | 训练循环 (grad accum + phase lr + metric logging + frame_cache管理) |
-| `configs/delta_flight8.yaml` | 训练配置 (batch=2, accum=8, epochs=100) |
+| `configs/delta_flight9.yaml` | 训练配置 (batch=4, accum=4, epochs=80) |

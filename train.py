@@ -147,6 +147,9 @@ def build_loss(cfg, device):
         lambda_ifpn_sup=loss_cfg.get("lambda_ifpn_sup", 0.0),
         # v6 Bravo P0-1
         lambda_pix=loss_cfg.get("lambda_pix", 1.0),
+        # Flight9: DPE anti-collapse + edge-aware illumination
+        lambda_illum_spatial=loss_cfg.get("lambda_illum_spatial", 0.1),
+        lambda_illum_tv=loss_cfg.get("lambda_illum_tv", 0.05),
     )
     return criterion.to(device)
 
@@ -332,21 +335,21 @@ def main():
     def get_phase(epoch):
         if epoch < 5:   return 'phase1_warmup'
         elif epoch < 11: return 'phase1'
-        elif epoch < 36: return 'phase1_5'
+        elif epoch < 26: return 'phase1_5'
         else:            return 'phase2'
 
     def get_unlock_ratio(epoch):
         if epoch < 11: return 0.0
-        elif epoch < 36: return (epoch - 11) / 25.0   # linear 0→1 over 25 epochs
+        elif epoch < 26: return (epoch - 11) / 15.0   # linear 0→1 over 15 epochs
         else: return 1.0
 
     def get_lr(epoch, base=cfg["train"]["lr"]):
         if epoch < 5: return base * (0.01 + 0.99 * epoch / 5)
         elif epoch < 11: return base * 0.75
-        elif epoch < 36: return base * 0.75 * (1 - (epoch - 11) / 25 * 0.33)
-        elif epoch < 66: return base * 0.5
-        elif epoch < 82: return base * 0.125
-        elif epoch < 92: return base * 0.05
+        elif epoch < 26: return base * 0.75 * (1 - (epoch - 11) / 15 * 0.33)
+        elif epoch < 51: return base * 0.5
+        elif epoch < 65: return base * 0.125
+        elif epoch < 73: return base * 0.05
         else: return base * 0.02
     scaler = GradScaler(enabled=cfg["train"]["amp"] and device.type == "cuda")
     grad_clip = cfg["train"].get("grad_clip", 1.0)
@@ -448,7 +451,7 @@ def main():
         # Phase transition actions
         if epoch == 10:
             logger.info("Phase 1.5: Unlocking NDPN/MCPN/CXG")
-        if epoch == 35:
+        if epoch == 25:
             logger.info("Phase 2: Full tri-source restoration")
 
         train_stats = train_one_epoch(
@@ -495,7 +498,7 @@ def main():
             os.path.join(output_dir, "latest.pth"),
         )
         # Flight3 Mod3: per-phase checkpoint saving
-        phase_ckpt_map = {5: "phase1_warmup.pth", 10: "phase1.pth", 35: "phase15.pth"}
+        phase_ckpt_map = {5: "phase1_warmup.pth", 10: "phase1.pth", 25: "phase15.pth"}
         if epoch + 1 in phase_ckpt_map:
             phase_path = os.path.join(output_dir, phase_ckpt_map[epoch + 1])
             save_checkpoint(

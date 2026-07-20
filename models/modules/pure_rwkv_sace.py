@@ -302,21 +302,21 @@ class TemporalAggregation(nn.Module):
 # 6. PureRWKVSACE — Charlie-Mark4 完整模块
 # ============================================================
 class TCA(nn.Module):
-    """TCA (Mark1): 时间对应与对齐 — SWD 已降采样，无需内部再降
+    """TCA (Flight9): WKV @ H/2, direct l2_lat input, no internal FPN.
 
-    Args:
-        channels: 特征通道数 (默认 64)
-        num_frames: 帧数 T (默认 5)
+    Flight9 changes:
+      - Cancel WFR: input is encoder l2_lat (H/2) directly, no feat_tca residual
+      - Remove internal FPN — WKV stays at H/2 (128×128)
+      - Remove wfr_lambda parameter
+      - C_omega computed on the same l2_lat feature resolution
     """
 
-    def __init__(self, channels: int = 64, num_frames: int = 5,
-                 lff_module=None, n_layer: int = 1):
+    def __init__(self, channels: int = 64, num_frames: int = 5):
         super().__init__()
         self.channels = channels
         self.num_frames = num_frames
         self.center_idx = num_frames // 2
 
-        # --- 帧内空间处理 ---
         self.mvc_shift = MVCShift(channels)
         self.spatial_wkv = SpatialWKV2D(channels)
         self.channel_mix = nn.Sequential(
@@ -325,62 +325,32 @@ class TCA(nn.Module):
             nn.Conv2d(channels * 4, channels, 1),
         )
         self.spatial_gamma = nn.Parameter(torch.zeros(1, channels, 1, 1))
-        # WFR residual injection scale (init=0, safe start)
-        self.wfr_lambda = nn.Parameter(torch.zeros(1, channels, 1, 1))
 
-        # --- 时序对应 ---
         self.corr_gen = TemporalCorrespondence(channels)
         self.temporal_agg = TemporalAggregation(channels)
 
-    def forward(self, feats: torch.Tensor,
-                encoder_lats: tuple = None,
-                tfsi_out: Dict = None) -> Dict:
+    def forward(self, feats: torch.Tensor) -> Dict:
         """
-        feats: (B, T, C, H/2, W/2) — WFR feat_tca (residual)
-        encoder_lats: (l1_lat(B,T,64,H,W), l2_lat(B,T,64,H/2), l3_lat(B,T,64,H/4)) — Flight8
+        feats: (B, T, C, H/2, W/2) — encoder l2_lat directly (no WFR preprocessing)
         """
         B, T, C, H_ds, W_ds = feats.shape
 
-        # Flight8: internal FPN aggregation → full-res WKV (batch=2 to fit 24GB)
-        if encoder_lats is not None:
-            l1, l2, l3 = encoder_lats
-            H_full, W_full = l1.shape[-2], l1.shape[-1]
-            l1_f = l1.reshape(B*T, 64, H_full, W_full)
-            l2_f = l2.reshape(B*T, 64, H_full//2, W_full//2)
-            l3_f = l3.reshape(B*T, 64, H_full//4, W_full//4)
-            p3 = l3_f
-            p2 = l2_f + F.interpolate(p3, size=l2_f.shape[-2:], mode='bilinear', align_corners=False)
-            p1 = l1_f + F.interpolate(p2, size=l1_f.shape[-2:], mode='bilinear', align_corners=False)
-            x_flat = p1  # (B*T, 64, H, W) — full resolution WKV
-            H, W = H_full, W_full
-        else:
-            H_full, W_full = H_ds * 2, W_ds * 2
-            H, W = H_full, W_full
-            x_flat = feats.reshape(B * T, C, H_ds, W_ds)
-
+        x_flat = feats.reshape(B * T, C, H_ds, W_ds)
         x_shifted = self.mvc_shift(x_flat)
         x_wkv = self.spatial_wkv(x_shifted)
         x_cm = self.channel_mix(x_wkv)
-        wfr_residual = feats.reshape(B * T, C, H_ds, W_ds)
-        if encoder_lats is not None:
-            wfr_residual = F.interpolate(wfr_residual, size=(H, W), mode='bilinear', align_corners=False)
-        sace_out_ds = x_flat + x_cm * self.spatial_gamma + wfr_residual * self.wfr_lambda
-        sace_out = sace_out_ds.reshape(B, T, C, H, W)
+        sace_out_ds = x_flat + x_cm * self.spatial_gamma
+        sace_out = sace_out_ds.reshape(B, T, C, H_ds, W_ds)
 
-        # --- Step 2: 统计量 ---
         mu_t_clean = sace_out[:, self.center_idx]
         sigma_t_clean = sace_out.std(dim=1, unbiased=False)
 
-        # --- Step 3: 时序对应 → C_omega_list (在 H/2 分辨率下计算) ---
-        # Flight8: use WFR feats (H/2) for C_omega — lower res is sufficient for correspondence
-        center_orig = feats[:, self.center_idx]  # WFR feat_tca at H/2
+        center_orig = feats[:, self.center_idx]
         neighbor_idx = [t for t in range(T) if t != self.center_idx]
         neighbor_orig = feats[:, neighbor_idx]
         C_omega_list = self.corr_gen(center_orig, neighbor_orig)
 
-        # --- Step 4: 时序聚合 → F_t_aligned ---
-        # Flight8: full-res sace_out for aggregation, C_omega from feats (H/2)
-        sace_4d = sace_out_ds.reshape(B, T, C, H, W)
+        sace_4d = sace_out_ds.reshape(B, T, C, H_ds, W_ds)
         center_enhanced = sace_4d[:, self.center_idx]
         neighbor_enhanced = sace_4d[:, neighbor_idx]
         F_t_aligned = self.temporal_agg(center_enhanced, neighbor_enhanced, C_omega_list)

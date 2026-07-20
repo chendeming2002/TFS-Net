@@ -211,6 +211,8 @@ class TFSNetLoss(nn.Module):
         freq_phase_weight: float = 0.5,
         lambda_ifpn_sup: float = 0.0,
         lambda_pix: float = 1.0,
+        lambda_illum_spatial: float = 0.1,
+        lambda_illum_tv: float = 0.05,
         # Mark2: uncertainty weighting
         uncertainty_weighting: bool = True,
         use_pe_charbonnier: bool = False,
@@ -234,6 +236,8 @@ class TFSNetLoss(nn.Module):
         self.freq_phase_weight = freq_phase_weight
         self.lambda_ifpn_sup = lambda_ifpn_sup
         self.lambda_pix = lambda_pix
+        self.lambda_illum_spatial = lambda_illum_spatial
+        self.lambda_illum_tv = lambda_illum_tv
 
         # Mark2 flags
         self.uncertainty_weighting = uncertainty_weighting
@@ -294,6 +298,21 @@ class TFSNetLoss(nn.Module):
         grad_i_x = (ref_img[:, :, :, 1:] - ref_img[:, :, :, :-1]).abs().mean(dim=1, keepdim=True)
         grad_i_y = (ref_img[:, :, 1:, :] - ref_img[:, :, :-1, :]).abs().mean(dim=1, keepdim=True)
         return (grad_s_x * torch.exp(-grad_i_x)).mean() + (grad_s_y * torch.exp(-grad_i_y)).mean()
+
+    @staticmethod
+    def _illum_spatial_loss(s_illum: torch.Tensor) -> torch.Tensor:
+        """Flight9: penalize zero spatial variance — -log(std) puts infinite cost on collapse."""
+        std = s_illum.std(dim=[-2, -1]).mean()
+        return -torch.log(std.clamp(min=1e-6))
+
+    @staticmethod
+    def _illum_tv_loss(s_illum: torch.Tensor, ref_img: torch.Tensor) -> torch.Tensor:
+        """Flight9: edge-aware total variation (QRetinex-Net style)."""
+        grad_x = (s_illum[:, :, :, 1:] - s_illum[:, :, :, :-1]).abs()
+        grad_y = (s_illum[:, :, 1:, :] - s_illum[:, :, :-1, :]).abs()
+        grad_i_x = (ref_img[:, :, :, 1:] - ref_img[:, :, :, :-1]).abs().mean(dim=1, keepdim=True)
+        grad_i_y = (ref_img[:, :, 1:, :] - ref_img[:, :, :-1, :]).abs().mean(dim=1, keepdim=True)
+        return (grad_x * torch.exp(-10 * grad_i_x)).mean() + (grad_y * torch.exp(-10 * grad_i_y)).mean()
 
     def schedule_loss_phase(self, epoch: int):
         """Mark2 训练阶段调度 (epoch 边界调用)"""
@@ -363,6 +382,8 @@ class TFSNetLoss(nn.Module):
             L_pix = self._pe_charbonnier(pred, target) if self.use_pe_charbonnier else charbonnier_loss(pred, target)
             L_ssim = 1.0 - ssim_map(pred, target).mean()
             L_illum_smooth = self._edge_aware_smooth(s_illum, target)
+            L_illum_spatial = self._illum_spatial_loss(s_illum)
+            L_illum_tv = self._illum_tv_loss(s_illum, target)
 
             # gain_map supervision (Flight6: pixel-wise target=GT/img_curved, Phase 1 detach)
             L_gain_sup = pred.new_tensor(0.0)
@@ -440,8 +461,10 @@ class TFSNetLoss(nn.Module):
             L_ssim = 1.0 - ssim_map(pred, target).mean()
             L_perc = self.perceptual(pred, target)
 
-        # Illumination smoothness
+        # Illumination smoothness + Flight9 anti-collapse + edge-aware TV
         L_illum_smooth = self._edge_aware_smooth(s_illum, target)
+        L_illum_spatial = self._illum_spatial_loss(s_illum)
+        L_illum_tv = self._illum_tv_loss(s_illum, target)
 
         # s_noise supervision (disabled)
         L_noise_sup = pred.new_tensor(0.0)
@@ -503,20 +526,22 @@ class TFSNetLoss(nn.Module):
                 L_total = self._uw(L_pix, 'pix') + self._uw(L_ssim, 'ssim')
             else:
                 L_total = self.lambda_pix * L_pix + self.lambda_ssim * L_ssim
-            L_total = L_total + self.lambda_illum * L_illum_smooth
+            L_total = L_total + self.lambda_illum * L_illum_smooth + self.lambda_illum_spatial * L_illum_spatial + self.lambda_illum_tv * L_illum_tv
         elif self.uncertainty_weighting:
             L_total = (
                 self._uw(L_pix, 'pix') + self._uw(L_freq, 'freq')
                 + self._uw(L_ssim, 'ssim') + self._uw(L_perc, 'perc')
                 + self._uw(L_illum_smooth, 'illum')
                 + self._uw(L_inter, 'inter')
-                + self._uw(L_align_warp, 'ifpn')  # Phase 2: diag_prior removed
+                + self._uw(L_align_warp, 'ifpn')
                 + 0.5 * L_gain_sup + 0.001 * L_wfr_reg
-                + 0.01 * L_dpe_prior  # Flight3 B: DPE supervision (reduced in Phase 2)
-                + 0.1 * L_gamma_reg  # Flight3 Mod3: gamma anti-collapse
+                + 0.01 * L_dpe_prior
+                + 0.1 * L_gamma_reg
                 + 0.5 * L_lit
-                + 0.1 * L_residual_reg  # Flight7: Stage A supervision + residual reg
-                + 0.2 * L_ndpn_aux + 0.1 * L_mcpn_aux  # Flight7.2: aux losses for NDPN/MCPN
+                + 0.1 * L_residual_reg
+                + 0.2 * L_ndpn_aux + 0.1 * L_mcpn_aux
+                + self.lambda_illum_spatial * L_illum_spatial
+                + self.lambda_illum_tv * L_illum_tv
             )
         else:
             L_total = (

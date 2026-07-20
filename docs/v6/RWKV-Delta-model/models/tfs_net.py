@@ -22,13 +22,11 @@ import torch.nn.functional as F
 
 from models.modules.encoder import PyramidEncoder
 from models.modules.tfsi_v2 import DPE
-from models.modules.swd import WFR
 from models.modules.pure_rwkv_sace import TCA
 from models.modules.ispn_v2 import ISPN
 from models.modules.ndpn import NDPN
 from models.modules.mrpn import MCPN
 from models.modules.igrf import SGRF
-from models.modules.amp_enhance import AmpEnhance
 
 
 class CXG(nn.Module):
@@ -123,11 +121,6 @@ class TFSNet(nn.Module):
 
         # v5.9: AmpEnhance — 图像级频域幅度增强 (Encoder 前处理)
         self.use_amp_enhance = use_amp_enhance
-        if use_amp_enhance:
-            self.amp_enhance = AmpEnhance(in_channels=in_channels, hidden=16, min_amps=0.1)
-        else:
-            self.amp_enhance = None
-
         # Stage 0: PyramidEncoder
         self.encoder = PyramidEncoder(
             in_channels=in_channels,
@@ -136,12 +129,8 @@ class TFSNet(nn.Module):
             num_bottleneck_blocks=num_bottleneck_blocks,
         )
 
-        # Mark1: ISPN 输入投影 (encoder 特征 → 3ch 图像)
-        # Mark1: SWD 空域小波分流 (替代 DWT-LFF)
-        self.wfr = WFR(channels=fused_channels, alpha_init=0.6)
-
         self.dpe = DPE(
-            channels=fused_channels, fused_channels=fused_channels, eps=eps,
+            channels=fused_channels, eps=eps,
             use_soft_median=use_soft_median,
         )
 
@@ -151,15 +140,13 @@ class TFSNet(nn.Module):
         self.ndpn = NDPN(channels=fused_channels)
         self.mcpn = MCPN(channels=fused_channels)
 
-        # Stage 4: CXG 交叉激励门
         self.cxg = CXG(channels=fused_channels)
 
-        # Stage 5: SGRF 阶段式修复融合
         self.sgrf = SGRF(channels=fused_channels, out_channels=in_channels,
                          use_soft_clamp=use_soft_clamp, use_nafblock=use_nafblock,
                          num_res_blocks=num_igrf_res_blocks)
 
-        # 逐帧特征缓存 (key: frame_global_index → {l1_lat, l2_lat, l3_lat, feat_tca})
+        # 逐帧特征缓存 (key: frame_global_index → {l1_lat, l2_lat, l3_lat})
         self.frame_cache: Dict[int, Dict[str, torch.Tensor]] = {}
         self._cache_max_size = 64
         self._cache_access_order: List[int] = []
@@ -229,45 +216,21 @@ class TFSNet(nn.Module):
             l3_lat = l3_flat.reshape(B, T, *l3_flat.shape[1:])
         feats = l1_lat
 
-        # Stage 1: WFR on l1_lat (H×W) → feat_tca (H/2×W/2) with cache
-        if use_cache:
-            feat_tca_list = []
-            for i in range(T):
-                gidx = frame_indices[i]
-                if gidx in self.frame_cache and "feat_tca" in self.frame_cache[gidx]:
-                    feat_tca_list.append(self.frame_cache[gidx]["feat_tca"])
-                    self._cache_access_order.remove(gidx)
-                    self._cache_access_order.append(gidx)
-                else:
-                    fi = l1_list[i]
-                    if fi.dim() == 3:
-                        fi = fi.unsqueeze(0)
-                    wfr_out_i = self.wfr(fi)
-                    ft = wfr_out_i["feat_tca"]
-                    self._cache_put(gidx, "feat_tca", ft)
-                    feat_tca_list.append(ft)
-            feat_tca = torch.cat(feat_tca_list, dim=0).unsqueeze(0)  # (1, T, 64, H/2, W/2)
-        else:
-            feats_flat = l1_lat.reshape(B * T, -1, H, W)
-            wfr_out = self.wfr(feats_flat)
-            feat_tca = wfr_out["feat_tca"].reshape(B, T, -1, H // 2, W // 2)
-
-        # Stage 2: DPE — 3-stage progressive scan with gray/lum priors
-        dpe_out = self.dpe(l1_lat, l2_lat, l3_lat, center_frame=image_center)
+        # Stage 1: DPE — single-scale on l3 (H/4) + softplus illumination head
+        dpe_out = self.dpe(l3_lat, center_frame=image_center)
         s_illum = dpe_out["s_illum"]
-        s_noise_orig = dpe_out["s_noise"]
+        s_noise = dpe_out["s_noise"]
         s_illum = F.interpolate(s_illum, size=(H, W), mode='bilinear', align_corners=False)
-        s_noise = F.interpolate(s_noise_orig, size=(H, W), mode='bilinear', align_corners=False)
+        s_noise = F.interpolate(s_noise, size=(H, W), mode='bilinear', align_corners=False)
 
-        # Stage 3: TCA — internal FPN + full-res WKV
-        tca_out = self.tca(feat_tca, encoder_lats=(l1_lat, l2_lat, l3_lat))
-        F_aligned_list = [tca_out["tca_out"][:, t] for t in range(T)]
+        # Stage 2: TCA — WKV @ H/2 on l2_lat directly (no WFR pre-processing)
+        tca_out = self.tca(l2_lat)
+        F_aligned_list_half = [tca_out["tca_out"][:, t] for t in range(T)]
+        F_aligned_list = [F.interpolate(f, size=(H, W), mode='bilinear', align_corners=False) for f in F_aligned_list_half]
         C_omega_list = tca_out.get("C_omega_list", [])
-        F_t_aligned = tca_out["F_t_aligned"]
-        mu_t_clean = tca_out["mu_t_clean"]
-        sigma_t_clean = tca_out["sigma_t_clean"]
-
-        aligned_feats = torch.stack(F_aligned_list, dim=1)
+        F_t_aligned = F.interpolate(tca_out["F_t_aligned"], size=(H, W), mode='bilinear', align_corners=False)
+        mu_t_clean = F.interpolate(tca_out["mu_t_clean"], size=(H, W), mode='bilinear', align_corners=False)
+        sigma_t_clean = F.interpolate(tca_out["sigma_t_clean"], size=(H, W), mode='bilinear', align_corners=False)
 
         f_enc_center = feats[:, center_idx]
         ispn_out = self.ispn(f_enc_center, s_illum)
