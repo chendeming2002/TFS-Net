@@ -279,10 +279,9 @@ $\alpha_{\text{target}} = \sigma(\alpha_{\text{raw}})$，可学习参数，初�
 
 **关键性质**：曲线永不饱和到 1.0，gain 不需充当刹车。
 
-**空间 gain**：
-$$G = 0.5 + \frac{\text{softplus}(\text{raw})}{\text{softplus}(4)} \cdot (G_{\text{max}} - 0.5)$$
-
-gain_head bias=0.0 → 初始 G≈1.10（近似 identity），配合 TCC 输出≈0.5 → 最终输出≈0.55，合理起点。
+**空间 gain (Flight10: softplus×scale)**：
+$$G = \text{clamp}\left(1.0 + \text{softplus}(\text{raw}) \cdot s_{\text{gain}},\ 1.0,\ 20.0\right)$$
+$s_{\text{gain}}$ 为可学习增益尺度（初始 2.0）。替代旧 sigmoid [0.5, 2.0] 设计——前者不能达到暗图所需 13× 增益。
 
 ### 2.5 NDPN — 噪声退化处理 (对应 $\sigma^2_{\text{img}}$)
 
@@ -327,11 +326,13 @@ $$\mathbf{f}_{\text{motion}}^{\text{out}} = \mathbf{f}_{\text{motion}} \odot \be
 SGRF 拆分为两阶段：**Stage A**（提亮）和 **Stage B**（残差精修）。Flight7 引入 `sg[img_lit]` 隔离梯度。Flight7.2 恢复 NDPN/MCPN 进入 S1/S2 的梯度通路，并通过辅助损失为 NDPN/MCPN 提供独立优化目标。
 
 **Stage A — 提亮**（`igrf.py:162-174`）：
-$$\text{S1: } I_1 = \text{soft\_clamp}(I_t + \delta_1(\mathbf{f}_{\text{noise}}^{\text{out}})), \quad \text{S2: } I_2 = \text{soft\_clamp}(I_1 + \delta_2(\mathbf{f}_{\text{motion}}^{\text{out}}))$$
+$$\text{S1: } I_1 = \text{soft\_clamp}(I_t + \delta_1^{\text{bound}}(\mathbf{f}_{\text{noise}}^{\text{out}})), \quad \text{S2: } I_2 = \text{soft\_clamp}(I_1 + \delta_2^{\text{bound}}(\mathbf{f}_{\text{motion}}^{\text{out}}))$$
+其中 $\delta^{\text{bound}} = \text{min\_delta} + \text{softplus}(\delta - \text{min\_delta})$ 为 Flight10 亮度下界软约束。
 $$\text{TCC: } I_{\text{curved}} = \text{TCC}_6(I_2, A, \alpha_{\text{target}}), \quad \mathbf{I}_{\text{lit}} = \text{soft\_clamp}(I_{\text{curved}} \odot \mathbf{G})$$
 
-**Stage B — 残差精修**（`igrf.py:176-181`）：
-$$\boldsymbol{\delta} = h_\theta(\mathbf{f}_{\text{noise}}^{\text{out}} + \mathbf{f}_{\text{motion}}^{\text{out}}) \cdot \tanh(\beta), \quad \hat{\mathbf{J}} = \text{sg}[\mathbf{I}_{\text{lit}}] + \boldsymbol{\delta}$$
+**Stage B — 残差精修 (Flight10: delta_scale=0.2)**（`igrf.py:187-190`）：
+$$\boldsymbol{\delta} = h_\theta(\mathbf{f}_{\text{noise}}^{\text{out}} + \mathbf{f}_{\text{motion}}^{\text{out}}), \quad \hat{\mathbf{J}} = \text{sg}[\mathbf{I}_{\text{lit}}] + \lambda_{\text{delta}} \cdot \boldsymbol{\delta}$$
+其中 $\lambda_{\text{delta}} = 0.2$ 为可学习尺度参数（初始 0.2）。替代旧 `tanh(β)` 设计——tanh(0)=0 导致梯度死区；delta_scale=0.2 初始输出近零但梯度非零。
 
 **Flight7.2 辅助监督**：
 $$\mathcal{L}_{\text{ndpn}} = 1 - \text{SSIM}(I_1, \text{GT}), \quad \mathcal{L}_{\text{mcpn}} = \|I_2 - \text{GT}\|_1$$
@@ -342,14 +343,14 @@ Flight4 用 soft_clamp 替代 hard clamp 消除了梯度截断。Flight5 将曲�
 **S2.5 TCC 曲线**：
 $$\text{TCC}_n = \text{TCC}_{n-1} + A_n \odot \text{TCC}_{n-1} \odot (1 - \text{TCC}_{n-1}) \odot (\alpha_{\text{target}} - \text{TCC}_{n-1})$$
 
-**S3 提亮**：
-$$\hat{X}_t = \text{soft\_clamp}\left(\text{TCC}(I_2) \odot G\right)$$
+**S3 提亮 (Flight10: softplus gain)**：
+$$\hat{X}_t = \text{soft\_clamp}\left(\text{TCC}(I_2) \odot \text{clamp}(1.0 + \text{softplus}(\text{raw}) \cdot s_{\text{gain}},\ 1,\ 20)\right)$$
 
 SGRF 的三阶段顺序由 §2.1 的物理推导确定。Mod5 对 StageBlock delta 施加零均值约束。Mod6 将曲线升级为 pixel-wise 8 iter，并移除 bias_map——ZeroDCE 曲线 $I+\alpha\cdot I\cdot(1-I)$ 提供有界加性修正，bias 无独立物理角色。
 
 **Zero-gate StageBlock (Mod5: zero-mean)**：
 $$\delta = \text{ConvBlock}([f_{\text{branch}}, \text{proj}(I_{\text{current}})]) \cdot \gamma_{\text{gate}}$$
-$$\delta = \delta - \bar{\delta} \quad\text{(强制 per-channel 空间均值为零)}$$
+$$\delta = \delta - \bar{\delta} \quad\text{(zero-mean, Flight10: +softplus下界, min=-0.2×img.mean)}$$
 
 **四阶段公式 (Denoise → Deblur → Curve → Brighten)**：
 
