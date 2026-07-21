@@ -1,74 +1,41 @@
-# RWKV-Delta 代码快照 — Flight9
+# RWKV-Delta 代码快照 — Flight10
 
-> Flight9 是 TFS-Net v6 的最新架构，对 DPE/Encoder-TCA 路由/WFR 进行全面重构：
-> 1. **取消 WFR**: Encoder l1/l2/l3 三尺度直连各模块, 天然频率分离
-> 2. **DPE softplus+soft_clamp**: sigmoid→softplus 根除饱和, 单尺度 H/4
-> 3. **L_illum_spatial + L_illum_tv**: 反零方差 + 边缘感知 TV 双重防饱和
-> 4. **TCA H/2**: 128×128 WKV, l2_lat 直连, 无 internal FPN
-> 5. **Gamma clamp**: NDPN gamma max=0.03 防暴走
-> 6. **训练** batch=4, accum=4 (eff=16), epochs=80
+> Flight10 是 TFS-Net v6 的最新架构，聚焦损失函数清理 + Stage B/ISPN 管线修复：
+> 1. **损失清理**: 删除 L_wfr_reg/L_gamma_reg/L_dpe_prior 死代码
+> 2. **Stage B delta_scale=0.2**: 替代 tanh(β=0), 消除梯度死区
+> 3. **ISPN softplus gain**: gain[1,20] via softplus×learnable_scale(2.0)
+> 4. **S1/S2亮度约束**: softplus软下界, 防止去噪/去模糊暗化
+> 5. **感知解耦启用**: SSIM→img_s1+S2, VGG→res_t, +L_ssim_s2
+> 6. **L_spatial单边**: relu(1.0-std), 不推动高方差
+> 7. **训练** batch=4, accum=4 (eff=16), epochs=80
 
-## 整体架构概览
+## 整体架构
 
 ```
 输入 → Encoder[l1/l2/l3] → ┬ DPE(l3) → s_illum(softplus) + s_noise(sigmoid)
                            ├ TCA(l2) → tca_out + C_omega + F_t_aligned
-                           └ ISPN(l1) → TCC + gain
-                              └→ [NDPN/MCPN] (三源并行)
-                                 → [CXG] → [SGRF] → 输出
+                           └ ISPN(l1) → TCC + gain[1,20]
+                              └→ [NDPN/MCPN] → [CXG] → [SGRF] → res_t
 ```
 
-## 文件结构
+## Flight10 核心变更
 
-```
-docs/v6/RWKV-Delta-model/
-├── configs/
-│   └── delta_flight9.yaml     # 当前训练配置 (batch=4, accum=4, epochs=80)
-├── models/
-│   ├── tfs_net.py             # TFSNet + CXG + LRU frame_cache (Flight9, 无WFR)
-│   ├── tfsi_v2.py             # DPE (softplus+soft_clamp, 单尺度 H/4)
-│   ├── pure_rwkv_sace.py      # TCA (H/2 WKV, l2_lat 直连)
-│   ├── ndpn.py                # NDPN (gamma clamp ≤0.03, zero-init sigmoid)
-│   ├── mrpn.py                # MCPN (zero-init sigmoid)
-│   ├── igrf.py                # SGRF (Stage A/B + auxiliary losses)
-│   └── modules/               # boxes, encoder
-├── losses/
-│   └── losses.py              # TFSNetLoss (+L_illum_spatial+L_illum_tv)
-├── train.py                   # phase schedule for 80 epochs
-└── v6-delta-diagrams.md       # 架构图 (Flight9 updated)
-```
+| # | 模块 | 变更 | 文件 |
+|:--:|------|------|------|
+| 1 | SGRF | Stage B tanh(β)→delta_scale=0.2, S1/S2 softplus下界 | `igrf.py` |
+| 2 | ISPN | gain: sigmoid[0.5,2.0]→softplus×scale(2)+clamp[1,20] | `ispn_v2.py` |
+| 3 | Loss | 删L_wfr_reg/L_gamma_reg/L_dpe_prior, L_spatial单边relu | `losses.py` |
+| 4 | Loss | +L_brightness_preserve(0.5)+L_gain_range(0.3)+L_ssim_s2(0.1) | `losses.py` |
+| 5 | Loss | perceptual_decoupling=True, L_align_warp→0.005 | `losses.py` |
+| 6 | Train | 移除 max_gain 动态调度 | `train.py` |
 
-## Flight9 核心模块
-
-| 类 | 模块 | Flight9 创新 |
-|------|------|-----------|
-| `PyramidEncoder` | Encoder | l1/l2/l3 多尺度直连 (无 FPN 融合, 无 WFR 中介) |
-| `DPE` | 退化估计 | softplus+soft_clamp IllumHead, 单尺度 H/4, L_spatial+L_tv |
-| `IllumHead` | DPE | Conv1x1→softplus+base(0.3)→soft_clamp(max=3.0) |
-| `TCA` | 时序对齐 | H/2 WKV, l2_lat 直连, 无 internal FPN |
-| `NDPN` | 去噪 | gamma property clamp ≤0.03, zero-init conf_proj+denoise_strength |
-| `MCPN` | 运动 | zero-init motion_estimator+comp_gate |
-
-## 数据流
-
-```
-Encoder → l1, l2, l3 (多尺度)
-  ├─ DPE(l3) + gray/lum → s_illum(softplus) → ISPN
-  │                     → s_noise(sigmoid) → NDPN
-  └─ TCA(l2) → tca_out(H/2) ↑upsample → ISPN/NDPN/MCPN
-              → C_omega → NDPN conf_map + MCPN motion_mag
-              → F_t_aligned → NDPN/MCPN 对齐参考
-CXG → f_noise↔f_motion → SGRF
-```
-
-## 已取消 / 变更 (vs Flight8)
+## 已删除组件
 
 | 组件 | 原因 |
 |------|------|
-| WFR (SWD) | 多尺度 Encoder 天然实现频域分离, 取消 -25K 参数 |
-| feat_tfde | DPE 重新设计为 l3 直连, 不再需要 WFR 输出 |
-| TCA internal FPN | 回退, TCA 直接从 l2_lat 输入 H/2 |
-| TCA wfr_lambda | 取消 WFR 残差注入参数 |
-| 3-stage DPE | 级联放大饱和, 单尺度 H/4 足够 (光照是低频) |
-| sigmoid s_illum head | 替换为 softplus+soft_clamp |
+| WFR (SWD) | Flight9取消 |
 | AmpEnhance | 从未启用 |
+| L_wfr_reg | WFR不存在, 死代码 |
+| L_gamma_reg | gn=0.034>>0.005, relu恒零 |
+| L_dpe_prior | 与softplus DPE+L_spatial冲突 |
+| max_gain scheduling | ISPN改用learnable scale替代 |

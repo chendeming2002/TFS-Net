@@ -82,11 +82,14 @@ class StageBlock(nn.Module):
         delta = self.fuse(combined) * self.gate
         if self.use_intensity and s_intensity is not None:
             delta = delta + self.intensity_corr(s_intensity)
-        # Flight3 Mod5: zero-mean constraint — StageBlock rearranges pixels but
-        # cannot shift mean brightness. All brightness change must route through
-        # ISPN curve/gain (enforcing S2.1 denoise-before-brighten constraint).
+        # Flight3 Mod5: zero-mean constraint
         delta = delta - delta.mean(dim=[-2, -1], keepdim=True)
-        # Flight4: always use soft_clamp — hard clamp corrupts gradient flow
+        # Flight10: prevent excessive darkening via softplus lower bound.
+        # delta can still go negative (needed for denoising/deblurring)
+        # but large negative excursions are softly constrained.
+        min_delta = -0.2 * img_current.mean()
+        delta = min_delta + F.softplus(delta - min_delta)
+        # Flight4: always use soft_clamp
         # (zero-mean δ only works when negative deltas aren't truncated to 0)
         img_next = soft_clamp(img_current + delta)
         return img_next, delta
@@ -154,7 +157,10 @@ class SGRF(nn.Module):
         )
         nn.init.zeros_(self.residual_head[-1].weight)
         nn.init.zeros_(self.residual_head[-1].bias)
-        self.residual_scale = nn.Parameter(torch.zeros(1))
+        # Flight10: learnable delta_scale (init=0.2) replaces tanh(β=0) dead-zone.
+        # delta_scale=0.2 × zero-init conv → initial residual≈0, but grad=0.2×∂L/∂δ ≠ 0
+        # This avoids the tanh(0)=0 gradient block that made Stage B a no-op.
+        self.residual_scale = nn.Parameter(torch.tensor(0.2))
 
     def forward(
         self,
@@ -184,9 +190,7 @@ class SGRF(nn.Module):
         # === Stage B: NDPN/MCPN → residual → final output ===
         f_combined = f_noise_out + f_motion_out
         residual = self.residual_head(f_combined)
-        scale = torch.tanh(self.residual_scale)
-        # Flight7.1: no outer soft_clamp — img_lit is already soft_clamped by BrightenStage
-        res_t = img_lit.detach() + residual * scale
+        res_t = img_lit.detach() + residual * self.residual_scale
 
         return {
             "res_t":       res_t,
@@ -194,6 +198,6 @@ class SGRF(nn.Module):
             "img_s2":      img_s2,
             "img_curved":  img_curved,
             "img_lit":     img_lit,
-            "residual":    residual * scale,
+            "residual":    residual * self.residual_scale,
             "lit_up_map":  lit_up,
         }

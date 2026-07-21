@@ -301,9 +301,10 @@ class TFSNetLoss(nn.Module):
 
     @staticmethod
     def _illum_spatial_loss(s_illum: torch.Tensor) -> torch.Tensor:
-        """Flight9: penalize zero spatial variance — -log(std) puts infinite cost on collapse."""
+        """Flight10: single-sided — penalize std < 1.0, ignore high std.
+        Flight9's -log(std) pushed std to 19.6 — now we only prevent collapse."""
         std = s_illum.std(dim=[-2, -1]).mean()
-        return -torch.log(std.clamp(min=1e-6))
+        return F.relu(1.0 - std)
 
     @staticmethod
     def _illum_tv_loss(s_illum: torch.Tensor, ref_img: torch.Tensor) -> torch.Tensor:
@@ -451,15 +452,20 @@ class TFSNetLoss(nn.Module):
         else:
             L_freq = pred.new_tensor(0.0)
 
-        # Mark2: perceptual decoupling — SSIM on img_s1, VGG on img_s2
+        # Flight10: perceptual decoupling — SSIM on S1+S2 (no brightness mismatch), VGG on res_t
         img_s1 = outputs.get("img_s1", pred)
         img_s2 = outputs.get("img_s2", pred)
         if self.perceptual_decoupling:
             L_ssim = 1.0 - ssim_map(img_s1, target).mean()
-            L_perc = self.perceptual(img_s2, target)
+            L_perc = self.perceptual(pred, target)
         else:
             L_ssim = 1.0 - ssim_map(pred, target).mean()
             L_perc = self.perceptual(pred, target)
+
+        # Flight10: SSIM on img_s2 for structure feedback (avoids VGG brightness mismatch)
+        L_ssim_s2 = pred.new_tensor(0.0)
+        if "img_s2" in outputs and self.perceptual_decoupling:
+            L_ssim_s2 = 1.0 - ssim_map(img_s2, target).mean()
 
         # Illumination smoothness + Flight9 anti-collapse + edge-aware TV
         L_illum_smooth = self._edge_aware_smooth(s_illum, target)
@@ -491,34 +497,36 @@ class TFSNetLoss(nn.Module):
             img_s2_lit = torch.clamp(outputs["img_s2"] * gain, 0.0, 1.0)
             L_inter = charbonnier_loss(img_s2_lit, target)
 
-        # Gamma anti-collapse (Flight3 Mod3): penalize gamma→0
+        # Gamma anti-collapse — REMOVED (Flight10): gamma far above 0.005 threshold,
+        # gn=0.034 >> 0.005, relu(0.005-|γ|)=0 always. Dead code.
         L_gamma_reg = pred.new_tensor(0.0)
-        if model is not None and epoch >= 10:
-            if hasattr(model, 'ndpn') and hasattr(model.ndpn, 'gamma'):
-                g_ndpn = model.ndpn.gamma.abs().mean()
-                L_gamma_reg = L_gamma_reg + torch.relu(0.005 - g_ndpn)
-            if hasattr(model, 'mcpn') and hasattr(model.mcpn, 'gamma'):
-                g_mcpn = model.mcpn.gamma.abs().mean()
-                L_gamma_reg = L_gamma_reg + torch.relu(0.005 - g_mcpn)
 
-        # WFR reg (Mark4: shared)
+        # WFR reg — REMOVED (Flight10): WFR module deleted in Flight9.
         L_wfr_reg = pred.new_tensor(0.0)
-        if model is not None and hasattr(model, 'wfr'):
-            wfr = model.wfr
-            try:
-                alpha_bias = wfr.alpha_net[2].bias.mean()
-                wfr._alpha_mean = alpha_bias.sigmoid()
-                L_wfr_reg = (wfr._alpha_mean - 0.7)**2  # asymmetric: allow DPE to take more LL
-            except: pass
 
-        # align_warp + diag_prior (already computed above, shared)
-        # Mark4: these C_omega losses remain active in all phases
-
-        # Flight3 B: DPE direct supervision (Phase 2, reduced weight)
+        #         DPE prior — REMOVED (Flight10): counterproductive with softplus DPE,
+        # L1(s_illum, 1-brightness) fights against L_illum_spatial.
         L_dpe_prior = pred.new_tensor(0.0)
-        if "s_illum" in outputs and "image_center" in outputs:
-            ic = outputs["image_center"].mean(dim=1, keepdim=True)
-            L_dpe_prior = F.l1_loss(s_illum, (1.0 - ic).detach().expand_as(s_illum))
+
+        # Flight10: brightness preservation — prevent S1/S2 from becoming darker than input
+        L_brightness_preserve = pred.new_tensor(0.0)
+        if "img_s1" in outputs and "img_s2" in outputs and "image_center" in outputs:
+            img_input = outputs["image_center"]
+            img_s1 = outputs["img_s1"]
+            img_s2 = outputs["img_s2"]
+            L_bright_s1 = F.relu(img_input.mean() * 0.8 - img_s1.mean())
+            L_bright_s2 = F.relu(img_s1.mean() * 0.7 - img_s2.mean())
+            L_brightness_preserve = L_bright_s1 + L_bright_s2
+
+        # Flight10: gain_range — guide gain_map to cover the needed dynamic range
+        L_gain_range = pred.new_tensor(0.0)
+        if "gain_map" in outputs and "img_s2" in outputs:
+            gain_map = outputs["gain_map"]
+            img_s2 = outputs["img_s2"]
+            with torch.no_grad():
+                target_gain = target.mean() / img_s2.mean().clamp(min=0.01)
+                target_gain = target_gain.clamp(1.0, 20.0)
+            L_gain_range = F.l1_loss(gain_map.mean(), target_gain)
 
         # Mark2 warmup: pix+ssim only for first 5 epochs
         if self.warmup_loss_only_pix_ssim and epoch < 5:
@@ -526,22 +534,23 @@ class TFSNetLoss(nn.Module):
                 L_total = self._uw(L_pix, 'pix') + self._uw(L_ssim, 'ssim')
             else:
                 L_total = self.lambda_pix * L_pix + self.lambda_ssim * L_ssim
-            L_total = L_total + self.lambda_illum * L_illum_smooth + self.lambda_illum_spatial * L_illum_spatial + self.lambda_illum_tv * L_illum_tv
+            L_total = L_total + self.lambda_illum * L_illum_smooth + self.lambda_illum_spatial * L_illum_spatial + self.lambda_illum_tv * L_illum_tv + 0.5 * L_brightness_preserve
         elif self.uncertainty_weighting:
             L_total = (
                 self._uw(L_pix, 'pix') + self._uw(L_freq, 'freq')
                 + self._uw(L_ssim, 'ssim') + self._uw(L_perc, 'perc')
                 + self._uw(L_illum_smooth, 'illum')
                 + self._uw(L_inter, 'inter')
-                + self._uw(L_align_warp, 'ifpn')
-                + 0.5 * L_gain_sup + 0.001 * L_wfr_reg
-                + 0.01 * L_dpe_prior
-                + 0.1 * L_gamma_reg
+                + 0.5 * L_gain_sup
                 + 0.5 * L_lit
                 + 0.1 * L_residual_reg
                 + 0.2 * L_ndpn_aux + 0.1 * L_mcpn_aux
                 + self.lambda_illum_spatial * L_illum_spatial
                 + self.lambda_illum_tv * L_illum_tv
+                + 0.5 * L_brightness_preserve
+                + 0.3 * L_gain_range
+                + 0.005 * L_align_warp
+                + 0.1 * L_ssim_s2
             )
         else:
             L_total = (
@@ -567,6 +576,9 @@ class TFSNetLoss(nn.Module):
             "loss_residual_reg": L_residual_reg.detach(),
             "loss_ndpn_aux":    L_ndpn_aux.detach(),
             "loss_mcpn_aux":    L_mcpn_aux.detach(),
+            "loss_bright_pres": L_brightness_preserve.detach(),
+            "loss_gain_range":  L_gain_range.detach(),
+            "loss_ssim_s2":     L_ssim_s2.detach(),
         }
         return L_total, loss_dict
 

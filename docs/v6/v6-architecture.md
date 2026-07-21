@@ -1,32 +1,27 @@
-# TFS-Net v6 Delta Flight9 模型架构设计文档
+# TFS-Net v6 Delta Flight10 模型架构设计文档
 
-> 日期：2026-07-20
-> 版本：v6 Delta Flight9 (current)
-> 训练配置：`configs/delta_flight9.yaml`，batch=4 (accum=4→eff=16), epochs=80
-> 参数量：~1.5M (取消 WFR -25K)
-> 核心变更：取消 WFR, DPE sigmoid→softplus, TCA H/2, L_illum_spatial+tv, gamma clamp
+> 日期：2026-07-21
+> 版本：v6 Delta Flight10 (current)
+> 训练配置：`configs/delta_flight10.yaml`，batch=4 (accum=4→eff=16), epochs=80
+> 参数量：~1.5M
+> 核心变更：损失清理 + Stage B delta_scale + ISPN softplus gain + S1/S2亮度约束 + 感知解耦
 
 ---
 
 ## 1. 概述
 
-TFS-Net (Tri-Source Fusion & Synthesis Network) 是一个端到端多帧低光视频增强网络。Flight9 核心变更:
-1. **取消 WFR** — Encoder l1/l2/l3 直连各模块,天然频率分离
-2. **DPE softplus** — sigmoid→softplus+soft_clamp,单尺度 H/4,根除饱和
-3. **TCA H/2** — 128×128 WKV, batch=4 恢复样本多样性
-4. **L_illum_spatial + L_illum_tv** — 反零方差 + 边缘感知 TV
-5. **Gamma clamp** — NDPN gamma max=0.03
+Flight10 在 Flight9 收敛于 PSNR=16.33 的基础上，聚焦**损失函数优化**和**Stage B/ISPN 管线修复**，而非架构结构调整。
 
-| 模块 | 缩写 | Flight9 功能 |
+| 模块 | 缩写 | Flight10 功能 |
 |------|------|------|
-| **Encoder** | PyramidEncoder | 3级金字塔 → l1(64,H,W), l2(64,H/2), l3(64,H/4) 多尺度直连 |
-| **DPE** | Degradation Prior Estimator | 单尺度 H/4, softplus+s_max_clamp, L_spatial+L_tv 反饱和 |
-| **TCA** | Temporal Correspondence & Alignment | H/2 WKV 扫描 (l2_lat 直连) + C_omega 时序矩阵 |
-| **ISPN** | Illumination-Source Processing Network | TCC曲线(3ch×4×↓) + pixel-wise gain([0.5,2.0]) |
-| **NDPN** | Noise Degradation Processing Network | C_omega 置信度引导去噪 (γ clamp≤0.03) |
-| **MCPN** | Motion Compensation Processing Network | C_omega 运动补偿 (gamma=0.01, startup→pass-through) |
-| **CXG** | Cross-eXcitation Gate | 去噪↔运动 交叉激励门 |
-| **SGRF** | Stage-wise Guided Restoration & Fusion | S1:去噪→S2:去模糊→TCC×6→gain→res_t |
+| **Encoder** | PyramidEncoder | 3级金字塔 → l1/l2/l3 多尺度直连 |
+| **DPE** | Degradation Prior Estimator | softplus IllumHead, H/4 单尺度, L_spatial单边 |
+| **TCA** | Temporal Correspondence & Alignment | H/2 WKV, l2_lat直连, L_align_warp→0.005 |
+| **ISPN** | Illumination-Source Processing Network | softplus×scale(2.0) gain [1,20], TCC不变 |
+| **NDPN** | Noise Degradation Processing Network | C_omega引导, γ≤0.03, S1下界约束 |
+| **MCPN** | Motion Compensation Processing Network | C_omega补偿, γ=0.01, S2下界约束 |
+| **CXG** | Cross-eXcitation Gate | 去噪↔运动交叉激励 |
+| **SGRF** | Stage-wise Guided Restoration & Fusion | Stage A: S1→S2→TCC→gain, Stage B: delta_scale=0.2 |
 
 ### 命名变更总表
 
@@ -505,7 +500,7 @@ feat_tca (B,T,C,H/2,W/2) from WFR — 半分辨率, 节省 4× WKV 计算量
 | 模块 | 参数量 |
 |------|--------|
 | Encoder | ~320K |
-| WFR | ~25K |
+| WFR | — (已取消) | — |
 | DPE | ~50K |
 | TCA (MVCShift + WKV + Corr + Agg) | ~300K |
 | ISPN (gain_head + SpatialCurveBranch, Mod6) | ~75K || NDPN (含 conf_proj + noise_extract + denoise_strength) | ~85K |
@@ -529,7 +524,8 @@ feat_tca (B,T,C,H/2,W/2) from WFR — 半分辨率, 节省 4× WKV 计算量
 | **v6 Delta Mark3** | **两阶段渐进训练 + ISPN 隔离 + SGRF 中间监督 + 相位调度** | **1.69M** | PSNR 18→8.7 |
 | **v6 Delta Flight7.2+WFR** | **Encoder→TCA主输入+WFR残差, DPE concat Enc center, aux监督, TCC 4×↓, Stage A/B** | **1.55M** | PSNR 17.10@ep80 |
 | **v6 Delta Flight8** | Multi-scale encoder, DPE 3-stage+gray/lum, TCA internal FPN+full-res WKV, batch=2 accum=8 | 1.85M | 提前终止 (dpe_si=0.92/0.00) |
-| **v6 Delta Flight9** | **取消WFR, DPE softplus单尺度H/4, TCA H/2, L_illum_spatial+tv, gamma clamp, batch=4** | **~1.5M** | **训练中** |
+| **v6 Delta Flight9** | 取消WFR, DPE softplus, TCA H/2, L_spatial+tv, gamma clamp | ~1.5M | 16.33@ep70 (收敛) |
+| **v6 Delta Flight10** | **损失清理(删3死代码), Stage B delta_scale=0.2, ISPN gain[1,20]+learnable_scale, S1/S2亮度软约束, perceptual_decoupling=True** | **~1.5M** | **训练中** |
 
 ---
 
@@ -696,9 +692,9 @@ elif phase == 'phase2':
 ### 7.5 训练监控
 
 ```bash
-tail -f outputs/sdsd_f9/train.log
-grep "diag:" outputs/sdsd_f9/train.log | tail -10
-grep "Val stats" outputs/sdsd_f9/train.log | tail -10
+tail -f outputs/sdsd_f10/train.log
+grep "diag:" outputs/sdsd_f10/train.log | tail -10
+grep "Val stats" outputs/sdsd_f10/train.log | tail -10
 ```
 
 ### Flight9 关键设计决策
@@ -728,4 +724,4 @@ grep "Val stats" outputs/sdsd_f9/train.log | tail -10
 | `models/tfs_net.py` | CXG, TFSNet (数据流编排) |
 | `losses/losses.py` | TFSNetLoss (Kendall UW + gain_sup + Phase Schedule) |
 | `train.py` | 训练循环 (grad accum + phase lr + metric logging + frame_cache管理) |
-| `configs/delta_flight9.yaml` | 训练配置 (batch=4, accum=4, epochs=80) |
+| `configs/delta_flight10.yaml` | 训练配置 (batch=4, accum=4, epochs=80) |
