@@ -329,17 +329,52 @@ class TCA(nn.Module):
         self.corr_gen = TemporalCorrespondence(channels)
         self.temporal_agg = TemporalAggregation(channels)
 
+        # Flight10m1: minimal WFR — HaarDWT LL anchor + HF edge for TCA alignment
+        self.dwt_anchor = nn.Sequential(
+            nn.InstanceNorm2d(channels, affine=True),   # remove illumination bias from LL
+            nn.Conv2d(channels, channels, 1, bias=False),
+        )
+        self.dwt_hf_proj = nn.Sequential(
+            nn.Conv2d(channels * 3, channels, 3, padding=1, groups=4, bias=False),
+            LayerNorm2d(channels),
+        )
+        self.anchor_fuse = nn.Conv2d(channels * 3, channels, 1)
+
+    @staticmethod
+    def _haar_dwt(x_4d: torch.Tensor):
+        """x: (B, C, H, W) → LL, LH, HL, HH: each (B, C, H/2, W/2)"""
+        B, C, H, W = x_4d.shape
+        x01, x02 = x_4d[:,:,0::2,:], x_4d[:,:,1::2,:]
+        L = (x01 + x02) * 0.5
+        H_ = (x01 - x02) * 0.5
+        L0, L1 = L[:,:,:,0::2], L[:,:,:,1::2]
+        H0, H1 = H_[:,:,:,0::2], H_[:,:,:,1::2]
+        LL = (L0 + L1) * 0.5
+        LH = (L0 - L1) * 0.5
+        HL = (H0 + H1) * 0.5
+        HH = (H0 - H1) * 0.5
+        return LL, LH, HL, HH
+
     def forward(self, feats: torch.Tensor) -> Dict:
         """
-        feats: (B, T, C, H/2, W/2) — encoder l2_lat directly (no WFR preprocessing)
+        feats: (B, T, C, H/2, W/2) — encoder l2_lat directly
         """
         B, T, C, H_ds, W_ds = feats.shape
 
-        x_flat = feats.reshape(B * T, C, H_ds, W_ds)
-        x_shifted = self.mvc_shift(x_flat)
+        # Flight10m1: HaarDWT anchor — LL(IN去光照) + HF(边缘先验) → 增强 TCA 输入
+        feats_flat = feats.reshape(B * T, C, H_ds, W_ds)
+        LL, LH, HL, HH = self._haar_dwt(feats_flat)
+        anchor = self.dwt_anchor(LL)
+        anchor_up = F.interpolate(anchor, size=(H_ds, W_ds), mode='bilinear', align_corners=False)
+        hf_cat = torch.cat([LH, HL, HH], dim=1)
+        hf_up = F.interpolate(hf_cat, size=(H_ds, W_ds), mode='bilinear', align_corners=False)
+        hf_feat = self.dwt_hf_proj(hf_up)
+        x_enhanced = self.anchor_fuse(torch.cat([feats_flat, anchor_up, hf_feat], dim=1))
+
+        x_shifted = self.mvc_shift(x_enhanced)
         x_wkv = self.spatial_wkv(x_shifted)
         x_cm = self.channel_mix(x_wkv)
-        sace_out_ds = x_flat + x_cm * self.spatial_gamma
+        sace_out_ds = x_enhanced + x_cm * self.spatial_gamma
         sace_out = sace_out_ds.reshape(B, T, C, H_ds, W_ds)
 
         mu_t_clean = sace_out[:, self.center_idx]

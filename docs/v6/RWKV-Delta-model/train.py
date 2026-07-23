@@ -150,8 +150,7 @@ def build_loss(cfg, device):
         # Flight9: DPE anti-collapse + edge-aware illumination
         lambda_illum_spatial=loss_cfg.get("lambda_illum_spatial", 0.1),
         lambda_illum_tv=loss_cfg.get("lambda_illum_tv", 0.05),
-        # Flight10: perceptual decoupling (SSIM→S1+S2, VGG→res_t)
-        perceptual_decoupling=loss_cfg.get("perceptual_decoupling", True),
+        # Flight10m1: perceptual decoupling disabled — SSIM/VGG both on res_t
     )
     return criterion.to(device)
 
@@ -443,8 +442,7 @@ def main():
         for pg in optimizer.param_groups:
             pg['lr'] = lr
 
-        # Flight3 I: dynamic max_gain scheduling (4→16 over training) — REMOVED Flight10
-        # ISPN now uses learnable gain_scale instead of fixed max_gain
+        # Flight10m1: max_gain scheduling removed — ISPN uses sigmoid [0.5, 2.0]
 
         # Phase transition actions
         if epoch == 10:

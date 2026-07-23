@@ -1,10 +1,21 @@
-# TFS-Net v6 Delta Flight10 模型架构设计文档
+# TFS-Net v6 Delta Flight10 Mark1 模型架构设计文档
 
-> 日期：2026-07-21
-> 版本：v6 Delta Flight10 (current)
-> 训练配置：`configs/delta_flight10.yaml`，batch=4 (accum=4→eff=16), epochs=80
-> 参数量：~1.5M
-> 核心变更：损失清理 + Stage B delta_scale + ISPN softplus gain + S1/S2亮度约束 + 感知解耦
+> 日期：2026-07-22
+> 版本：v6 Delta Flight10m1 (current)
+> 训练配置：`configs/delta_flight10m1.yaml`，batch=4 (accum=4→eff=16), epochs=80
+> 参数量：~1.5M + 15K (HaarDWT anchor)
+> 核心变更：F10回退(gain坍缩+感知解耦) + TCA HaarDWT锚点闭合WFR差距
+
+---
+
+## 1. 概述
+
+Flight10m1 在 F10 "损失清理 + 感知解耦" 基础上进行精简收敛:
+1. **gain 回退**: softplus×scale → sigmoid[0.5,2.0] (F9验证稳定)
+2. **感知解耦关闭**: SSIM/VGG 都回到 res_t (img_s1 暗态SSIM有亮度域偏移)
+3. **L_gain_range/L_align_warp 删除**: 冲突梯度 + 无效正则
+4. **HaarDWT TCA锚点**: LL(IN去光照) + HF(DWConv边缘) → 15K参数闭合WFR差距
+5. **保留**: softplus DPE, L_spatial单边, Stage B delta_scale=0.2, S1/S2 softplus下界
 
 ---
 
@@ -526,7 +537,8 @@ feat_tca (B,T,C,H/2,W/2) from WFR — 半分辨率, 节省 4× WKV 计算量
 | **v6 Delta Flight7.2+WFR** | **Encoder→TCA主输入+WFR残差, DPE concat Enc center, aux监督, TCC 4×↓, Stage A/B** | **1.55M** | PSNR 17.10@ep80 |
 | **v6 Delta Flight8** | Multi-scale encoder, DPE 3-stage+gray/lum, TCA internal FPN+full-res WKV, batch=2 accum=8 | 1.85M | 提前终止 (dpe_si=0.92/0.00) |
 | **v6 Delta Flight9** | 取消WFR, DPE softplus, TCA H/2, L_spatial+tv, gamma clamp | ~1.5M | 16.33@ep70 (收敛) |
-| **v6 Delta Flight10** | **损失清理(删3死代码), Stage B delta_scale=0.2, ISPN gain[1,20]+learnable_scale, S1/S2亮度软约束, perceptual_decoupling=True** | **~1.5M** | **训练中** |
+| **v6 Delta Flight10** | 损失清理, Stage B delta_scale=0.2, ISPN gain[1,20], S1/S2亮度约束, perceptual_decoupling | ~1.5M | 15.92@ep40 (gain坍缩) |
+| **v6 Delta Flight10m1** | **gain回退sigmoid,感知解耦关闭,删L_gain_range+L_align_warp,TCA HaarDWT锚点(+15K)** | **~1.5M** | **训练中** |
 
 ---
 
@@ -693,9 +705,9 @@ elif phase == 'phase2':
 ### 7.5 训练监控
 
 ```bash
-tail -f outputs/sdsd_f10/train.log
-grep "diag:" outputs/sdsd_f10/train.log | tail -10
-grep "Val stats" outputs/sdsd_f10/train.log | tail -10
+tail -f outputs/sdsd_f10m1/train.log
+grep "diag:" outputs/sdsd_f10m1/train.log | tail -10
+grep "Val stats" outputs/sdsd_f10m1/train.log | tail -10
 ```
 
 ### Flight9 关键设计决策
@@ -725,4 +737,4 @@ grep "Val stats" outputs/sdsd_f10/train.log | tail -10
 | `models/tfs_net.py` | CXG, TFSNet (数据流编排) |
 | `losses/losses.py` | TFSNetLoss (Kendall UW + gain_sup + Phase Schedule) |
 | `train.py` | 训练循环 (grad accum + phase lr + metric logging + frame_cache管理) |
-| `configs/delta_flight10.yaml` | 训练配置 (batch=4, accum=4, epochs=80) |
+| `configs/delta_flight10m1.yaml` | 训练配置 (batch=4, accum=4, epochs=80) |

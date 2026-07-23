@@ -84,11 +84,10 @@ class StageBlock(nn.Module):
             delta = delta + self.intensity_corr(s_intensity)
         # Flight3 Mod5: zero-mean constraint
         delta = delta - delta.mean(dim=[-2, -1], keepdim=True)
-        # Flight10: prevent excessive darkening via softplus lower bound.
-        # delta can still go negative (needed for denoising/deblurring)
-        # but large negative excursions are softly constrained.
-        min_delta = -0.2 * img_current.mean()
-        delta = min_delta + F.softplus(delta - min_delta)
+        # Flight10m1: removed softplus lower bound — it introduced a minimum
+        # delta of min_delta + softplus(0) ≈ 0.68, causing S1/S2 to be
+        # excessively brightened at inference. Zero-mean + soft_clamp + 
+        # L_brightness_preserve loss are sufficient to prevent darkening.
         # Flight4: always use soft_clamp
         # (zero-mean δ only works when negative deltas aren't truncated to 0)
         img_next = soft_clamp(img_current + delta)

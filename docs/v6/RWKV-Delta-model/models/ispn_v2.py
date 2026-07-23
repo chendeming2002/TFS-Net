@@ -15,13 +15,13 @@ import torch.nn.functional as F
 
 class ISPN(nn.Module):
     def __init__(self, channels: int = 64, img_channels: int = 3,
-                 curve_iter: int = 6, ds_factor: int = 4):
+                 curve_iter: int = 6, ds_factor: int = 4,
+                 gain_min: float = 0.5, gain_max: float = 2.0):
         super().__init__()
         self.curve_iter = curve_iter
         self.ds_factor = ds_factor
-        # Flight10: gain via softplus × learnable scale, clamped [1.0, 20.0]
-        # Replaces old sigmoid [0.5, 2.0] which couldn't reach 13× needed for dark images.
-        self.gain_scale = nn.Parameter(torch.tensor(2.0))
+        self.gain_min = gain_min
+        self.gain_max = gain_max
 
         self.refine = nn.Sequential(
             nn.Conv2d(channels + 1, channels, 3, 1, 1),
@@ -56,10 +56,9 @@ class ISPN(nn.Module):
     def forward(self, f_enc_center: torch.Tensor, s_illum: torch.Tensor) -> dict:
         h = self.refine(torch.cat([f_enc_center, s_illum], dim=1))
 
-        # Flight10: gain = 1.0 + softplus(raw) × learnable_scale, clamped [1.0, 20.0]
+        # Gain: pixel-wise, sigmoid → [gain_min, gain_max] (Flight9 verified stable)
         gain_raw = self.gain_net(h)
-        gain_map = 1.0 + F.softplus(gain_raw) * self.gain_scale
-        gain_map = gain_map.clamp(1.0, 20.0)
+        gain_map = self.gain_min + (self.gain_max - self.gain_min) * torch.sigmoid(gain_raw)
 
         # Curve: downsampled feature → 1 A_map → reused n_iter times
         B, _, H, W = h.shape

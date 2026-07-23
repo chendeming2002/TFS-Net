@@ -452,19 +452,21 @@ class TFSNetLoss(nn.Module):
         else:
             L_freq = pred.new_tensor(0.0)
 
-        # Flight10: perceptual decoupling — SSIM on S1+S2 (no brightness mismatch), VGG on res_t
+        # Flight10m1: perceptual_decoupling → False (SSIM/VGG both on res_t).
+        # SSIM on dark img_s1 vs bright GT had permanent luminance mismatch (2μxμy/(μx²+μy²)≈0.3).
         img_s1 = outputs.get("img_s1", pred)
         img_s2 = outputs.get("img_s2", pred)
         if self.perceptual_decoupling:
             L_ssim = 1.0 - ssim_map(img_s1, target).mean()
-            L_perc = self.perceptual(pred, target)
+            L_perc = self.perceptual(img_s2, target)
         else:
             L_ssim = 1.0 - ssim_map(pred, target).mean()
             L_perc = self.perceptual(pred, target)
 
-        # Flight10: SSIM on img_s2 for structure feedback (avoids VGG brightness mismatch)
+        # Flight10m1: L_ssim_s2 kept as auxiliary — SSIM on img_s2 provides structural feedback
+        # without the brightness domain mismatch of img_s1.
         L_ssim_s2 = pred.new_tensor(0.0)
-        if "img_s2" in outputs and self.perceptual_decoupling:
+        if "img_s2" in outputs:
             L_ssim_s2 = 1.0 - ssim_map(img_s2, target).mean()
 
         # Illumination smoothness + Flight9 anti-collapse + edge-aware TV
@@ -518,15 +520,9 @@ class TFSNetLoss(nn.Module):
             L_bright_s2 = F.relu(img_s1.mean() * 0.7 - img_s2.mean())
             L_brightness_preserve = L_bright_s1 + L_bright_s2
 
-        # Flight10: gain_range — guide gain_map to cover the needed dynamic range
+        # Flight10m1: L_gain_range removed — collapsed gain with softplus×scale.
         L_gain_range = pred.new_tensor(0.0)
-        if "gain_map" in outputs and "img_s2" in outputs:
-            gain_map = outputs["gain_map"]
-            img_s2 = outputs["img_s2"]
-            with torch.no_grad():
-                target_gain = target.mean() / img_s2.mean().clamp(min=0.01)
-                target_gain = target_gain.clamp(1.0, 20.0)
-            L_gain_range = F.l1_loss(gain_map.mean(), target_gain)
+        # L_align_warp removed — ifpn stagnated at 5.35 for 20+ epochs.
 
         # Mark2 warmup: pix+ssim only for first 5 epochs
         if self.warmup_loss_only_pix_ssim and epoch < 5:
@@ -548,8 +544,6 @@ class TFSNetLoss(nn.Module):
                 + self.lambda_illum_spatial * L_illum_spatial
                 + self.lambda_illum_tv * L_illum_tv
                 + 0.5 * L_brightness_preserve
-                + 0.3 * L_gain_range
-                + 0.005 * L_align_warp
                 + 0.1 * L_ssim_s2
             )
         else:
