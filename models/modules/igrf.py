@@ -70,6 +70,10 @@ class StageBlock(nn.Module):
         )
         # Mark4: zero-gate — starts at 0, progressive release
         self.gate = nn.Parameter(torch.zeros(1))
+        # Flight10m2: inference_scale for inference-time gate reduction.
+        # 1.0 during training, can be set to 0.1-0.5 at inference to
+        # preserve details (prevents over-denoising at high resolutions).
+        self.inference_scale = 1.0
         if use_intensity:
             self.intensity_corr = nn.Conv2d(1, img_channels, kernel_size=3, padding=1, bias=True)
             nn.init.zeros_(self.intensity_corr.weight)
@@ -79,7 +83,7 @@ class StageBlock(nn.Module):
                 s_intensity: torch.Tensor = None):
         img_feat = self.img_proj(img_current)
         combined = torch.cat([f_branch, img_feat], dim=1)
-        delta = self.fuse(combined) * self.gate
+        delta = self.fuse(combined) * self.gate * self.inference_scale
         if self.use_intensity and s_intensity is not None:
             delta = delta + self.intensity_corr(s_intensity)
         # Flight3 Mod5: zero-mean constraint

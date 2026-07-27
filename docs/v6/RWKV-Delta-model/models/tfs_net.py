@@ -251,7 +251,8 @@ class TFSNet(nn.Module):
             unlock = getattr(self, '_unlock_ratio', 0.0)
             ndpn_out = self.ndpn(feats=feats, F_aligned_list=F_aligned_list, mu_t_clean=mu_t_clean,
                 sigma_t_clean=sigma_t_clean, s_noise=s_noise, center_idx=center_idx,
-                C_omega_list=C_omega_list, F_t_aligned=F_t_aligned)
+                C_omega_list=C_omega_list, F_t_aligned=F_t_aligned, image_center=image_center,
+                l2_feats=l2_lat)
             mcpn_out = self.mcpn(F_aligned_list=F_aligned_list, center_idx=center_idx,
                 sigma_t_clean=sigma_t_clean, C_omega_list=C_omega_list, F_t_aligned=F_t_aligned)
             f_noise_out = ndpn_out["f_noise_out"] * unlock
@@ -263,7 +264,8 @@ class TFSNet(nn.Module):
         else:  # phase2
             ndpn_out = self.ndpn(feats=feats, F_aligned_list=F_aligned_list, mu_t_clean=mu_t_clean,
                 sigma_t_clean=sigma_t_clean, s_noise=s_noise, center_idx=center_idx,
-                C_omega_list=C_omega_list, F_t_aligned=F_t_aligned)
+                C_omega_list=C_omega_list, F_t_aligned=F_t_aligned, image_center=image_center,
+                l2_feats=l2_lat)
             mcpn_out = self.mcpn(F_aligned_list=F_aligned_list, center_idx=center_idx,
                 sigma_t_clean=sigma_t_clean, C_omega_list=C_omega_list, F_t_aligned=F_t_aligned)
             f_noise_gated, f_motion_gated = self.cxg(ndpn_out["f_noise_out"], mcpn_out["f_motion_out"])

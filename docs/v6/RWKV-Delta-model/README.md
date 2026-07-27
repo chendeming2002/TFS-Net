@@ -1,28 +1,37 @@
-# RWKV-Delta 代码快照 — Flight10 Mark1
+# RWKV-Delta 代码快照 — Flight10 Mark4
 
-> Flight10m1 在 F10 基础上精简收敛：回退 gain + 感知解耦失败设计，新增 TCA HaarDWT 锚点。
-> 1. **gain 回退**: softplus×scale → sigmoid[0.5,2.0] (修复坍缩)
-> 2. **感知解耦关闭**: SSIM/VGG → res_t (避免暗态亮度域偏移)
-> 3. **删除**: L_gain_range + L_align_warp (冲突梯度 + 无效正则)
-> 4. **TCA HaarDWT 锚点**: LL(IN去光照) + HF(DWConv边缘) → +15K
-> 5. **保留**: softplus DPE, L_spatial单边, Stage B delta_scale, S1/S2下界, L_brightness_preserve
-> 6. **训练** batch=4, accum=4, epochs=80
+> Flight10m4 在 m3 temporal-base NDPN 基础上新增 1×1 bypass + l2 粗尺度:
+> 1. **NDPN 1×1 bypass**: 3×3 spatial + 1×1 pointwise 并行, 细纹无色散直通
+> 2. **NDPN l2 coarse**: l2_lat(H/2)→coarse_proj 全局噪声引导
+> 3. **MCPN 1×1 bypass**: motion_refine 拆 spatioal + pointwise
+> 4. **保留**: m3 detail_map门控 + temporal base, m2 sigmoid gain + HaarDWT锚点 + 15项损失
+> 5. **训练** batch=4, accum=4, epochs=80
 
 ## 整体架构
 
 ```
-输入 → Encoder[l1/l2/l3] → ┬ DPE(l3) → s_illum(softplus) + s_noise(sigmoid)
-                           ├ TCA(l2) → HaarDWT[LL→IN→anchor, HF→DWConv→edge]
-                           │            → fuse → WKV → C_omega → F_t_aligned
-                           └ ISPN(l1) → TCC + gain[0.5,2.0] (sigmoid)
-                              └→ [NDPN/MCPN] → [CXG] → [SGRF] → res_t
+Enc[l1/l2/l3] → DPE(l3)→s_illum/s_noise
+              → TCA(l2)+HaarDWT→WKV→C_omega
+              → NDPN(l1+l2): F_denoised + (3×3+1×1)correction + l2_coarse
+              → MCPN(l1): window_corr + (3×3+1×1)motion_refine
+              → CXG → SGRF → res_t
 ```
 
-## F10m1 关键变更
+## m4 新增 (vs m3)
 
-| # | 模块 | 变更 | 文件 |
+| # | 模块 | 新增 | 文件 |
 |:--:|------|------|------|
-| 1 | ISPN | gain: sigmoid[0.5,2.0] (回退F9) | `ispn_v2.py` |
-| 2 | Loss | perceptual_decoupling→False, 删L_gain_range+L_align_warp | `losses.py` |
-| 3 | TCA | +HaarDWT: LL(IN→1×1 anchor) + HF(DWConv groups=4→edge) | `pure_rwkv_sace.py` |
-| 4 | Train | 移除max_gain调度, perceptual_decoupling关闭 | `train.py` |
+| 1 | NDPN | corr_pointwise (1×1→GELU→1×1) parallel bypass | `ndpn.py` |
+| 2 | NDPN | coarse_proj: l2_lat(H/2) → interpolate → +correction×γ×0.5 | `ndpn.py` |
+| 3 | MCPN | motion_refine split: spatial(3×3) + pointwise(1×1) | `mrpn.py` |
+
+## 已删除组件
+
+| 组件 | 原因 |
+|------|------|
+| WFR (SWD) | Flight9 取消 |
+| AmpEnhance | 从未启用 |
+| L_wfr_reg / L_gamma_reg / L_dpe_prior | 死代码 |
+| L_gain_range / L_align_warp | 冲突/无效梯度 |
+| NDPN noise_extract + denoise_strength | m3 temporal-base 替换 |
+| perceptual_decoupling | SSIM domain mismatch |

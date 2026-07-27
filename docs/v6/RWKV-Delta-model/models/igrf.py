@@ -70,6 +70,10 @@ class StageBlock(nn.Module):
         )
         # Mark4: zero-gate — starts at 0, progressive release
         self.gate = nn.Parameter(torch.zeros(1))
+        # Flight10m2: inference_scale for inference-time gate reduction.
+        # 1.0 during training, can be set to 0.1-0.5 at inference to
+        # preserve details (prevents over-denoising at high resolutions).
+        self.inference_scale = 1.0
         if use_intensity:
             self.intensity_corr = nn.Conv2d(1, img_channels, kernel_size=3, padding=1, bias=True)
             nn.init.zeros_(self.intensity_corr.weight)
@@ -79,16 +83,15 @@ class StageBlock(nn.Module):
                 s_intensity: torch.Tensor = None):
         img_feat = self.img_proj(img_current)
         combined = torch.cat([f_branch, img_feat], dim=1)
-        delta = self.fuse(combined) * self.gate
+        delta = self.fuse(combined) * self.gate * self.inference_scale
         if self.use_intensity and s_intensity is not None:
             delta = delta + self.intensity_corr(s_intensity)
         # Flight3 Mod5: zero-mean constraint
         delta = delta - delta.mean(dim=[-2, -1], keepdim=True)
-        # Flight10: prevent excessive darkening via softplus lower bound.
-        # delta can still go negative (needed for denoising/deblurring)
-        # but large negative excursions are softly constrained.
-        min_delta = -0.2 * img_current.mean()
-        delta = min_delta + F.softplus(delta - min_delta)
+        # Flight10m1: removed softplus lower bound — it introduced a minimum
+        # delta of min_delta + softplus(0) ≈ 0.68, causing S1/S2 to be
+        # excessively brightened at inference. Zero-mean + soft_clamp + 
+        # L_brightness_preserve loss are sufficient to prevent darkening.
         # Flight4: always use soft_clamp
         # (zero-mean δ only works when negative deltas aren't truncated to 0)
         img_next = soft_clamp(img_current + delta)

@@ -1,21 +1,29 @@
-# TFS-Net v6 Delta Flight10 Mark1 模型架构设计文档
+# TFS-Net v6 Delta Flight10 Mark4 模型架构设计文档
 
-> 日期：2026-07-22
-> 版本：v6 Delta Flight10m1 (current)
-> 训练配置：`configs/delta_flight10m1.yaml`，batch=4 (accum=4→eff=16), epochs=80
-> 参数量：~1.5M + 15K (HaarDWT anchor)
-> 核心变更：F10回退(gain坍缩+感知解耦) + TCA HaarDWT锚点闭合WFR差距
+> 日期：2026-07-27
+> 版本：v6 Delta Flight10m4 (current)
+> 训练配置：`configs/delta_flight10m3.yaml`，batch=4 (accum=4→eff=16), epochs=80
+> 参数量：~1.5M + 15K (HaarDWT) + ~80K (NDPN/MCPN 1×1 bypass)
+> 核心变更：NDPN+MCPN parallel 1×1 + l2粗尺度, stage B delta_scale, P2 dip mitigations
 
 ---
 
 ## 1. 概述
 
-Flight10m1 在 F10 "损失清理 + 感知解耦" 基础上进行精简收敛:
-1. **gain 回退**: softplus×scale → sigmoid[0.5,2.0] (F9验证稳定)
-2. **感知解耦关闭**: SSIM/VGG 都回到 res_t (img_s1 暗态SSIM有亮度域偏移)
-3. **L_gain_range/L_align_warp 删除**: 冲突梯度 + 无效正则
-4. **HaarDWT TCA锚点**: LL(IN去光照) + HF(DWConv边缘) → 15K参数闭合WFR差距
-5. **保留**: softplus DPE, L_spatial单边, Stage B delta_scale=0.2, S1/S2 softplus下界
+Flight10m4 在 m3 temporal-base NDPN 基础上新增 1×1 pointwise bypass 和多尺度引导:
+1. **NDPN 1×1 bypass**: 3×3 spatial + 1×1 pointwise 并行, 细节直通无色散
+2. **NDPN l2 粗尺度**: l2_lat(H/2)→coarse_proj 提供全局噪声引导
+3. **MCPN 1×1 bypass**: motion_refine 拆分为 spatial + pointwise
+4. **保留**: softplus DPE, HaarDWT锚点, sigmoid gain, 15项损失, detail_map门控
+
+| 模块 | 缩写 | m4 功能 |
+|------|------|------|
+| **NDPN** | Noise Degradation Network | F_denoised(temporal) + 1×1/3×3 correction + l2 coarse + detail_map gate |
+| **MCPN** | Motion Compensation Network | window_corr + 1×1/3×3 motion_refine + startup gate |
+| **DPE** | Degradation Prior Estimator | softplus H/4, L_spatial relu(1.0-std), 权0.03 |
+| **TCA** | Temporal Correspondence | HaarDWT LL anchor(IN→1×1) + HF(DWConv groups=4) → WKV |
+| **ISPN** | Illumination Processing | sigmoid gain[0.5,2.0] + TCC×6 |
+| **SGRF** | Stage-wise Fusion | Stage A: S1→S2→TCC→gain, Stage B: delta_scale=0.2 |
 
 ---
 
@@ -538,7 +546,8 @@ feat_tca (B,T,C,H/2,W/2) from WFR — 半分辨率, 节省 4× WKV 计算量
 | **v6 Delta Flight8** | Multi-scale encoder, DPE 3-stage+gray/lum, TCA internal FPN+full-res WKV, batch=2 accum=8 | 1.85M | 提前终止 (dpe_si=0.92/0.00) |
 | **v6 Delta Flight9** | 取消WFR, DPE softplus, TCA H/2, L_spatial+tv, gamma clamp | ~1.5M | 16.33@ep70 (收敛) |
 | **v6 Delta Flight10** | 损失清理, Stage B delta_scale=0.2, ISPN gain[1,20], S1/S2亮度约束, perceptual_decoupling | ~1.5M | 15.92@ep40 (gain坍缩) |
-| **v6 Delta Flight10m1** | **gain回退sigmoid,感知解耦关闭,删L_gain_range+L_align_warp,TCA HaarDWT锚点(+15K)** | **~1.5M** | **训练中** |
+| **v6 Delta Flight10m3** | NDPN temporal-base+detail-gated correction, correction_net | ~1.5M | 18.27@ep40 |
+| **v6 Delta Flight10m4** | **NDPN 1×1 bypass+coarse l2, MCPN 1×1 bypass, 保留所有m3设计** | **~1.5M+80K** | **训练中** |
 
 ---
 
@@ -705,9 +714,9 @@ elif phase == 'phase2':
 ### 7.5 训练监控
 
 ```bash
-tail -f outputs/sdsd_f10m1/train.log
-grep "diag:" outputs/sdsd_f10m1/train.log | tail -10
-grep "Val stats" outputs/sdsd_f10m1/train.log | tail -10
+tail -f outputs/sdsd_f10m4/train.log
+grep "diag:" outputs/sdsd_f10m4/train.log | tail -10
+grep "Val stats" outputs/sdsd_f10m4/train.log | tail -10
 ```
 
 ### Flight9 关键设计决策
