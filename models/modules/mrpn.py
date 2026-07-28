@@ -68,16 +68,11 @@ class MCPN(nn.Module):
         nn.init.zeros_(self.comp_gate[-2].weight)
         nn.init.zeros_(self.comp_gate[-2].bias)
 
-        # Delta: motion refinement — 3×3 spatial + 1×1 pointwise bypass
-        self.motion_refine_spatial = nn.Sequential(
+        # P0: motion refinement — single 3×3 only (1×1 has no spatial meaning for motion)
+        self.motion_refine = nn.Sequential(
             nn.Conv2d(channels * 2, channels, 3, 1, 1),
             nn.GELU(),
             nn.Conv2d(channels, channels, 3, 1, 1),
-        )
-        self.motion_refine_1x1 = nn.Sequential(
-            nn.Conv2d(channels * 2, channels, 1, 1, 0),
-            nn.GELU(),
-            nn.Conv2d(channels, channels, 1, 1, 0),
         )
 
         # Flight3: γ=0.001 → gradient flows through motion branch without visible output
@@ -168,9 +163,7 @@ class MCPN(nn.Module):
             blur_input = torch.cat([sigma_1ch, frame_diff], dim=1)
             blur_mask = self.blur_estimator(blur_input)
 
-        # Delta: motion refinement — 3×3 spatial + 1×1 pointwise bypass
-        motion_input = torch.cat([f_center, f_omega_aligned], dim=1)
-        motion_delta = self.motion_refine_spatial(motion_input) + self.motion_refine_1x1(motion_input)
+        motion_delta = self.motion_refine(torch.cat([f_center, f_omega_aligned], dim=1))
 
         z_t = torch.cat([f_center, f_omega_aligned], dim=1)
         g_t = torch.sigmoid(self.gate(z_t))

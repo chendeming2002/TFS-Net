@@ -1,107 +1,106 @@
-# TFS-Net v6 Delta Flight10 Mark4 整体架构图 (2026-07-27, current)
+# TFS-Net v6 Delta Flight10 Mark5 整体架构图 (2026-07-28, current)
 
-## 图一：简化架构 (NDPN 1×1 bypass + MCPN 1×1 bypass + l2 coarse)
+## 图一：简化架构 (NDPN detail_residual highway + F_denoised prior)
 
 ```mermaid
 flowchart TD
-    subgraph 输入
-        IN["多帧低光输入 x : (B,T,3,H,W)"]
+    subgraph Input
+        IN["多帧低光 x : (B,T,3,H,W)"]
     end
 
-    subgraph 编码["Encoder → l1/l2/l3"]
+    subgraph Enc["Encoder → l1/l2/l3"]
         ENC["PyramidEncoder → l1(64,H,W), l2(64,H/2), l3(64,H/4)"]
     end
 
-    subgraph 诊断["DPE (softplus, H/4)"]
-        DPE["DPE @ H/4<br/>L_spatial: relu(1.0-std) 权0.03<br/>→ s_illum(softplus) + s_noise(sigmoid)"]
+    subgraph DPE["DPE (softplus, H/4)"]
+        DPE1["DPE @ H/4<br/>L_spatial: relu(1.0-std) 0.03<br/>→ s_illum + s_noise"]
     end
 
-    subgraph 对齐["TCA (HaarDWT anchor)"]
-        TCA["TCA @ H/2<br/>HaarDWT: LL(IN→1×1)→anchor + HF(DWConv)→edge<br/>→ fuse → MVC-Shift → 4dirWKV → ChannelMix<br/>→ C_omega + F_t_aligned"]
+    subgraph TCA["TCA (HaarDWT anchor)"]
+        TCA1["HaarDWT: LL(IN)→anchor + HF(DWConv)→edge<br/>→ fuse → MVC-Shift → 4dirWKV → C_omega"]
     end
 
-    subgraph NDPN["NDPN (temporal base + 1×1 bypass + l2 coarse)"]
-        NDPN_DETAIL["F_denoised = SNR加权多帧聚合 (主去噪)"]
-        NDPN_CORR["correction = (corr_spatial 3×3 + corr_pointwise 1×1)<br/>× γ × (1-detail_map)<br/>+ coarse_proj(l2↑) × γ × 0.5"]
-        NDPN_OUT["f_noise = F_denoised + correction + noise_proj(s_noise)"]
-        NDPN_DETAIL --> NDPN_CORR --> NDPN_OUT
+    subgraph NDPN["NDPN m5: temporal + detail highway + F_denoise prior"]
+        N1["F_denoised = SNR 加权多帧聚合 + refine skip"]
+        N2["detail_residual = f_enc - F_denoised → 1×1 gate → preserved_detail"]
+        N3["corr_spatial(3×3) × γ × (1-detail_map)<br/>coarse(F_denoised avgpool) × γ × 0.5 × (1-detail_map)"]
+        N4["f_noise = F_denoised + correction + preserved_detail + s_noise"]
+        N1 --> N2 --> N4
+        N1 --> N3 --> N4
     end
 
-    subgraph MCPN["MCPN (1×1 bypass)"]
-        MCPN_MOT["motion_refine = spatial(3×3) + pointwise(1×1)"]
-        MCPN_FUSE["g_t·center + (1-g_t)·omega + motion_delta·comp·γ"]
-        MCPN_MOT --> MCPN_FUSE
+    subgraph MCPN["MCPN m5: single 3×3 motion_refine"]
+        M1["window_corr → f_omega_aligned"]
+        M2["motion_refine(3×3) × γ × comp_gate"]
+        M3["g_t × center + (1-g_t) × omega + motion_delta"]
+        M1 --> M2 --> M3
     end
 
-    subgraph 融合["CXG + SGRF"]
+    subgraph Fusion["CXG + SGRF"]
         CXG["CXG 交叉激励门"]
-        SGRF["SGRF<br/>Stage A: S1(zero-mean)→S2(zero-mean)→TCC×6→gain→img_lit<br/>Stage B: delta_scale=0.2×residual→res_t"]
+        SGRF["SGRF: S1→S2(zero-mean)→TCC×6→gain→img_lit<br/>Stage B: delta_scale=0.2→res_t"]
     end
 
-    OUT["输出 res_t"]
+    OUT["res_t"]
 
     IN --> ENC
-    ENC -- "l3(H/4)" --> DPE
-    ENC -- "l2(H/2)" --> TCA
-    ENC -- "l1(H)" --> NDPN_DETAIL
-    ENC -- "l2(H/2)" -.-> NDPN_CORR
-    DPE -- "s_illum" --> ISPN
-    TCA -- "C_omega, F_aligned" --> NDPN_DETAIL
-    TCA -- "C_omega, F_aligned" --> MCPN_MOT
-    NDPN_OUT --> CXG
-    MCPN_FUSE --> CXG
+    ENC -- "l3" --> DPE1
+    ENC -- "l2" --> TCA1
+    ENC -- "l1" --> N1
+    DPE1 -- "s_illum" --> ISPN["ISPN sigmoid[0.5,2.0]"]
+    TCA1 -- "C_omega, F_aligned" --> N1
+    TCA1 -- "C_omega, F_aligned" --> M1
+    N4 --> CXG
+    M3 --> CXG
     CXG --> SGRF
     IN -- "img_center" --> SGRF
+    ISPN -- "gain+curve" --> SGRF
     SGRF --> OUT
 ```
 
-## 核心变更 (m3 → m4)
-
-| # | 模块 | 变更 | 目的 |
-|:--:|------|------|------|
-| 1 | NDPN | corr_spatial(3×3) + **corr_pointwise(1×1)** | 1×1 无色散混参，细纹直接透传 |
-| 2 | NDPN | + **coarse_proj(l2_lat↑)** | H/2 全局噪声分布，补充局部细节 |
-| 3 | MCPN | motion_refine 3×3 + **1×1 bypass** | 运动补偿保留亚像素定位精度 |
-
-## NDPN 数据流 (m4 详细)
+## NDPN m5 详细数据流
 
 ```
-f_enc (B,64,H,W) ────┬──→ SNR-weighted multi-frame aggregation
-l2_lat[:,c] (64,H/2)  │    → F_denoised = Σ(w_i × F_aligned[i])
-                      │
-image_center (B,3,H,W) → |∇I| → detail_proj → detail_map ∈ [0,1]
-                      │
-          ┌───────────┘
-          ▼
-  correction_input = [f_enc, F_denoised, detail_map]
-          │
-          ├─→ corr_spatial (3×3→GELU→3×3) → 空间去噪 (identify noise+texture patterns)
-          ├─→ corr_pointwise (1×1→GELU→1×1) → 像素直通 (pointwise detail pass)
-          │
-          └─→ correction = (spatial + pointwise) × γ × (1-detail_map)
-              + coarse_proj(l2_center↑) × γ × 0.5
-              × conf_map (if C_omega available)
-          │
-          ▼
-  f_noise = F_denoised + correction + noise_proj(s_noise)
+f_enc (B,64,H,W)
+  │
+  ├─→ SNR weighted multi-frame aggregation → F_denoised
+  │     → + refine(F_denoised) skip connect (P2 fix)
+  │
+  ├─→ detail_map: |∇F_denoised| → detail_proj → (B,1,H,W) ∈ [0,1]
+  │     P1 fix: F_denoised is temporal-filtered, noise-free
+  │
+  ├─→ detail_residual = f_enc - F_denoised  (what temporal agg removed?)
+  │     → detail_gate_1x1(detail_residual) → sigmoid gate
+  │     → preserved_detail = detail_residual × gate × detail_map
+  │     P0 fix: true highway — only preserve details that differ from smoothed F_denoised
+  │
+  ├─→ corr_spatial([f_enc, F_denoised, detail_map], 3×3)  (spatial correction)
+  │     × γ(max=0.1, P2: relaxed from 0.03) × (1-detail_map)
+  │
+  ├─→ coarse_prior(F_denoised avgpool→upsample→conv, 3×3)
+  │     × γ × 0.5 × (1-detail_map)
+  │     P1 fix: F_denoised avgpool replaces l2_lat, properly gated
+  │
+  └─→ f_noise = F_denoised + corr_spatial + preserved_detail + coarse_prior + s_noise
 ```
+
+## m4 → m5 修复对照
+
+| # | 问题 (plan) | m4 | **m5** |
+|:--:|------|-----|------|
+| P0 | NDPN 1×1 与 3×3 同目标冗余 | corr_spatial + corr_pointwise | **detail_residual = f_enc - F_denoised → gate** |
+| P0 | MCPN 1×1 对运动无意义 | motion_refine 3×3 + 1×1 | **回退单 3×3** |
+| P1 | coarse l2 含噪且无门控 | l2_lat → coarse_proj | **F_denoised avgpool → coarse_prior, +detail_map** |
+| P1 | detail_map 被噪声污染 | image_center gradient | **F_denoised gradient** |
+| P2 | gamma 0.03 压制三路 | clamp 0.03 | **clamp 0.1** |
+| P2 | refine 无 skip | F_denoised = refine(x) | **F_denoised = x + refine(x)** |
 
 ## 版本演进
 
-| 版本 | 关键NDPN设计 | ep40 PSNR |
-|------|-------------|:--:|
-| F10m1 | f_enc - noise_feat × strength × γ | 17.35 (bug inflate) |
-| F10m2 | same + S1/S2 bug fix | 17.60 |
-| **F10m3** | **F_denoised + detail-gated correction** | **18.27** |
-| **F10m4** | **m3 + 1×1 bypass + l2 coarse + MCPN 1×1** | **训练中** |
-
-## 损失函数 (15项, 不变于 m3)
-
-### Phase 1: 7项
-L_pix(UW), L_ssim(UW), L_illum_smooth(UW), L_illum_spatial(0.03), L_illum_tv(0.05), L_gain_sup(0.5), L_brightness_preserve(0.5)
-
-### Phase 1.5: +3项
-L_ndpn_aux(0.2), L_mcpn_aux(0.1), L_residual_reg(0.05)
-
-### Phase 2: +5项
-L_lit(0.5), L_perc(UW), L_freq(UW), L_inter(UW), L_ssim_s2(0.1)
+| 版本 | NDPN 核心 | ep40 PSNR |
+|------|----------|:--:|
+| F10m1 | f_enc - noise_feat × strength (bug: softplus δ) | 17.35 |
+| F10m2 | 同上 + bug fixed | 17.60 |
+| F10m3 | F_denoised + detail-gated correction | **18.27** |
+| F10m4 | m3 + 1×1 bypass + l2 coarse | 设计缺陷 |
+| **F10m5** | **m3 + detail_residual highway + F_denoised prior + γ→0.1** | **训练中** |

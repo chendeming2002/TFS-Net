@@ -1,20 +1,29 @@
-# TFS-Net v6 Delta Flight10 Mark4 模型架构设计文档
+# TFS-Net v6 Delta Flight10 Mark5 模型架构设计文档
 
-> 日期：2026-07-27
-> 版本：v6 Delta Flight10m4 (current)
-> 训练配置：`configs/delta_flight10m3.yaml`，batch=4 (accum=4→eff=16), epochs=80
-> 参数量：~1.5M + 15K (HaarDWT) + ~80K (NDPN/MCPN 1×1 bypass)
-> 核心变更：NDPN+MCPN parallel 1×1 + l2粗尺度, stage B delta_scale, P2 dip mitigations
+> 日期：2026-07-28
+> 版本：v6 Delta Flight10m5 (current)
+> 训练配置：`configs/delta_flight10m5.yaml`，batch=2 (accum=8→eff=16), epochs=80
+> 核心变更：NDPN detail_residual highway + coarse F_denoised先验 + F_denoised gradient detail_map + gamma→0.1 + refine skip
 
 ---
 
 ## 1. 概述
 
-Flight10m4 在 m3 temporal-base NDPN 基础上新增 1×1 pointwise bypass 和多尺度引导:
-1. **NDPN 1×1 bypass**: 3×3 spatial + 1×1 pointwise 并行, 细节直通无色散
-2. **NDPN l2 粗尺度**: l2_lat(H/2)→coarse_proj 提供全局噪声引导
-3. **MCPN 1×1 bypass**: motion_refine 拆分为 spatial + pointwise
-4. **保留**: softplus DPE, HaarDWT锚点, sigmoid gain, 15项损失, detail_map门控
+Flight10m5 根据 m4 设计审查逐项修复:
+1. **NDPN 1×1→detail_residual highway**: f_enc - F_denoised → 1×1 gate → preserved_detail
+2. **coarse_proj: l2→F_denoised avgpool** + detail_map 门控
+3. **detail_map: image梯度→F_denoised梯度** (避免噪声误判为纹理)
+4. **gamma clamp 0.03→0.1** + refine skip connection
+5. **MCPN 1×1 移除** — 运动是空间位移, 1×1 无物理意义
+
+| 模块 | m5 设计要点 |
+|------|------|
+| **NDPN** | F_denoised(时序) + corr_spatial(3×3) + detail_residual(1×1 gate) + coarse(F_denoised pool) |
+| **MCPN** | 单 motion_refine(3×3), 窗口相关聚合 |
+| **DPE** | softplus H/4, L_spatial relu(1.0-std) 0.03 |
+| **TCA** | HaarDWT LL(IN→1×1) + HF(DWConv) → WKV @ H/2 |
+| **ISPN** | sigmoid gain[0.5,2.0] + TCC×6 |
+| **SGRF** | Stage A: S1→S2→TCC→gain, Stage B: delta_scale=0.2 |
 
 | 模块 | 缩写 | m4 功能 |
 |------|------|------|
@@ -546,8 +555,8 @@ feat_tca (B,T,C,H/2,W/2) from WFR — 半分辨率, 节省 4× WKV 计算量
 | **v6 Delta Flight8** | Multi-scale encoder, DPE 3-stage+gray/lum, TCA internal FPN+full-res WKV, batch=2 accum=8 | 1.85M | 提前终止 (dpe_si=0.92/0.00) |
 | **v6 Delta Flight9** | 取消WFR, DPE softplus, TCA H/2, L_spatial+tv, gamma clamp | ~1.5M | 16.33@ep70 (收敛) |
 | **v6 Delta Flight10** | 损失清理, Stage B delta_scale=0.2, ISPN gain[1,20], S1/S2亮度约束, perceptual_decoupling | ~1.5M | 15.92@ep40 (gain坍缩) |
-| **v6 Delta Flight10m3** | NDPN temporal-base+detail-gated correction, correction_net | ~1.5M | 18.27@ep40 |
-| **v6 Delta Flight10m4** | **NDPN 1×1 bypass+coarse l2, MCPN 1×1 bypass, 保留所有m3设计** | **~1.5M+80K** | **训练中** |
+| **v6 Delta Flight10m4** | NDPN 1×1 bypass+coarse l2, MCPN 1×1 bypass | ~1.5M+80K | 设计缺陷 (审查终止) |
+| **v6 Delta Flight10m5** | **NDPN detail_residual highway, coarse F_denoised post-Fix, detail F_denoised grad, gamma→0.1, MCPN回退, refine skip** | **~1.5M+15K** | **训练中** |
 
 ---
 
@@ -714,9 +723,9 @@ elif phase == 'phase2':
 ### 7.5 训练监控
 
 ```bash
-tail -f outputs/sdsd_f10m4/train.log
-grep "diag:" outputs/sdsd_f10m4/train.log | tail -10
-grep "Val stats" outputs/sdsd_f10m4/train.log | tail -10
+ tail -f outputs/sdsd_f10m5/train.log
+ grep "diag:" outputs/sdsd_f10m5/train.log | tail -10
+ grep "Val stats" outputs/sdsd_f10m5/train.log | tail -10
 ```
 
 ### Flight9 关键设计决策
@@ -746,4 +755,4 @@ grep "Val stats" outputs/sdsd_f10m4/train.log | tail -10
 | `models/tfs_net.py` | CXG, TFSNet (数据流编排) |
 | `losses/losses.py` | TFSNetLoss (Kendall UW + gain_sup + Phase Schedule) |
 | `train.py` | 训练循环 (grad accum + phase lr + metric logging + frame_cache管理) |
-| `configs/delta_flight10m1.yaml` | 训练配置 (batch=4, accum=4, epochs=80) |
+| `configs/delta_flight10m5.yaml` | 训练配置 (batch=2, accum=8, epochs=80) |

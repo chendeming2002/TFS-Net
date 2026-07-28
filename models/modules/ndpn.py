@@ -1,14 +1,13 @@
 """
-NDPN (Noise-Denoising Pyramid Network) — TFS-Net v3 → Flight10m3
+NDPN (Noise-Denoising Pyramid Network) — TFS-Net → Flight10m5
 ==================================================================
-基于 SNR 自适应聚合 + 细节保留的多帧降噪。
+基于 SNR 自适应聚合 + detail-residual highway 的多帧降噪。
 
-Flight10m3 核心变更:
-  1. 提升 F_denoised (时序聚合) 为主去噪源——多帧加权已充分去噪
-  2. 废除 per-frame feature subtraction（原 noise_feat * strength），改为
-     conf-gated 自适应残差校正（轻量、细节保留）
-  3. 新增 detail_proj：从图像梯度构建细节 map，控制残差强度
-  4. 纹理区（高梯度）→ 弱校正保留细节；平坦区（低梯度）→ 允许校正
+Flight10m5 核心变更 (vs m4):
+  P0: corr_pointwise → detail_residual gate: f_enc - F_denoised → 1×1 gate → preserved
+  P1: coarse_proj 输入源 → F_denoised avgpool(替代 l2_lat), +detail_map 门控
+  P1: detail_map 源 → F_denoised gradient(替代 image_center, 避免噪声误判)
+  P2: gamma clamp 0.03→0.1 + refine 加 skip connection
 """
 from __future__ import annotations
 
@@ -57,9 +56,7 @@ class NDPN(nn.Module):
         nn.init.zeros_(self.conf_proj[-2].weight)
         nn.init.zeros_(self.conf_proj[-2].bias)
 
-        # Flight10m3: light adaptive correction — 3×3 spatial (denoise) + 1×1 pointwise (detail)
-        # The 1×1 path acts as an information highway: pointwise corrections pass through
-        # without spatial mixing, preserving fine textures that 3×3 would blur.
+        # P0: spatial correction (3×3 only — 1×1 bypass removed)
         self.corr_spatial = nn.Sequential(
             nn.Conv2d(channels * 2 + 1, channels, 3, 1, 1),
             nn.GELU(),
@@ -68,25 +65,25 @@ class NDPN(nn.Module):
         nn.init.zeros_(self.corr_spatial[-1].weight)
         nn.init.zeros_(self.corr_spatial[-1].bias)
 
-        self.corr_pointwise = nn.Sequential(
-            nn.Conv2d(channels * 2 + 1, channels, 1, 1, 0),
+        # P0: detail residual highway — from f_enc - F_denoised
+        self.detail_gate_1x1 = nn.Sequential(
+            nn.Conv2d(channels, channels, 1, 1, 0),
             nn.GELU(),
             nn.Conv2d(channels, channels, 1, 1, 0),
         )
-        nn.init.zeros_(self.corr_pointwise[-1].weight)
-        nn.init.zeros_(self.corr_pointwise[-1].bias)
+        nn.init.zeros_(self.detail_gate_1x1[-1].weight)
+        nn.init.zeros_(self.detail_gate_1x1[-1].bias)
 
-        # Flight10m4: multi-scale coarse guidance projector — l2_lat (H/2) upsampled → coarse hint
-        self.coarse_proj = nn.Sequential(
-            nn.Conv2d(channels, channels // 2, 3, 1, 1),
+        # P1: coarse prior from F_denoised avgpool (replaces l2_lat)
+        self.coarse_prior = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, 1, 1),
             nn.GELU(),
-            nn.Conv2d(channels // 2, channels, 3, 1, 1),
+            nn.Conv2d(channels, channels, 3, 1, 1),
         )
-        nn.init.zeros_(self.coarse_proj[-1].weight)
-        nn.init.zeros_(self.coarse_proj[-1].bias)
+        nn.init.zeros_(self.coarse_prior[-1].weight)
+        nn.init.zeros_(self.coarse_prior[-1].bias)
 
-        # Flight10m3: detail projector — image gradient → (B, 1, H, W) detail map
-        # Learns which gradient patterns are "texture to preserve" vs "noise to remove"
+        # P1: detail projector from F_denoised gradient (replaces image_center)
         self.detail_proj = nn.Sequential(
             nn.Conv2d(1, channels // 4, 3, 1, 1),
             nn.GELU(),
@@ -94,16 +91,17 @@ class NDPN(nn.Module):
             nn.Sigmoid(),
         )
 
+        # P2: gamma clamp relaxed to 0.1
         self.gamma_raw = nn.Parameter(torch.full((1, channels, 1, 1), 0.01))
 
     @property
     def gamma(self):
-        return self.gamma_raw.clamp(max=0.03)
+        return self.gamma_raw.clamp(max=0.1)
 
     @staticmethod
-    def _image_gradient(img: torch.Tensor) -> torch.Tensor:
-        """img: (B, 3, H, W) → gradient magnitude (B, 1, H, W)."""
-        gray = img.mean(dim=1, keepdim=True)
+    def _feature_gradient(feat: torch.Tensor) -> torch.Tensor:
+        """feat: (B, C, H, W) → gradient magnitude (B, 1, H, W)."""
+        gray = feat.mean(dim=1, keepdim=True)
         gx = (gray[:, :, :, 1:] - gray[:, :, :, :-1]).abs()
         gy = (gray[:, :, 1:, :] - gray[:, :, :-1, :]).abs()
         gx = F.pad(gx, (0, 1, 0, 0))
@@ -156,37 +154,37 @@ class NDPN(nn.Module):
         F_denoised = torch.zeros_like(F_ref)
         for i in range(T):
             F_denoised = F_denoised + (alphas[i] / alpha_sum) * F_aligned_list[i]
-        F_denoised = self.refine(F_denoised)
 
-        # Flight10m3: F_denoised IS the primary denoised output.
-        # The correction below only makes small, detail-aware adjustments.
+        # P2: refine with skip connection
+        F_denoised = F_denoised + self.refine(F_denoised)
 
-        # Step 4: Detail map from image gradient
+        # Step 4: Detail map from F_denoised gradient (P1: noiseless, not image_center)
         f_enc = feats[:, center_idx]
-        if image_center is not None:
-            detail_raw = self._image_gradient(image_center)
-            detail_map = self.detail_proj(detail_raw)
-        else:
-            detail_map = torch.zeros(B, 1, H, W, device=feats.device)
+        detail_raw = self._feature_gradient(F_denoised)
+        detail_map = self.detail_proj(detail_raw)
 
-        # Step 5: Multi-scale correction — spatial (3×3) + pointwise (1×1) + coarse (l2)
+        # Step 5: Spatial correction + detail residual highway (P0)
         correction_input = torch.cat([f_enc, F_denoised, detail_map], dim=1)
         corr_spatial = self.corr_spatial(correction_input)
-        corr_pointwise = self.corr_pointwise(correction_input)
-        correction = (corr_spatial + corr_pointwise) * self.gamma * (1.0 - detail_map)
+        correction = corr_spatial * self.gamma * (1.0 - detail_map)
 
-        # Multi-scale coarse hint from l2_lat (H/2)
-        if l2_feats is not None:
-            l2_center = l2_feats[:, center_idx, :, :, :]
-            coarse_hint = self.coarse_proj(F.interpolate(l2_center, size=(H, W),
-                                      mode='bilinear', align_corners=False))
-            correction = correction + coarse_hint * self.gamma * 0.5
+        # P0: detail residual highway — preserve what temporal aggregation removed
+        detail_residual = f_enc - F_denoised
+        detail_gate = torch.sigmoid(self.detail_gate_1x1(detail_residual))
+        preserved_detail = detail_residual * detail_gate * detail_map
+
+        # P1: coarse prior from F_denoised avgpool (not l2_lat), properly gated
+        coarse_pool = F.avg_pool2d(F_denoised, 2)
+        coarse_hint = self.coarse_prior(F.interpolate(coarse_pool, size=(H, W),
+                                        mode='bilinear', align_corners=False))
+        correction = correction + coarse_hint * self.gamma * 0.5 * (1.0 - detail_map)
 
         if conf_map is not None:
             correction = correction * conf_map
+            preserved_detail = preserved_detail * conf_map
 
-        # Step 6: Final output — temporal base + light correction + s_noise injection
-        f_noise_out = F_denoised + correction + self.noise_proj(s_noise)
+        # Step 6: Final output
+        f_noise_out = F_denoised + correction + preserved_detail + self.noise_proj(s_noise)
 
         return {
             "f_noise_out": f_noise_out,
