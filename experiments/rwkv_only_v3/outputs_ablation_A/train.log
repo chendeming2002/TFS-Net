@@ -1,0 +1,1 @@
+2026-08-22 17:04:15,396 - INFO - Ablation=A flags={'remove_sigmoid': True, 'use_hf_residual': False, 'use_conf_scale': False} Params: 0.82M

@@ -1,5 +1,5 @@
 seed: 42
-output_dir: experiments/rwkv_only_v3/outputs_notca
+output_dir: experiments/rwkv_only_v3/outputs_ablation
 dataset:
   train_input_root: /home/a1005/yzy/dataset/SDSD/indoor/input
   train_target_root: /home/a1005/yzy/dataset/SDSD/indoor/GT
@@ -12,7 +12,7 @@ dataset:
   val_crop_size: 256
 train:
   batch_size: 2
-  epochs: 30
+  epochs: 20
   lr: 0.0008
   weight_decay: 0.0001
   amp: true
