@@ -221,12 +221,11 @@ class TemporalCorrespondence(nn.Module):
         self.proj_dim = proj_dim
         self.proj_q = nn.Conv2d(channels, proj_dim, 1, bias=False)
         self.proj_k = nn.Conv2d(channels, proj_dim, 1, bias=False)
-        # Mod1: softplus tau, 下界 0.05 防除零
         self.tau_raw = nn.Parameter(torch.zeros(1))
 
     @property
     def tau(self):
-        return F.softplus(self.tau_raw) + 0.05
+        return F.softplus(self.tau_raw).clamp(0.02, 0.5) + 0.02
 
     def forward(self, center_feat: torch.Tensor,
                 neighbor_feats: torch.Tensor) -> list:
