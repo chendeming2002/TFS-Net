@@ -43,7 +43,8 @@ def train_one_epoch(model, opt, scaler, loader, device, use_amp, logger,
 
         with autocast(enabled=use_amp):
             out = model(clip)
-        loss = F.l1_loss(out["res_t"], target) + 0.2 * (1 - ssim_map(out["res_t"], target).mean())
+        pred = out["res_t"].float()
+        loss = F.l1_loss(pred, target) + 0.2 * (1 - ssim_map(pred, target).mean())
         loss = loss / grad_accum
         scaler.scale(loss).backward()
 
