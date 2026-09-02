@@ -8,6 +8,7 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader, Subset
 
 from datasets import SDSDDataset
+from datasets.samplers import TemporalBucketSampler
 from losses.losses import ssim_map
 from utils.metrics import tensor_psnr, tensor_ssim
 from utils.misc import AverageMeter, create_logger, seed_everything
@@ -103,9 +104,18 @@ def main():
         train_ds = Subset(train_ds, range(8))
         val_ds = Subset(val_ds, range(4))
 
-    train_loader = DataLoader(train_ds, batch_size=cfg["train"]["batch_size"],
-                              shuffle=True, num_workers=cfg["dataset"].get("num_workers", 2),
-                              pin_memory=True)
+    nw = 0 if args.smoke else cfg["dataset"].get("num_workers", 2)
+    if args.smoke:
+        train_loader = DataLoader(train_ds, batch_size=cfg["train"]["batch_size"],
+                                  shuffle=True, num_workers=0, pin_memory=True)
+    else:
+        train_sampler = TemporalBucketSampler(train_ds.samples,
+                                              cfg["train"]["batch_size"],
+                                              seed=cfg["seed"])
+        train_loader = DataLoader(train_ds, batch_sampler=train_sampler,
+                                  num_workers=nw, pin_memory=True,
+                                  persistent_workers=nw > 0,
+                                  prefetch_factor=2 if nw > 0 else None)
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False,
                             num_workers=cfg["dataset"].get("num_workers", 2),
                             pin_memory=True)
