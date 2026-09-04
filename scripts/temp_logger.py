@@ -24,7 +24,8 @@ TRAIN_LOGS = [
 SAMPLE_INTERVAL = 5       # 秒
 PLOT_EVERY = 60           # 每 60 个样本 (~5 分钟) 重画图
 
-FIELDS = ["ts", "time", "pkg", "core16", "core20", "gpu_temp", "gpu_power", "gpu_util", "train_tag"]
+FIELDS = ["ts", "time", "pkg", "core16", "core20", "nvme", "pl1",
+          "gpu_temp", "gpu_power", "gpu_util", "train_tag"]
 
 SENSORS_RE = {
     "pkg": re.compile(r"^Package id 0:\s*\+(\d+\.?\d*)"),
@@ -33,6 +34,9 @@ SENSORS_RE = {
 }
 STEP_RE = re.compile(r"step (\d+)/(\d+)")
 EPOCH_RE = re.compile(r"Epoch (\d+)/(\d+) train")
+
+RAPL_PL1 = "/sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw"
+NVME_TEMP = "/sys/class/hwmon/hwmon1/temp2_input"
 
 
 def read_sensors():
@@ -80,6 +84,21 @@ def read_train():
     return ""
 
 
+def read_pl1_nvme():
+    out = {}
+    try:
+        with open(RAPL_PL1) as f:
+            out["pl1"] = str(int(f.read().strip()) // 1000000)  # W
+    except Exception:
+        out["pl1"] = ""
+    try:
+        with open(NVME_TEMP) as f:
+            out["nvme"] = str(int(f.read().strip()) // 1000)  # °C
+    except Exception:
+        out["nvme"] = ""
+    return out
+
+
 def main():
     os.makedirs(LOG_DIR, exist_ok=True)
     new_file = not os.path.exists(CSV_PATH)
@@ -92,14 +111,17 @@ def main():
     while True:
         row = {"ts": int(time.time()), "time": datetime.now().strftime("%H:%M:%S")}
         row.update(read_sensors())
+        row.update(read_pl1_nvme())
         row.update(read_gpu())
         row["train_tag"] = read_train()
         try:
             writer.writerow(row)
             f.flush()
+            n += 1
+            if n % 10 == 0:
+                os.fsync(f.fileno())  # 断电防丢: 每10样本强制落盘
         except Exception:
             pass
-        n += 1
         if n % PLOT_EVERY == 0:
             try:
                 subprocess.run(

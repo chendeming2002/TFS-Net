@@ -29,7 +29,7 @@ def parse_args():
     p.add_argument("--smoke", action="store_true")
     p.add_argument("--resume", type=str, default=None)
     p.add_argument("--ablation", type=str, default="none",
-                   choices=["none", "A", "B", "C", "ABC"])
+                   choices=["none", "A", "B", "C", "BC", "ABC"])
     return p.parse_args()
 
 
@@ -91,6 +91,7 @@ def main():
         "A":   {"remove_sigmoid": True,  "use_hf_residual": False, "use_conf_scale": False},
         "B":   {"remove_sigmoid": False, "use_hf_residual": True,  "use_conf_scale": False},
         "C":   {"remove_sigmoid": False, "use_hf_residual": False, "use_conf_scale": True},
+        "BC":  {"remove_sigmoid": False, "use_hf_residual": True,  "use_conf_scale": True},
         "ABC": {"remove_sigmoid": True,  "use_hf_residual": True,  "use_conf_scale": True},
         "none":{"remove_sigmoid": False, "use_hf_residual": False, "use_conf_scale": False},
     }[args.ablation]

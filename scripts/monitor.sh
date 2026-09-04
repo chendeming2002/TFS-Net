@@ -2,7 +2,10 @@
 # 训练+温度 一体监视 (每 5 秒刷新)
 # 用法: watch -n 5 bash scripts/monitor.sh   或直接 bash scripts/monitor.sh
 
-LOG=/home/a1005/25/TFS-Net/experiments/rwkv_only_v3/outputs_ablation_A/train.log
+# 自动发现活跃训练日志: 取最近修改的 train.log
+LOG=$(ls -t /home/a1005/25/TFS-Net/experiments/rwkv_only_v3/outputs_ablation*/train.log \
+      /home/a1005/25/TFS-Net/experiments/rwkv_only_v3/outputs_notca/train.log 2>/dev/null | head -1)
+LOG=${LOG:-/home/a1005/25/TFS-Net/experiments/rwkv_only_v3/outputs_ablation_A/train.log}
 
 echo "══════════ 训练进度 ══════════"
 # 最近 3 条 step/Epoch/Val

@@ -19,10 +19,11 @@ ROOT = "/home/a1005/25/TFS-Net"
 CSV_PATH = os.path.join(ROOT, "scripts/monitor_data/temp_log.csv")
 
 
-def load():
+def load(path=CSV_PATH):
     rows = []
-    with open(CSV_PATH) as f:
-        for r in csv.DictReader(f):
+    with open(path, encoding="utf-8", errors="ignore") as f:
+        clean = (line.replace("\x00", "") for line in f)
+        for r in csv.DictReader(clean):
             try:
                 rows.append({
                     "ts": int(r["ts"]),
@@ -47,10 +48,11 @@ def series(rows, key):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--csv", default=CSV_PATH)
     ap.add_argument("--out", default=os.path.join(ROOT, "scripts/monitor_data/temp_chart.png"))
     args = ap.parse_args()
 
-    rows = load()
+    rows = load(args.csv)
     if len(rows) < 2:
         print("数据不足 2 行, 跳过绘图")
         return
