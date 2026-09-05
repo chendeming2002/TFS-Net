@@ -1,0 +1,22 @@
+seed: 42
+output_dir: experiments/rwkv_only_v3/outputs_ablation_TA
+dataset:
+  train_input_root: /home/a1005/yzy/dataset/SDSD/indoor/input
+  train_target_root: /home/a1005/yzy/dataset/SDSD/indoor/GT
+  val_input_root: /home/a1005/yzy/dataset/SDSD/test/low-light
+  val_target_root: /home/a1005/yzy/dataset/SDSD/test/GT
+  window_size: 5
+  crop_size: 256
+  num_workers: 2
+  max_val_seqs: 5
+  val_crop_size: 256
+train:
+  batch_size: 2
+  epochs: 20
+  lr: 0.0008
+  weight_decay: 0.0001
+  amp: true
+  log_interval: 50
+  val_interval: 10
+  grad_clip: 0.5
+  grad_accum_steps: 8

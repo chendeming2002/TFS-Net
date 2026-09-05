@@ -59,13 +59,15 @@ class BiWKV(nn.Module):
 
     @staticmethod
     def _scan_cumsum(ek, ekv, u_coef, ew_pow):
-        """chunk-wise cumsum: 每 256 token 递推一次 state"""
+        """chunk-wise cumsum: 每 256 token 递推一次 state.
+        T-A1 修复: (1) 跨 chunk 衰减因子方向改正 ew^{j'+1} (原 ew^{cs-1-j'} 反向)
+                   (2) state 更新 off-by-one: ew^{cs} (原 ew^{cs-1})
+                   (3) 删除死代码 ew_chunk"""
         CHUNK = 256
         B, L, C = ek.shape
         out = torch.zeros(B, L, C, device=ek.device)
         state_num = torch.zeros(B, 1, C, device=ek.device)
         state_den = torch.zeros(B, 1, C, device=ek.device)
-        ew_chunk = ew_pow[:, :CHUNK] * ew_pow[:, 0:1]  # relative decay within chunk
         for s in range(0, L, CHUNK):
             e = min(s + CHUNK, L)
             cs = e - s
@@ -74,13 +76,14 @@ class BiWKV(nn.Module):
             S_loc = (ekv_c / ew_pow[:, :cs].clamp(min=1e-12)).cumsum(dim=1) * ew_pow[:, :cs]
             D_loc = (ek_c  / ew_pow[:, :cs].clamp(min=1e-12)).cumsum(dim=1) * ew_pow[:, :cs]
             # combine with state from previous chunks
-            decay_state = ew_pow[:, cs-1:cs].expand(-1, cs, -1) / ew_pow[:, :cs].clamp(min=1e-12)
+            # 上一 chunk 末位 (全局 s-1) 到当前位 (全局 s+j') 距离 = j'+1 → 衰减因子 ew^{j'+1}
+            decay_state = ew_pow[:, 1:cs+1]
             S = S_loc + state_num * decay_state
             D = D_loc + state_den * decay_state
             out[:, s:e] = (u_coef * ekv_c + S) / (u_coef * ek_c + D + 1e-8)
-            # update state for next chunk: accumulate all decayed contributions
-            state_num = ew_pow[:, cs-1:cs] * state_num + S_loc[:, -1:]
-            state_den = ew_pow[:, cs-1:cs] * state_den + D_loc[:, -1:]
+            # update state: 旧 state 从 prev-last 衰减 cs 步到 new-last (ew^{cs}), 加上新 chunk 局部累积
+            state_num = ew_pow[:, cs:cs+1] * state_num + S_loc[:, -1:]
+            state_den = ew_pow[:, cs:cs+1] * state_den + D_loc[:, -1:]
         return out
 
     def forward(self, k: torch.Tensor, v: torch.Tensor,

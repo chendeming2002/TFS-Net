@@ -18,7 +18,8 @@ from models.modules.pure_rwkv_sace import TCA
 class RWKVOnlyAblation(nn.Module):
     def __init__(self, in_channels=3, level_channels=(32, 64, 96),
                  fused_channels=64, num_frames=5,
-                 remove_sigmoid=False, use_hf_residual=False, use_conf_scale=False):
+                 remove_sigmoid=False, use_hf_residual=False, use_conf_scale=False,
+                 gamma_ones=False):
         super().__init__()
         self.remove_sigmoid = remove_sigmoid
         self.use_hf_residual = use_hf_residual
@@ -33,6 +34,9 @@ class RWKVOnlyAblation(nn.Module):
             num_bottleneck_blocks=0,
         )
         self.tca = TCA(channels=fused_channels)
+        if gamma_ones:
+            # T-A2: 解除休眠 — 输出门控从零初始化改为 1 (EvRWKV LayerScale=1 做法)
+            nn.init.ones_(self.tca.spatial_gamma)
 
         if use_conf_scale:
             self.conf_proj = nn.Sequential(
