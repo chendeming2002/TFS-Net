@@ -29,7 +29,7 @@ def parse_args():
     p.add_argument("--smoke", action="store_true")
     p.add_argument("--resume", type=str, default=None)
     p.add_argument("--ablation", type=str, default="none",
-                   choices=["none", "A", "B", "C", "BC", "TA", "TABC", "ABC"])
+                   choices=["none", "A", "B", "C", "BC", "TA", "TBC", "TABC", "ABC"])
     return p.parse_args()
 
 
@@ -88,14 +88,15 @@ def main():
     device = torch.device("cuda")
 
     flags = {
-        "A":    {"remove_sigmoid": True,  "use_hf_residual": False, "use_conf_scale": False, "gamma_ones": False},
-        "B":    {"remove_sigmoid": False, "use_hf_residual": True,  "use_conf_scale": False, "gamma_ones": False},
-        "C":    {"remove_sigmoid": False, "use_hf_residual": False, "use_conf_scale": True,  "gamma_ones": False},
-        "BC":   {"remove_sigmoid": False, "use_hf_residual": True,  "use_conf_scale": True,  "gamma_ones": False},
-        "TA":   {"remove_sigmoid": False, "use_hf_residual": False, "use_conf_scale": False, "gamma_ones": True},
-        "TABC": {"remove_sigmoid": False, "use_hf_residual": True,  "use_conf_scale": True,  "gamma_ones": True},
-        "ABC":  {"remove_sigmoid": True,  "use_hf_residual": True,  "use_conf_scale": True,  "gamma_ones": False},
-        "none": {"remove_sigmoid": False, "use_hf_residual": False, "use_conf_scale": False, "gamma_ones": False},
+        "A":    {"remove_sigmoid": True,  "use_hf_residual": False, "use_conf_scale": False, "gamma_ones": False, "local_align": False},
+        "B":    {"remove_sigmoid": False, "use_hf_residual": True,  "use_conf_scale": False, "gamma_ones": False, "local_align": False},
+        "C":    {"remove_sigmoid": False, "use_hf_residual": False, "use_conf_scale": True,  "gamma_ones": False, "local_align": False},
+        "BC":   {"remove_sigmoid": False, "use_hf_residual": True,  "use_conf_scale": True,  "gamma_ones": False, "local_align": False},
+        "TA":   {"remove_sigmoid": False, "use_hf_residual": False, "use_conf_scale": False, "gamma_ones": True,  "local_align": False},
+        "TBC":  {"remove_sigmoid": False, "use_hf_residual": False, "use_conf_scale": False, "gamma_ones": False, "local_align": True},
+        "TABC": {"remove_sigmoid": False, "use_hf_residual": True,  "use_conf_scale": True,  "gamma_ones": True,  "local_align": True},
+        "ABC":  {"remove_sigmoid": True,  "use_hf_residual": True,  "use_conf_scale": True,  "gamma_ones": False, "local_align": False},
+        "none": {"remove_sigmoid": False, "use_hf_residual": False, "use_conf_scale": False, "gamma_ones": False, "local_align": False},
     }[args.ablation]
 
     ds_cfg = cfg["dataset"]

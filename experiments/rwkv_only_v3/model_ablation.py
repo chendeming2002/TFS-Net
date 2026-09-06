@@ -13,17 +13,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 from models.modules.encoder import PyramidEncoder
 from models.modules.pure_rwkv_sace import TCA
+from local_tca import LocalTCA
 
 
 class RWKVOnlyAblation(nn.Module):
     def __init__(self, in_channels=3, level_channels=(32, 64, 96),
                  fused_channels=64, num_frames=5,
                  remove_sigmoid=False, use_hf_residual=False, use_conf_scale=False,
-                 gamma_ones=False):
+                 gamma_ones=False, local_align=False):
         super().__init__()
         self.remove_sigmoid = remove_sigmoid
         self.use_hf_residual = use_hf_residual
         self.use_conf_scale = use_conf_scale
+        self.local_align = local_align
         self.num_frames = num_frames
         self.fused_channels = fused_channels
 
@@ -33,7 +35,10 @@ class RWKVOnlyAblation(nn.Module):
             fused_channels=fused_channels,
             num_bottleneck_blocks=0,
         )
-        self.tca = TCA(channels=fused_channels)
+        if local_align:
+            self.tca = LocalTCA(channels=fused_channels, num_frames=num_frames)
+        else:
+            self.tca = TCA(channels=fused_channels)
         if gamma_ones:
             # T-A2: 解除休眠 — 输出门控从零初始化改为 1 (EvRWKV LayerScale=1 做法)
             nn.init.ones_(self.tca.spatial_gamma)
@@ -111,8 +116,14 @@ class RWKVOnlyAblation(nn.Module):
         tca_up = F.interpolate(tca_feat, size=(H, W), mode='bilinear',
                                align_corners=False)
 
-        motion_map = self._build_motion_map(
-            tca_out.get("C_omega_list", []), (H, W), x.device)
+        if self.local_align:
+            # T-BC: 置信度回退 — conf 高(匹配唯一/静止)→信任多帧聚合, conf 低(运动/遮挡)→回退中心帧
+            conf = F.interpolate(tca_out["conf_map"], size=(H, W),
+                                 mode='bilinear', align_corners=False)
+            motion_map = 1.0 - conf
+        else:
+            motion_map = self._build_motion_map(
+                tca_out.get("C_omega_list", []), (H, W), x.device)
 
         l1_c = l1_lat[:, center_idx]
         l1_feat = self.proj_l1(l1_c)
