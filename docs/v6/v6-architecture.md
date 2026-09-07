@@ -88,6 +88,99 @@ Flight10 在 Flight9 收敛于 PSNR=16.33 的基础上，聚焦**损失函数优
         Stage A: S1→S2→TCC×6→gain→img_lit,  Stage B: sg[img_lit]+residual→res_t
 ```
 
+### 结构图（Mermaid，2026-09-06 基于 F10m5 代码实测）
+
+#### 整体结构图
+
+```mermaid
+flowchart TB
+    X["输入窗口 I_{t-2..t+2}<br/>(B, 5, 3, H, W)"]
+
+    subgraph ENC["Stage 0 · PyramidEncoder — 多尺度隐式频率路由"]
+        L1["l1_lat 64ch @H<br/>高频局部细节"]
+        L2["l2_lat 64ch @H/2<br/>中尺度结构"]
+        L3["l3_lat 64ch @H/4<br/>低频全局"]
+    end
+
+    subgraph DPEs["Stage 1 · DPE 退化先验估计（取 l3, softplus IllumHead）"]
+        SI["s_illum — Type III 光照先验"]
+        SN["s_noise — Type I/II 噪声先验（空间选择性）"]
+    end
+
+    subgraph TCAs["Stage 2 · TCA 时序对应对齐（取 l2, WKV @ H/2）"]
+        direction TB
+        DWT["HaarDWT anchor<br/>LL 去光照 + HF 边缘（minimal WFR）"]
+        WKV["MVC-Shift → SpatialWKV2D 四方向扫描<br/>→ ChannelMix → ×spatial_gamma"]
+        STATS["mu_t_clean · sigma_t_clean"]
+        COM["TemporalCorrespondence<br/>C_omega_list（32² 全局 softmax）"]
+        TAGG["TemporalAggregation → F_t_aligned"]
+        DWT --> WKV --> STATS
+        DWT --> COM --> TAGG
+    end
+
+    subgraph ISP["Stage 3 · ISPN 光照源处理"]
+        GAIN["gain_map [0.5, 2.0] sigmoid<br/>+ Zero-DCE TCC curve ×6"]
+    end
+
+    subgraph ND["Stage 4a · NDPN 噪声源处理"]
+        SNR["SNR 估计 ← mu/sigma → s_snr"]
+        CONF["conf_proj ← C_omega 对角线<br/>（已退化为全局常数）"]
+        FDN["SNR 加权逐帧聚合 → F_denoised + refine"]
+        CORR["corr_spatial ×gamma≤0.1×(1-detail_map)<br/>+ detail_residual highway + coarse_prior"]
+        SNR --> FDN --> CORR
+        CONF --> CORR
+    end
+
+    subgraph MC["Stage 4b · MCPN 运动源处理"]
+        WC["窗口相关 + 运动门 G_t<br/>（sigma 仅间接代理运动幅度）"]
+    end
+
+    CXG["Stage 4c · CXG 交叉激励门"]
+
+    subgraph SG["Stage 5 · SGRF 物理序两阶段重构"]
+        SA["Stage A（提亮）: S1→S2→TCC×6→gain→img_lit"]
+        SB["Stage B（精炼）: sg[img_lit]<br/>+ delta_scale=0.2 × conv(f_noise, f_motion) → res_t"]
+    end
+
+    X --> ENC
+    ENC --> L1 & L2 & L3
+    L3 --> DPEs
+    L2 --> TCAs
+    L1 -->|"f_enc_center / feats"| ISP
+    L1 -->|"feats (5帧)"| ND
+
+    SI --> ISP
+    SN --> ND
+    TCAs -->|"F_aligned_list / F_t_aligned / mu / sigma / C_omega"| ND
+    TCAs -->|"F_aligned_list / sigma / C_omega"| MC
+    X -->|"image_center 直连"| ND
+    X -->|"image_center 直连"| SG
+
+    ISP -->|"gain_map, curve_A"| SG
+    ND --> CXG
+    MC --> CXG
+    CXG -->|"f_noise_gated, f_motion_gated"| SG
+```
+
+#### “多源噪声分割”部分结构图（Encoder 之后、三分支之前）
+
+```mermaid
+flowchart LR
+    X["输入 5 帧窗口"] --> ENC["PyramidEncoder<br/>多尺度 = 天然频率分离器"]
+
+    ENC -->|"l3 @H/4 低频全局"| DPE["DPE 源先验估计"]
+    DPE --> SI["s_illum<br/>→ Type III 光照先验<br/>（供 ISPN）"]
+    DPE --> SN["s_noise<br/>→ Type I/II 噪声先验<br/>（供 NDPN）"]
+
+    ENC -->|"l2 @H/2 结构"| TCA["TCA 时序对应级分离"]
+    TCA -->|"F_aligned_list<br/>@H 对齐多帧"| FAL["时间平均材料<br/>→ Type I/II（供 NDPN）"]
+    TCA -->|"C_omega_list<br/>32² 全局 softmax"| CO["对应质量信号<br/>→ Type IV 空间定位（供 MCPN/NDPN）<br/>⚠ 已实测退化为常数"]
+    TCA -->|"mu / sigma"| MS["时序统计<br/>→ SNR 自适应（供 NDPN）"]
+
+    ENC -->|"l1 @H 细节"| MAT["细节材料<br/>→ 三分支共享（NDPN/MCPN/SGRF）"]
+    X2["image_center 原始 RGB"] -.->|"直连"| MAT
+```
+
 ---
 
 ## 2. TSDR 理论框架与公式
@@ -756,3 +849,66 @@ elif phase == 'phase2':
 | `losses/losses.py` | TFSNetLoss (Kendall UW + gain_sup + Phase Schedule) |
 | `train.py` | 训练循环 (grad accum + phase lr + metric logging + frame_cache管理) |
 | `configs/delta_flight10m5.yaml` | 训练配置 (batch=2, accum=8, epochs=80) |
+
+---
+
+## 9. 探索中：面向下一完整版本的变更（2026-09-06）
+
+> 依据：概念模型实验序列（v1/v2/v3/A/BC/TA）+ 参考库对比（URWKV/DRWKV/EvRWKV）+ TSDR 716 契合性分析。
+> 详细论证见 `experiments/rwkv_only_v3/TCA_IMPROVEMENT.md` 与 `RESULTS.md`。
+
+### 9.1 已落地：T-A 算子修复（已在共享模块生效）
+
+`pure_rwkv_sace.py` 的 `_scan_cumsum` 跨 chunk 状态传播存在两处数学错误（衰减方向反向 + off-by-one，naive 对照 2.4e-02 → 修复后 4.77e-07 PASS）。已在共享模块修复，F10m5 直接受益。实测对 PSNR 中性（误差大部分相消），保留理由是正确性底线。
+
+### 9.2 进行中：T-BC 局部窗口对齐（替换 C_omega 全局 warp）
+
+**动机**：C_omega 的 32² 全局 softmax warp 是全帧凸组合——TSDR 理论明文警告"对动态源做朴素平均产生鬼影"。实测退化为常数（conf=0.64 恒定），运动边界定位失效。这是三轮消融（A/BC/TA）排除 head 微调与算子嫌疑后，唯一剩余的结构缺陷靶点。
+
+**变更内容**（`experiments/rwkv_only_v3/local_tca.py`，已实现并通过方向合成测试）：
+
+1. LocalWindowAlignment：H/2 全分辨率 R×R=9×9 窗口 softmax 替代 32² 全局稠密 warp——对齐粒度从每格 8×8px 提升到逐位置，位移容限 ±4px
+2. per-frame sigmoid 帧门替代 softmax 强制归一——坏帧可弃权
+3. 置信度回退门控：conf=窗口 softmax 峰值（匹配唯一性），conf 高→信任聚合（平均域），conf 低→回退中心帧（补偿域）——TSDR 归并禁令的逐像素执行
+4. 修复 P4 错位：对齐在增强后特征上计算（旧版信号/载体错位）
+
+### 9.3 三分支对接的接口变更（T-BC 采纳时）
+
+```mermaid
+flowchart TB
+    subgraph TCAN["TCA（T-BC 版，替换时序聚合路径）"]
+        DWT2["HaarDWT anchor（不变）"]
+        WKV2["SpatialWKV2D（T-A 修复算子）"]
+        LWA["LocalWindowAlignment<br/>9×9 窗口 softmax @H/2<br/>per-frame sigmoid 门<br/>conf = max-prob（匹配唯一性）"]
+        OUT["输出新增:<br/>conf_map · disp_field=Σprob·d<br/>· warped_list（全分辨率逐帧）"]
+        DWT2 --> WKV2 --> LWA --> OUT
+    end
+
+    subgraph NDPN2["NDPN（对接变更）"]
+        C2["conf_proj(C_omega对角线)<br/>整体删除 → 直收 conf_map"]
+        F2["F_aligned_list ← warped_list<br/>（全分辨率，平均前提成立）"]
+    end
+
+    subgraph MCPN2["MCPN（对接变更）"]
+        G2["G_t 运动门 ← |disp_field|<br/>（替代 sigma 间接代理）"]
+    end
+
+    subgraph ISPN2["ISPN（新识别缺口：时间锚定）"]
+        A2["+ mu_t_clean 注入<br/>（TSDR: temporal anchoring）"]
+    end
+
+    LWA -->|"conf_map"| C2
+    LWA -->|"warped_list"| F2
+    OUT -->|"disp_field"| G2
+    TCAS["mu_t_clean"] --> A2
+```
+
+### 9.4 ISPN 时间锚定（新识别的 TSDR 契合缺口）
+
+TSDR 716 要求光照源用 "spatial smoothness priors **and temporal anchoring**" 双机制修正。当前 ISPN 仅实现空间平滑（s_illum ← l3），无任何时序输入——而 `mu_t_clean` 就在 TCA 输出中。候选方案：向 ISPN 注入 mu_t_clean（或多帧低频均值）作为时间锚定项，抑制单帧光照估计的闪烁。
+
+### 9.5 明确不做的事
+
+- **不重新引入 WFR**：Flight9 已裁撤（多尺度 Encoder 承担频率路由），T-BC 后如需显式频率路由需全新论证
+- **不采用 URWKV 式 CUDA kernel 直接替换**：其双向融合语义与我们的 4 方向因果扫描不同（naive 对照差 698 无法验证），已选择纯 PyTorch 数学修复路径
+- **不加回梯度隔离/多损失**：概念模型实验已证明 v2 的"单 L1+SSIM、端到端单路径"优于 F10m5 的 Kendall UW 15 项损失与 stop-gradient 设计；三分支对接时应同步简化损失结构（T3 方案）
