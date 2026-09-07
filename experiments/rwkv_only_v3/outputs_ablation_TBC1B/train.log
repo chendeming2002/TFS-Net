@@ -1,0 +1,7 @@
+2026-09-07 19:30:36,053 - INFO - Ablation=TBC1B flags={'remove_sigmoid': False, 'use_hf_residual': False, 'use_conf_scale': False, 'gamma_ones': False, 'local_align': True, 'bootstrap': 'bias'} Params: 0.89M
+2026-09-07 19:31:33,808 - INFO - step 50/4027 loss=0.3053
+2026-09-07 19:32:30,111 - INFO - step 100/4027 loss=0.2952
+2026-09-07 19:33:26,275 - INFO - step 150/4027 loss=0.2954
+2026-09-07 19:34:22,232 - INFO - step 200/4027 loss=0.2911
+2026-09-07 19:35:17,900 - INFO - step 250/4027 loss=0.2828
+2026-09-07 19:36:13,560 - INFO - step 300/4027 loss=0.2764

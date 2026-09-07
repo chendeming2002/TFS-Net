@@ -20,7 +20,7 @@ class RWKVOnlyAblation(nn.Module):
     def __init__(self, in_channels=3, level_channels=(32, 64, 96),
                  fused_channels=64, num_frames=5,
                  remove_sigmoid=False, use_hf_residual=False, use_conf_scale=False,
-                 gamma_ones=False, local_align=False):
+                 gamma_ones=False, local_align=False, bootstrap="none"):
         super().__init__()
         self.remove_sigmoid = remove_sigmoid
         self.use_hf_residual = use_hf_residual
@@ -36,7 +36,8 @@ class RWKVOnlyAblation(nn.Module):
             num_bottleneck_blocks=0,
         )
         if local_align:
-            self.tca = LocalTCA(channels=fused_channels, num_frames=num_frames)
+            self.tca = LocalTCA(channels=fused_channels, num_frames=num_frames,
+                                bootstrap=bootstrap)
         else:
             self.tca = TCA(channels=fused_channels)
         if gamma_ones:

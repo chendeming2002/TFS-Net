@@ -36,11 +36,20 @@ class LocalWindowAlignment(nn.Module):
       warp(p) = Σ_d prob·neighbor_{p+d}      ← 局部凸组合 (非全帧)
       conf(p) = mean_t max_d prob_t(p, d)    ← 匹配唯一性 (运动→平坦→低)
       F_out = conf·gate_agg + (1-conf)·center
+
+    bootstrap 参数 (T-BC1b, 修复 T-BC1 的乘性自门控冷启动死锁):
+      "none" — 原版: conf=max-prob, 初始≈1/81 → 支路梯度被 conf 缩放致死 (已证实死锁)
+      "bias" — 恒等偏移: (0,0) 偏移的 logit 加可学习偏置 (init 4.5, 初始 conf≈0.86)
+               "先信任对齐, 学会在运动边界不信任" —— 符合 SDSD 静态主导统计
+      "gate" — 独立可学习门: conf = sigmoid(conv([center, F_agg])), 与对齐 softmax 解耦,
+               零初始化 → conf=0.5 起步, 门自身的输入路径保证 F_agg 支路梯度不灭
     """
 
-    def __init__(self, channels: int = 64, radius: int = 4, embed_dim: int = 16):
+    def __init__(self, channels: int = 64, radius: int = 4, embed_dim: int = 16,
+                 bootstrap: str = "none"):
         super().__init__()
         self.radius = radius
+        self.bootstrap = bootstrap
         self.embed = nn.Conv2d(channels, embed_dim, 1, bias=False)
         self.temp_raw = nn.Parameter(torch.zeros(1))
         self.frame_gate = nn.Sequential(
@@ -48,7 +57,17 @@ class LocalWindowAlignment(nn.Module):
             nn.GELU(),
             nn.Conv2d(channels, 1, 1),
         )
+        if bootstrap == "bias":
+            self.identity_bias = nn.Parameter(torch.tensor(5.8))
+        elif bootstrap == "gate":
+            self.conf_gate = nn.Sequential(
+                nn.Conv2d(channels * 2, channels, 3, 1, 1),
+                nn.GELU(),
+                nn.Conv2d(channels, 1, 1),
+            )
         self.out_norm = LayerNorm2d(channels)
+        # (0,0) 恒等偏移在 offsets 展开序列中的索引 (dx 外层, dy 内层)
+        self.id_idx = radius * (2 * radius + 1) + radius
 
     @property
     def temp(self) -> torch.Tensor:
@@ -75,7 +94,17 @@ class LocalWindowAlignment(nn.Module):
                 sk = _pad_crop(nk[:, t], dx, dy, r)
                 logits.append((ck * sk).sum(1, keepdim=True))
         logits = torch.cat(logits, dim=1) / self.temp                 # (B, Tn·R², H, W)
-        probs = F.softmax(logits, dim=1)
+
+        if self.bootstrap == "bias":
+            bias_map = torch.zeros_like(logits)
+            for t in range(Tn):
+                bias_map[:, t * R2 + self.id_idx] = self.identity_bias
+            logits = logits + bias_map
+
+        # T-BC1b: 逐帧窗口 softmax (每帧 R² 内归一) —— 联合 softmax 会让 Tn 个恒等
+        # 偏移互相竞争, 把 conf 上限钳在 1/Tn; 逐帧归一后帧内对齐置信与帧间门控解耦
+        probs = F.softmax(logits.view(B, Tn, R2, H, W), dim=2) \
+                   .reshape(B, Tn * R2, H, W)
 
         # pass 2: 逐帧加权聚合 (sigmoid 帧门允许弃权, 非 softmax 强制归一)
         conf_maps = []
@@ -96,7 +125,11 @@ class LocalWindowAlignment(nn.Module):
             gate_sum = g if gate_sum is None else gate_sum + g
 
         F_agg = agg / (gate_sum + 1e-6)                               # 全弃权 → →0
-        conf = torch.stack(conf_maps, dim=1).mean(dim=1)              # (B,1,H,W)
+
+        if self.bootstrap == "gate":
+            conf = torch.sigmoid(self.conf_gate(torch.cat([center, F_agg], dim=1)))
+        else:
+            conf = torch.stack(conf_maps, dim=1).mean(dim=1)          # (B,1,H,W)
         conf = F.avg_pool2d(conf, 3, 1, 1)                            # 轻度平滑
 
         out = conf * F_agg + (1.0 - conf) * center
@@ -106,9 +139,11 @@ class LocalWindowAlignment(nn.Module):
 class LocalTCA(TCA):
     """共享 TCA 的实验子类: 空间路径不变, 时序聚合替换为 LocalWindowAlignment。"""
 
-    def __init__(self, channels: int = 64, num_frames: int = 5, radius: int = 4):
+    def __init__(self, channels: int = 64, num_frames: int = 5, radius: int = 4,
+                 bootstrap: str = "none"):
         super().__init__(channels=channels, num_frames=num_frames)
-        self.local_align = LocalWindowAlignment(channels, radius=radius)
+        self.local_align = LocalWindowAlignment(channels, radius=radius,
+                                                bootstrap=bootstrap)
 
     def forward(self, feats: torch.Tensor) -> Dict:
         B, T, C, H_ds, W_ds = feats.shape
