@@ -3,13 +3,13 @@ TFS-Net v6 Delta Mark1 — Three-source Fusion & Synthesis Network (2026-07-01)
 ============================================================================
 端到端多帧低光增强网络。
 
-整体结构:
-    Stage 0: PyramidEncoder → F_stack
-    Stage 1: SWD (Spatial Wavelet Diverter) → feat_tfde + feat_tca
-    Stage 2: TFDE (时频退化估计) → s_illum, s_noise
-    Stage 3: TCA (时序对应对齐) → tca_out, C_omega_list, F_t_aligned
-    Stage 4: ISPN/NDPN/MCPN 三源恢复
-    Stage 5: CXG + SGRF → res_t
+整体结构 (Flight9 起 WFR/SWD 已取消, 各模块直接选取所需 Encoder 尺度):
+    Stage 0: PyramidEncoder → l1/l2/l3 (多尺度天然频率分离)
+    Stage 1: DPE (退化先验估计, 取 l3) → s_illum, s_noise
+    Stage 2: TCA (时序对应对齐, 取 l2, WKV @ H/2) → tca_out, C_omega_list, F_t_aligned
+    Stage 3: ISPN 光照分支 (取 l1)
+    Stage 4: NDPN 噪声分支 (取 l1) + MCPN 运动分支 + CXG 交叉门控
+    Stage 5: SGRF 物理序两阶段重构 → res_t
 """
 
 from __future__ import annotations
