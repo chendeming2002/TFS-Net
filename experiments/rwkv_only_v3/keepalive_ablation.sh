@@ -1,9 +1,9 @@
 #!/bin/bash
 # 训练 keepalive 包装器 — 进程崩溃自动断点续训 (断电重启后需手动跑一次本脚本)
-# 用法: nohup bash experiments/rwkv_only_v3/keepalive_ablation.sh A &
+# 用法: nohup bash experiments/rwkv_only_v3/keepalive_ablation.sh <A|B|C|BC|TA|TBC|TBC1B|TABC|ABC|none> [目标epoch=20] &
 
-ABLATION=${1:?用法: keepalive_ablation.sh <A|B|C|ABC|none>}
-CFG=/tmp/ablation_${ABLATION}.yaml
+ABLATION=${1:?用法: keepalive_ablation.sh <ABLATION> [目标epoch=20]}
+TARGET=${2:-20}
 CKPT_DIR=/home/a1005/25/TFS-Net/experiments/rwkv_only_v3/outputs_ablation_${ABLATION}
 LOG=/tmp/keepalive_${ABLATION}.log
 
@@ -23,10 +23,10 @@ while true; do
 import torch
 try:
     c = torch.load('$CKPT_DIR/latest.pth', map_location='cpu', weights_only=False)
-    print(1 if c['epoch'] >= 20 else 0)
+    print(1 if c['epoch'] >= $TARGET else 0)
 except: print(0)" 2>/dev/null)
   if [ "$DONE" = "1" ]; then
-    echo "[$(date '+%F %T')] 已达 20 epochs, keepalive 退出" >> "$LOG"
+    echo "[$(date '+%F %T')] 已达 $TARGET epochs, keepalive 退出" >> "$LOG"
     break
   fi
   sleep 60

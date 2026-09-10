@@ -119,6 +119,8 @@ def build_model(cfg, device):
         num_igrf_res_blocks=model_cfg.get("num_igrf_res_blocks", 2),
         use_amp_enhance=model_cfg.get("use_amp_enhance", False),
         charlie_mode=model_cfg.get("charlie_mode", False),
+        use_local_tca=model_cfg.get("use_local_tca", False),
+        tca_bootstrap=model_cfg.get("tca_bootstrap", "bias"),
     )
     return model.to(device)
 

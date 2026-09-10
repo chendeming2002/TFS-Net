@@ -108,6 +108,8 @@ class TFSNet(nn.Module):
         num_igrf_res_blocks: int = 2,
         use_amp_enhance: bool = False,
         charlie_mode: bool = False,
+        use_local_tca: bool = False,
+        tca_bootstrap: str = "bias",
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -134,7 +136,15 @@ class TFSNet(nn.Module):
             use_soft_median=use_soft_median,
         )
 
-        self.tca = TCA(channels=fused_channels)
+        if use_local_tca:
+            # Flight11: T-BC1b 主干 — LocalWindowAlignment 替换 C_omega 全局 warp,
+            # 输出 conf_map/warped_list/disp_field 供 NDPN/MCPN 对接
+            from models.modules.local_tca import LocalTCA
+            self.tca = LocalTCA(channels=fused_channels, num_frames=5,
+                                bootstrap=tca_bootstrap)
+        else:
+            self.tca = TCA(channels=fused_channels)
+        self.use_local_tca = use_local_tca
 
         self.ispn = ISPN(channels=fused_channels, img_channels=in_channels)
         self.ndpn = NDPN(channels=fused_channels)
@@ -225,8 +235,25 @@ class TFSNet(nn.Module):
 
         # Stage 2: TCA — WKV @ H/2 on l2_lat directly (no WFR pre-processing)
         tca_out = self.tca(l2_lat)
-        F_aligned_list_half = [tca_out["tca_out"][:, t] for t in range(T)]
-        F_aligned_list = [F.interpolate(f, size=(H, W), mode='bilinear', align_corners=False) for f in F_aligned_list_half]
+        conf_map_h = None
+        disp_field_h = None
+        if self.use_local_tca:
+            # Flight11 (T-BC1b 主干): F_aligned_list ← 恒等帧 + 逐帧窗口对齐特征 (P2)
+            warped_list = tca_out["warped_list"]
+            F_aligned_list_half = []
+            widx = 0
+            for t in range(T):
+                if t == center_idx:
+                    F_aligned_list_half.append(tca_out["tca_out"][:, t])
+                else:
+                    F_aligned_list_half.append(warped_list[widx])
+                    widx += 1
+            F_aligned_list = [F.interpolate(f, size=(H, W), mode='bilinear', align_corners=False) for f in F_aligned_list_half]
+            conf_map_h = F.interpolate(tca_out["conf_map"], size=(H, W), mode='bilinear', align_corners=False)
+            disp_field_h = F.interpolate(tca_out["disp_field"], size=(H, W), mode='bilinear', align_corners=False)
+        else:
+            F_aligned_list_half = [tca_out["tca_out"][:, t] for t in range(T)]
+            F_aligned_list = [F.interpolate(f, size=(H, W), mode='bilinear', align_corners=False) for f in F_aligned_list_half]
         C_omega_list = tca_out.get("C_omega_list", [])
         F_t_aligned = F.interpolate(tca_out["F_t_aligned"], size=(H, W), mode='bilinear', align_corners=False)
         mu_t_clean = F.interpolate(tca_out["mu_t_clean"], size=(H, W), mode='bilinear', align_corners=False)
@@ -252,9 +279,10 @@ class TFSNet(nn.Module):
             ndpn_out = self.ndpn(feats=feats, F_aligned_list=F_aligned_list, mu_t_clean=mu_t_clean,
                 sigma_t_clean=sigma_t_clean, s_noise=s_noise, center_idx=center_idx,
                 C_omega_list=C_omega_list, F_t_aligned=F_t_aligned, image_center=image_center,
-                l2_feats=l2_lat)
+                l2_feats=l2_lat, conf_map=conf_map_h)
             mcpn_out = self.mcpn(F_aligned_list=F_aligned_list, center_idx=center_idx,
-                sigma_t_clean=sigma_t_clean, C_omega_list=C_omega_list, F_t_aligned=F_t_aligned)
+                sigma_t_clean=sigma_t_clean, C_omega_list=C_omega_list, F_t_aligned=F_t_aligned,
+                disp_field=disp_field_h)
             f_noise_out = ndpn_out["f_noise_out"] * unlock
             f_motion_out = mcpn_out["f_motion_out"] * unlock
             if unlock > 0.3:
@@ -265,9 +293,10 @@ class TFSNet(nn.Module):
             ndpn_out = self.ndpn(feats=feats, F_aligned_list=F_aligned_list, mu_t_clean=mu_t_clean,
                 sigma_t_clean=sigma_t_clean, s_noise=s_noise, center_idx=center_idx,
                 C_omega_list=C_omega_list, F_t_aligned=F_t_aligned, image_center=image_center,
-                l2_feats=l2_lat)
+                l2_feats=l2_lat, conf_map=conf_map_h)
             mcpn_out = self.mcpn(F_aligned_list=F_aligned_list, center_idx=center_idx,
-                sigma_t_clean=sigma_t_clean, C_omega_list=C_omega_list, F_t_aligned=F_t_aligned)
+                sigma_t_clean=sigma_t_clean, C_omega_list=C_omega_list, F_t_aligned=F_t_aligned,
+                disp_field=disp_field_h)
             f_noise_gated, f_motion_gated = self.cxg(ndpn_out["f_noise_out"], mcpn_out["f_motion_out"])
 
         # SGRF: 阶段式修复融合 (Flight5: TCC curve)

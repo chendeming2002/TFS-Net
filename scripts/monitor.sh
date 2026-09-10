@@ -2,12 +2,18 @@
 # 训练+温度 一体监视 (每 5 秒刷新)
 # 用法: watch -n 5 bash scripts/monitor.sh   或直接 bash scripts/monitor.sh
 
-# 自动发现活跃训练日志: 取最近修改的 train.log
-LOG=$(ls -t /home/a1005/25/TFS-Net/experiments/rwkv_only_v3/outputs_ablation*/train.log \
-      /home/a1005/25/TFS-Net/experiments/rwkv_only_v3/outputs_notca/train.log 2>/dev/null | head -1)
-LOG=${LOG:-/home/a1005/25/TFS-Net/experiments/rwkv_only_v3/outputs_ablation_A/train.log}
+# 自动发现活跃训练日志: 取最近修改的 train.log (覆盖 rwkv_only_v3 消融 + 完整模型 f11)
+LOG=$(ls -t \
+      /home/a1005/25/TFS-Net/outputs/sdsd_f11/train.log \
+      /home/a1005/25/TFS-Net/outputs/sdsd_f10m5/train.log \
+      /home/a1005/25/TFS-Net/experiments/rwkv_only_v3/outputs_ablation*/train.log \
+      /home/a1005/25/TFS-Net/experiments/rwkv_only_v3/outputs_notca/train.log \
+      /home/a1005/25/TFS-Net/experiments/rwkv_only_v3/outputs/train.log \
+      2>/dev/null | head -1)
+LOG=${LOG:-/home/a1005/25/TFS-Net/outputs/sdsd_f11/train.log}
+TAG=$(echo "$LOG" | grep -oP "sdsd_f11|sdsd_f10m5|ablation_\w+|notca|outputs" | head -1)
 
-echo "══════════ 训练进度 ══════════"
+echo "══════════ 训练进度 [$TAG] ══════════"
 # 最近 3 条 step/Epoch/Val
 grep -a "step\|Epoch\|Val:" "$LOG" | tail -3
 

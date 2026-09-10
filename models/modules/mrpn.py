@@ -117,7 +117,7 @@ class MCPN(nn.Module):
         return aligned
 
     def forward(self, F_aligned_list, center_idx, sigma_t_clean=None,
-                C_omega_list=None, F_t_aligned=None):
+                C_omega_list=None, F_t_aligned=None, disp_field=None):
         f_t_aligned = F_aligned_list[center_idx]
         f_neighbors = torch.stack(
             [F_aligned_list[i] for i in range(len(F_aligned_list)) if i != center_idx],
@@ -129,9 +129,15 @@ class MCPN(nn.Module):
 
         f_omega_aligned = self._aggregate_neighbors(f_center, f_neighbors)
 
-        # Delta: motion magnitude from C_omega_list (full motion_estimator)
+        # Delta: motion magnitude
+        # P1: T-BC1b 接口 — disp_field (soft-argmax 位移场, 已上采样到 f 分辨率)
+        #     |disp| 单调映射到 (0,1): mag≈0px→0, mag≈4px→0.98; 替代退化的 C_omega 对角线
         motion_mag = None
-        if C_omega_list is not None and len(C_omega_list) > 0:
+        if disp_field is not None:
+            # 运动幅度 = 位移矢量 L2 范数 (px), 单调映射到 (0,1): 0px→0, 4px→0.98
+            mag = torch.sqrt(disp_field.pow(2).sum(dim=1, keepdim=True) + 1e-8)
+            motion_mag = 1.0 - torch.exp(-mag)
+        elif C_omega_list is not None and len(C_omega_list) > 0:
             diag_vals = []
             for C_t in C_omega_list:
                 diag = C_t.diagonal(dim1=-2, dim2=-1)  # (B, N)

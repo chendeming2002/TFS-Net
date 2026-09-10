@@ -94,6 +94,9 @@ class NDPN(nn.Module):
         # P2: gamma clamp relaxed to 0.1
         self.gamma_raw = nn.Parameter(torch.full((1, channels, 1, 1), 0.01))
 
+        # P3: luckiness 残差门 (CDVD-TSP) — 对齐后验信任度, δ 可学习
+        self.luck_delta = nn.Parameter(torch.log(torch.tensor(0.5)))
+
     @property
     def gamma(self):
         return self.gamma_raw.clamp(max=0.1)
@@ -113,7 +116,8 @@ class NDPN(nn.Module):
                 s_noise: torch.Tensor, center_idx: int,
                 C_omega_list: list = None, F_t_aligned: torch.Tensor = None,
                 image_center: torch.Tensor = None,
-                l2_feats: torch.Tensor = None) -> Dict[str, torch.Tensor]:
+                l2_feats: torch.Tensor = None,
+                conf_map: torch.Tensor = None) -> Dict[str, torch.Tensor]:
         B, T, C, H, W = feats.shape
         eps = 1e-6
 
@@ -125,13 +129,16 @@ class NDPN(nn.Module):
         s_snr = torch.sigmoid((snr_hat - self.tau_mid) / tau_scale)
 
         # Step 2: C_omega confidence map
+        # P2: T-BC1b 接口 — conf_map 由 LocalTCA 直接提供 (H 分辨率), 替换退化的 C_omega 对角线路径
         conf_map = None
-        if C_omega_list is not None and len(C_omega_list) > 0:
-            diag_scores = []
+        if conf_map is not None:
+            pass  # 调用方已上采样到 (B,1,H,W)
+        elif C_omega_list is not None and len(C_omega_list) > 0:
+            diag_vals = []
             for C_t in C_omega_list:
                 diag = C_t.diagonal(dim1=-2, dim2=-1)
-                diag_scores.append(diag)
-            diag_stack = torch.stack(diag_scores, dim=-1)
+                diag_vals.append(diag)
+            diag_stack = torch.stack(diag_vals, dim=-1)
             conf_raw = self.conf_proj(diag_stack).squeeze(-1)
             ds = int(conf_raw.shape[-1] ** 0.5)
             conf_map = conf_raw.reshape(B, 1, ds, ds)
@@ -139,7 +146,25 @@ class NDPN(nn.Module):
 
         # Step 3: Multi-frame SNR-weighted temporal aggregation
         F_ref = F_t_aligned if F_t_aligned is not None else feats[:, center_idx]
+
+        # P3: luckiness 残差门 (CDVD-TSP) — 对齐后验: warp 后残差越小越可信
+        # 在 4× 降采样上计算 (≈LL 带防暗区 Type I/II 噪声误杀), 5×5 mean filter
+        luck_weights = None
+        if F_t_aligned is not None:
+            delta = torch.exp(self.luck_delta)
+            ds_feat = F.avg_pool2d(F_ref, 4)
+            luck_weights = []
+            for i in range(T):
+                if i == center_idx:
+                    continue
+                r_i = F.avg_pool2d((F_aligned_list[i] - F_ref).abs().mean(dim=1, keepdim=True), 4)
+                r_i = F.avg_pool2d(r_i, 5, 1, 2)
+                luck_weights.append(torch.exp(-r_i * r_i / (2 * delta * delta + 1e-8)))
+            luck_weights = [F.interpolate(w, size=(H, W), mode='bilinear', align_corners=False)
+                            for w in luck_weights]
+
         alphas = []
+        lw_idx = 0
         for i in range(T):
             F_i_aligned = F_aligned_list[i]
             if i == center_idx:
@@ -148,6 +173,9 @@ class NDPN(nn.Module):
                 resid = (F_i_aligned - F_ref).abs()
                 alpha_raw = torch.sigmoid(self.alpha_conv(resid))
                 alpha_i = alpha_raw * (1.0 - s_snr)
+                if luck_weights is not None:
+                    alpha_i = alpha_i * luck_weights[lw_idx]
+                    lw_idx += 1
             alphas.append(alpha_i)
         alpha_sum = torch.stack(alphas, dim=1).sum(dim=1) + eps
 

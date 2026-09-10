@@ -134,9 +134,35 @@ s_illum（Type III 先验）+ s_noise（Type I/II 先验）与理论一一对应
 
 | 源 | 理论机制 | 结构实现 | 契合 |
 |----|---------|---------|:--:|
-| 噪声 (I+II) | 对齐后时间平均 + SNR 加权 | NDPN 全套输入就位；对齐质量/前提检验两处退化 | ◐ |
-| 光照 (III) | 空间平滑 + **时间锚定** | 仅空间平滑；时间锚定未实现 | ✗ |
-| 动态 (IV) | 显式对齐/补偿 + 边界定位 | 补偿材料就位；位移场/边界图缺位 | ◐ |
-| 分离 (TCA 职责) | 对应质量判据 | C_omega 退化 → 未分离 | ✗ |
+| 噪声 (I+II) | 对齐后时间平均 + SNR 加权 | NDPN 全套输入就位；对齐质量/前提检验两处退化（T-BC1b 转正后修复）| ◐ |
+| 光照 (III) | 空间平滑 + **时间锚定** | 仅空间平滑；时间锚定未实现（URWKV LAN 提供修复路线，见下）| ✗ |
+| 动态 (IV) | 显式对齐/补偿 + 边界定位 | 补偿材料就位；位移场/边界图缺位（T-BC1b 已预留接口）| ◐ |
+| 分离 (TCA 职责) | 对应质量判据 | C_omega 退化 → 未分离（**T-BC1b 终判：该职责在 SDSD 上不可操作化，见更新判读**）| ✗ |
 
-**结论**：架构骨架与 TSDR 理论自洽（DPE=先验估计、TCA=对应分离、三分支=三源处理、SGRF=物理序归并），三处实现级缺口中两处（动态源测量、分离信号）由 T-BC 补齐，一处（ISPN 时间锚定）为新识别的待办。另注意：716 论文文本的架构枚举（WFR）与代码不同步（见上文注记），论文改版时应一并更新。
+---
+
+## 契合性分析的 T-BC1b 修正判读（2026-09-10 增补）
+
+> 本节用于**修正**上文契合性表中的两条判断——T-BC1b@40 结果与本地 LLVE 代码调研（CDVD-TSP/fastdvdnet/STCD/DRWKV/URWKV/EvRWKV/StableLLVE/FRBNet）改写了两处结论。
+
+### M1. "分离信号"（TCA 职责）判读修正
+
+**原判断**：TCA 的 conf_map/window max-prob 作为 Type IV 空间选择性估计器，是 TSDR 分离信号的正确实现。
+**修正（T-BC1b@40 终判）**：窗口 max-prob 静态/运动无分化（0.698≈0.6995），被二次证伪为**场景判别器**。conf_map 的正确语义 = **匹配唯一性先验信号（warp 前向权重）**，而非 motion/scene discriminator。正确的多帧形态是"**始终开启聚合 + 可学习帧门**"——conf_map 仅作为门控的辅助权重。**"分离" 不再通过 TCA 的判别信号实现，而是通过三分支各自的物理先验实现（TSDR 的不可归并论证是静态机制划分，不需要 TCA 在线判别）**。
+
+### M2. 三分支输入清单（LLVE-informed 追加）
+
+基于本地参考库原文代码（CDVD-TSP/fastdvdnet/STCD/DRWKV/URWKV/EvRWKV/StableLLVE/FRBNet）：
+
+| 排名 | 喂法 | 来源依据 | 理由 |
+|:--:|------|----------|------|
+| 1 | **MCPN ← disp_field + \|disp\| 幅值** | T-BC1b 自带；CDVD flow-concat 先例 | 首次获得直接 Type IV 测量；零成本（softmax 副产物）。**替代已证伪的 C_omega 间接代理**（sigma/对角线）|
+| 2 | **NDPN ← warped_list（全分辨率逐帧）+ conf_map 替代 conf_proj** | T-BC1b 接口预留 | 全分辨率对齐后归一化平均的"对齐成立"前提首次满足 |
+| 3 | **NDPN/MCPN 聚合 ← per-frame luckiness 残差门** | CDVD-TSP `exp(−‖warped_t−center‖²/2δ²)`，5×5 mean filter 防暗区误杀 | **对齐后验信任度**，与 conf 先验互补（conf 问"匹不匹得上"，luckiness 问"warp 完还一不一致"）。CDVD 消融承重墙 |
+| 4 | **DPE ← +s_edge 头（时序 mu 上）+ 分支组合自洽 loss** | DRWKV GER 四头 + Retinex 闭式绑定 | 喂 NDPN detail 路径与 MCPN 运动边界判据；自洽约束治 DPE 塌缩 |
+| 5 | **ISPN ← LAN 式全局亮度状态调制（时间锚定修复）** | URWKV LAN（深度核实无 DCE curve）| 修复本文"契合缺口"；对跨阶段特征 GAP + MLP → 逐通道 scale 注入 ISPN refine。**工程警告：LAN 发布代码在 forward 内现建 Conv/Linear，移植必须挪 `__init__`** |
+| 6 | **NDPN ← s_noise 从末端加性注入改为输入侧逐帧 concat（fastdvdnet 式）** | fastdvdnet `models.py:121` | 噪声水平作为滤波前置条件：先知噪声再平均（因果序）|
+| 7 | **训练期：GT 上的 disp_field 外部匹配器监督（离线 DKM/CMP certainty）** | STCD (live scan) + StableLLVE (offline flow, w=20) | 零推理成本提升位移场质量；STCD R-constraint 其最强消融（3.15dB）|
+| 8 | DPE 附加 FRBNet FCCR 光照不变特征通道（低优先）| FRBNet | DPE 已有时序统计，边际 |
+
+**修正补充**：上文 M1 的"分离信号"失效结论已在 RESULTS.md §5 定案——**TSDR 的静态划源不依赖在线判别信号**，分离通过三分支的物理先验（平滑 vs 对齐 vs 平均）自然成立；TCA 的职责从"判别源"转为"提供对齐材料 + 全局亮度状态"。
