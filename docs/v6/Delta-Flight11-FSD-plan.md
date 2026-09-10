@@ -211,7 +211,27 @@ L = Charbonnier(res_t, GT) + 0.2·(1−SSIM(res_t, GT))     ← 概念模型验�
   + 0.05·gain_sup                                          ← ISPN 弱锚点（ic detach）
 ```
 
-移除：freq / perc / inter / lit / ndpn_aux / mcpn_aux / ssim_s2 / brightness_preserve / residual_reg / 全部 UW。
+**修改前后逐项对比**：
+
+| 损失项 | TFSNetLoss（修改前）| TFSNetLossSimple（修改后）| 处置依据 |
+|--------|-------------------|--------------------------|---------|
+| L_pix | Charbonnier，UW 加权 | Charbonnier，固定 λ=1.0 | **保留**（概念模型验证核心）|
+| L_ssim | 1−SSIM(res_t)，UW | 1−SSIM(res_t)，固定 λ=0.2 | **保留**（同上）|
+| L_illum_spatial | ReLU(1−std) 单边，λ=0.1 固定 | 同左，λ=0.05 固定 | **保留**（DPE 反塌缩，Flight9 实修）|
+| L_illum_tv | 边缘感知 TV，λ=0.05 固定 | 同左，λ=0.05 固定 | **保留**（同上）|
+| L_gain_sup | L1(gain, gt/ic.detach())，0.5 固定 | 同左，λ=0.05 固定 | **保留降权**（ISPN 锚点；目标非平稳，弱化）|
+| L_freq | FFT 幅值 (+相位) L1，UW | ✗ 移除 | 稀释；与 SSIM 高频职责重叠 |
+| L_perc | VGG 多层 L1，UW | ✗ 移除 | 稀释（实测 phase1_5 最大单项 0.688）|
+| L_inter | Charbonnier(img_s2·gain, GT)，UW | ✗ 移除 | 端到端覆盖 well-posed 版本 |
+| L_lit | L1(img_lit, GT)，0.5 固定 | ✗ 移除 | 中间监督稀释 |
+| **L_ndpn_aux** | 1−SSIM(img_s1, GT)，0.2 固定 | ✗ 移除 | **结构性冲突**：暗 img_s1 vs 亮 GT 亮度项恒偏置（自证≈0.3），逆物理分阶 |
+| **L_mcpn_aux** | L1(img_s2, GT)，0.1 固定 | ✗ 移除 | **结构性冲突**：暗 img_s2 vs 亮 GT 恒偏置；L_inter 才是 well-posed 形态 |
+| L_ssim_s2 | 1−SSIM(img_s2, GT)，0.1 固定 | ✗ 移除 | 同上（暗中间态）|
+| L_brightness_preserve | ReLU 单边亮度单调，0.5 固定 | ✗ 移除 | 稀释 |
+| L_residual_reg | \|residual\|.mean()，0.1 固定 | ✗ 移除 | 稀释 |
+| L_wfr_reg / L_gamma_reg / L_align_warp | 死代码（hasattr/C_omega 守卫恒 0）| ✗（TFSNetLoss 内保留惰性）| 零行为影响 |
+| **Kendall UW** | 7 个可学习 log_var 加权 | ✗ 全部固定权重 | **核心变更**：UW 稀释 pixel 梯度且无法纠正错误任务集合（15 项 vs 2 项的 +1.75dB 证据）|
+
 配置：`configs/delta_flight11_simple.yaml`（就绪未启动，S1 终判后接续——归因顺序：先骨干后损失，一次只动一个变量）。
 
 ### S2（V1 达标后）
@@ -226,7 +246,46 @@ L = Charbonnier(res_t, GT) + 0.2·(1−SSIM(res_t, GT))     ← 概念模型验�
 
 ---
 
-## 7. 风险与回退
+## 7. 训练过程与损失变化分析（2026-09-10 21:00 增补，至 ep12 phase1_5）
+
+### 7.1 相序轨迹与损失分量
+
+| 阶段 | epoch | total | pix | ssim(1−SSIM) | i_sup | 说明 |
+|------|:-----:|:-----:|:---:|:----:|:----:|------|
+| warmup 起 | 1 | 0.708 | 0.278 | 0.543 | 0.591 | ISPN-only，gain_map 快速收敛 |
+| warmup 末 | 5 | 0.169 | 0.120 | 0.366 | 0.163 | pix 降 57% |
+| phase1 末 | 11 | 0.115 | 0.114 | 0.337 | 0.136 | pix 平台期 |
+| **phase1_5 进入** | 12 | **1.785** | **0.189** | 0.381 | **0.259** | 分支解锁 + 辅助项激活 |
+
+ep10 验证：**PSNR=16.70 / SSIM=0.651 / LPIPS=0.359**。diag：s_illum 0.899±0.096（未塌缩 ✓），gain 1.14（界内 ✓），分支 gamma=0.01（刚起步）。
+
+### 7.2 与 F10m5 的同相序对照
+
+| 对照点 | F10m5（旧主干）| Flight11（T-BC1b）| 判读 |
+|--------|:--:|:--:|------|
+| ep10 [phase1] | 16.78 / 0.646 | 16.70 / 0.651 | **-0.08 噪声内平手——且此对照无信息量** |
+| ep20 [phase1_5, unlock≈0.5-0.6] | 16.77 / 0.676 | 待出（明早）| **首个有效判据** |
+
+**关键洞察：ep10 对照对主干无信息量**——phase1 下 unlock=0，NDPN/MCPN 输出被置零，LocalTCA 的全部贡献（warped_list/disp_field/conf_map）经门控归零，两模型实际都在跑 ISPN-only 路径。16.70≈16.78 恰是预期行为。**主干的真正判据在 ep20（unlock≈0.6）与 ep30+（phase2 全开）**。
+
+### 7.3 phase1_5 损失跳变的解构
+
+total 0.115→1.785 的跳变由三部分构成：
+1. **辅助项激活**：perc 0.688（最大单项）+ inter 0.222 + freq 0.020——这些正是 S1.5 要移除的稀释项
+2. **pix 退化 0.114→0.189（+66%）**：双因混合——(a) 分支经 SGRF 零门开启扰动输出；(b) UW 重平衡挤压 pixel 梯度
+3. **i_sup 回升 0.136→0.259**：gain_sup 目标 = gt/img_curved 非平稳——分支解锁改变 ic → 目标重置
+
+### 7.4 对当前改进的思考
+
+1. **损失稀释获得实证**：phase1（pix+ssim only）时 pix 单调降至 0.114；phase1_5 一开辅助项，pix 立刻退化 66%——S1.5 简化损失针对的现象在完整模型中同样存在。但分支扰动与梯度竞争混在一起，归因需靠 S1.5 对照（同主干、只换损失）
+2. **perc 应是首个移除对象**：0.688 的常量大项，VGG 在中间态输出上的距离几乎不随训练下降
+3. **gain_sup 目标非平稳是隐患**：ic 随分支解锁漂移使 ISPN 锚点抖动——Simple 版降权至 0.05 缓解，若仍有问题可改 gt/input_center（真平稳目标）
+4. **预测**：F11@ep20 显著 >16.77 → 主干+P1/P2/P3 有效；≈16.77 → 需查 unlock 路径贡献（conf/gamma 轨迹）
+5. **时间线**：~25min/epoch，ep20 验证明早、ep40 终判明下午
+
+---
+
+## 8. 风险与回退
 
 | 风险 | 缓解/回退 |
 |------|----------|
@@ -237,7 +296,7 @@ L = Charbonnier(res_t, GT) + 0.2·(1−SSIM(res_t, GT))     ← 概念模型验�
 
 ---
 
-## 8. 关键文件
+## 9. 关键文件
 
 | 文件 | 角色 |
 |------|------|
