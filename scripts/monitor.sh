@@ -11,7 +11,7 @@ LOG=$(ls -t \
       /home/a1005/25/TFS-Net/experiments/rwkv_only_v3/outputs/train.log \
       2>/dev/null | head -1)
 LOG=${LOG:-/home/a1005/25/TFS-Net/outputs/sdsd_f11/train.log}
-TAG=$(echo "$LOG" | grep -oP "sdsd_f11|sdsd_f10m5|ablation_\w+|notca|outputs" | head -1)
+TAG=$(basename "$(dirname "$LOG")")
 
 echo "══════════ 训练进度 [$TAG] ══════════"
 # 最近 3 条 step/Epoch/Val
