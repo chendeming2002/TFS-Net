@@ -576,3 +576,85 @@ class TFSNetLoss(nn.Module):
         }
         return L_total, loss_dict
 
+
+
+class TFSNetLossSimple(nn.Module):
+    """Flight 11.1 — T3 简化损失（概念模型验证形态移植到三分支架构）
+
+    依据:
+      - RESULTS.md / v6-architecture §9.5: 概念模型以 单L1+0.2(1−SSIM) 反超
+        15 项 Kendall UW 完整模型 (+1.75dB)——UW 稀释 pixel 梯度且无法纠正错误的任务集合
+    保留（新结构最小必需）:
+      - DPE 反塌缩正则 (illum_spatial 单边 + edge-aware TV)——Flight9/10 实修过的塌缩
+      - 弱增益监督 (gain_sup, 可学习 ISPN 在三分支形态下的锚点)
+    移除（结构性冲突或稀释）:
+      - L_ndpn_aux (1−SSIM(img_s1,G)) / L_mcpn_aux (L1(img_s2,G)): img_s1/img_s2 是
+        去噪/去模糊阶段的暗中间态，对亮 GT 的 SSIM 亮度项/L1 有恒定偏置，把暗态往亮拉
+        ——与分阶物理序 (denoise→deblur→brighten) 冲突；L_inter 的 img_s2·gain 才是
+        well-posed 形态（igrf.py 注释自证），由端到端覆盖
+      - freq / perc / inter / lit / brightness_preserve / residual_reg / ssim_s2 / UW 全部
+    接口与 TFSNetLoss 完全兼容 (forward 签名 + loss_dict 全键)。
+    """
+
+    def __init__(self, lambda_pix: float = 1.0, lambda_ssim: float = 0.2,
+                 lambda_illum_spatial: float = 0.05, lambda_illum_tv: float = 0.05,
+                 lambda_gain_sup: float = 0.05, use_pe_charbonnier: bool = True):
+        super().__init__()
+        self.lambda_pix = lambda_pix
+        self.lambda_ssim = lambda_ssim
+        self.lambda_illum_spatial = lambda_illum_spatial
+        self.lambda_illum_tv = lambda_illum_tv
+        self.lambda_gain_sup = lambda_gain_sup
+        self.use_pe_charbonnier = use_pe_charbonnier
+
+    def forward(self, outputs: dict, target: torch.Tensor, epoch: int = 0,
+                phase: str = 'phase2', unlock_ratio: float = 1.0, model=None):
+        pred = outputs["res_t"]
+
+        # ── 核心: 概念模型验证形态 ──
+        L_pix = charbonnier_loss(pred, target) if self.use_pe_charbonnier \
+            else F.l1_loss(pred, target)
+        L_ssim = 1.0 - ssim_map(pred, target).mean()
+
+        # ── DPE 反塌缩正则 (复用 TFSNetLoss 的静态实现) ──
+        L_illum_spatial = pred.new_tensor(0.0)
+        L_illum_tv = pred.new_tensor(0.0)
+        s_illum = outputs.get("s_illum", None)
+        if s_illum is not None:
+            L_illum_spatial = TFSNetLoss._illum_spatial_loss(s_illum)
+            L_illum_tv = TFSNetLoss._illum_tv_loss(s_illum, target)
+
+        # ── 弱增益监督 (同 TFSNetLoss 逻辑, ic detach) ──
+        L_gain_sup = pred.new_tensor(0.0)
+        if "gain_map" in outputs and "img_curved" in outputs:
+            gain_pred = outputs["gain_map"]
+            ic = F.interpolate(outputs["img_curved"], size=gain_pred.shape[-2:],
+                               mode='bilinear', align_corners=False).detach()
+            ic_m = ic.mean(dim=1, keepdim=True)
+            gt_m = F.interpolate(target.mean(dim=1, keepdim=True),
+                                 size=gain_pred.shape[-2:],
+                                 mode='bilinear', align_corners=False)
+            gain_target = (gt_m / (ic_m + 1e-4)).clamp(0.5, 2.0)
+            L_gain_sup = F.l1_loss(gain_pred, gain_target)
+
+        L_total = (self.lambda_pix * L_pix
+                   + self.lambda_ssim * L_ssim
+                   + self.lambda_illum_spatial * L_illum_spatial
+                   + self.lambda_illum_tv * L_illum_tv
+                   + self.lambda_gain_sup * L_gain_sup)
+
+        zero = pred.new_tensor(0.0)
+        loss_dict = {
+            "loss_total":       L_total.detach(),
+            "loss_pix":         L_pix.detach(),
+            "loss_ssim":        L_ssim.detach(),
+            "loss_illum":       L_illum_tv.detach(),
+            "loss_illum_sup":   L_gain_sup.detach(),
+            "loss_illum_spatial": L_illum_spatial.detach(),
+            "loss_freq":        zero,
+            "loss_perc":        zero,
+            "loss_noise_sup":   zero,
+            "loss_inter":       zero,
+            "loss_ifpn_sup":    zero,
+        }
+        return L_total, loss_dict

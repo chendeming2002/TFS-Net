@@ -1,0 +1,48 @@
+seed: 42
+output_dir: outputs/sdsd_f11_simple
+dataset:
+  train_input_root: /home/a1005/yzy/dataset/SDSD/indoor/input
+  train_target_root: /home/a1005/yzy/dataset/SDSD/indoor/GT
+  val_input_root: /home/a1005/yzy/dataset/SDSD/test/low-light
+  val_target_root: /home/a1005/yzy/dataset/SDSD/test/GT
+  window_size: 5
+  crop_size: 256
+  num_workers: 2
+  max_val_seqs: 5
+  val_crop_size: 256
+model:
+  type: TFSNet
+  in_channels: 3
+  level_channels: [32, 64, 96]
+  fused_channels: 64
+  use_soft_clamp: false
+  use_soft_median: true
+  use_nafblock: false
+  num_bottleneck_blocks: 0
+  num_igrf_res_blocks: 2
+  use_pure_rwkv: true
+  use_local_tca: true
+  tca_bootstrap: bias
+train:
+  batch_size: 2
+  epochs: 40
+  lr: 0.0008
+  weight_decay: 0.0001
+  amp: true
+  log_interval: 50
+  val_interval: 10
+  warmup_epochs: 5
+  grad_clip: 0.5
+  grad_accum_steps: 8
+loss:
+  type: TFSNetLossSimple
+  lambda_pix: 1.0
+  lambda_ssim: 0.2
+  lambda_illum_spatial: 0.05
+  lambda_illum_tv: 0.05
+  lambda_gain_sup: 0.05
+  use_pe_charbonnier: true
+eval:
+  tile_size: 256
+  tile_overlap: 32
+  amp: false

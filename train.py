@@ -25,7 +25,7 @@ except Exception:
         return _TqdmFallback(iterable, *args, **kwargs)
 
 from datasets import SDSDDataset
-from losses.losses import TFSNetLoss
+from losses.losses import TFSNetLoss, TFSNetLossSimple
 from models import TFSNet
 from utils.io import save_checkpoint
 from utils.inference import tiled_forward
@@ -127,6 +127,20 @@ def build_model(cfg, device):
 
 def build_loss(cfg, device):
     loss_cfg = cfg["loss"]
+    loss_type = loss_cfg.get("type", "TFSNetLoss")
+
+    if loss_type == "TFSNetLossSimple":
+        # Flight 11.1: T3 简化损失 — 概念模型验证形态 (单 pix+ssim + DPE 反塌缩 + 弱增益)
+        criterion = TFSNetLossSimple(
+            lambda_pix=loss_cfg.get("lambda_pix", 1.0),
+            lambda_ssim=loss_cfg.get("lambda_ssim", 0.2),
+            lambda_illum_spatial=loss_cfg.get("lambda_illum_spatial", 0.05),
+            lambda_illum_tv=loss_cfg.get("lambda_illum_tv", 0.05),
+            lambda_gain_sup=loss_cfg.get("lambda_gain_sup", 0.05),
+            use_pe_charbonnier=loss_cfg.get("use_pe_charbonnier", True),
+        )
+        return criterion.to(device)
+
     criterion = TFSNetLoss(
         use_freq_loss=loss_cfg.get("use_freq_loss", True),
         perceptual_pretrained=loss_cfg.get("perceptual_pretrained", False),

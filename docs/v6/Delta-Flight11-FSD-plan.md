@@ -196,6 +196,24 @@ flowchart TB
 | 全局对照 | res_test PSNR vs 20.02@40 | v2 基线（-0.1dB 管线混淆已知）|
 | 机制观测 | conf 轨迹维持高位 + 静止/运动场景开始分化（非验收门槛）| T-BC1 前车之鉴：PSNR 与机制诊断同等重要 |
 
+### S1.5 损失函数审计结论与简化（2026-09-10 增补，配置已就绪待 S1 终判后启动）
+
+**审计结论（逐项核查）**：现有 TFSNetLoss 的 SSIM 用法全部正确（7 处均为 `1−ssim`，日志键 `ssim=` 显示的是损失项非原始 SSIM）；Kendall UW 公式正确。但发现两类问题：
+
+1. **结构性冲突（应删）**：`L_ndpn_aux = 1−SSIM(img_s1, GT)` 与 `L_mcpn_aux = L1(img_s2, GT)`——img_s1/img_s2 是去噪/去模糊阶段的**暗中间态**（提亮在其后），对亮 GT 的 SSIM 亮度项/L1 存在恒定偏置，把暗中间态往亮拉，与分阶物理序（denoise→deblur→brighten）直接冲突。代码自证：flight10m1 注释承认该失配（2μxμy/(μx²+μy²)≈0.3）；L_inter 的 img_s2·gain 版本才是 well-posed 形态（igrf.py 注释）
+2. **死代码（惰性）**：L_wfr_reg/L_gamma_reg 已被 Flight10 注释中性化；L_align_warp/L_diag_prior 依赖 C_omega 非空——LocalTCA 下自动惰性（零行为影响）
+
+**简化损失 `TFSNetLossSimple`（T3 形态，已实现）**：
+
+```
+L = Charbonnier(res_t, GT) + 0.2·(1−SSIM(res_t, GT))     ← 概念模型验证的核心（+1.75dB 证据）
+  + 0.05·illum_spatial + 0.05·illum_tv                    ← DPE 反塌缩（Flight9/10 实修）
+  + 0.05·gain_sup                                          ← ISPN 弱锚点（ic detach）
+```
+
+移除：freq / perc / inter / lit / ndpn_aux / mcpn_aux / ssim_s2 / brightness_preserve / residual_reg / 全部 UW。
+配置：`configs/delta_flight11_simple.yaml`（就绪未启动，S1 终判后接续——归因顺序：先骨干后损失，一次只动一个变量）。
+
 ### S2（V1 达标后）
 
 - P4：DPE +s_edge 头（时序 mu 上）+ 分支组合自洽 loss（DRWKV GER 经验，治 DPE 塌缩）
