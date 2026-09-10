@@ -2,15 +2,14 @@
 # 训练+温度 一体监视 (每 5 秒刷新)
 # 用法: watch -n 5 bash scripts/monitor.sh   或直接 bash scripts/monitor.sh
 
-# 自动发现活跃训练日志: 取最近修改的 train.log (覆盖 rwkv_only_v3 消融 + 完整模型 f11)
+# 自动发现活跃训练日志: 取最近修改的 train.log (覆盖完整模型 outputs/* 与概念模型消融)
 LOG=$(ls -t \
-      /home/a1005/25/TFS-Net/outputs/sdsd_f11/train.log \
-      /home/a1005/25/TFS-Net/outputs/sdsd_f10m5/train.log \
+      /home/a1005/25/TFS-Net/outputs/*/train.log \
       /home/a1005/25/TFS-Net/experiments/rwkv_only_v3/outputs_ablation*/train.log \
       /home/a1005/25/TFS-Net/experiments/rwkv_only_v3/outputs_notca/train.log \
       /home/a1005/25/TFS-Net/experiments/rwkv_only_v3/outputs/train.log \
       2>/dev/null | head -1)
-LOG=${LOG:-/home/a1005/25/TFS-Net/outputs/sdsd_f11/train.log}
+LOG=${LOG:-/home/a1005/25/TFS-Net/outputs/sdsd_f11_simple/train.log}
 TAG=$(basename "$(dirname "$LOG")")
 
 echo "══════════ 训练进度 [$TAG] ══════════"

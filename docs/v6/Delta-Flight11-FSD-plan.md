@@ -178,7 +178,7 @@ flowchart TB
 | AMP | true | 新管线组标准（-0.1dB 管线混淆已知，S3/X1 消融）|
 | batch / accum | 2 / 8（等效 16）| 同 F10m5 |
 | phase schedule | warmup 5 → phase1 → phase1_5 → phase2 | 同 F10m5，三分支渐进解锁 |
-| 损失 | TFSNetLoss（沿用）| 损失简化留待 S2 后评估 |
+| 损失 | TFSNetLoss（沿用）| 本次训练不动损失；简化版 `TFSNetLossSimple` 已实现就绪（见 §S1.5），S1 终判后接续 |
 | 部署 | E-core 钉绑（taskset 16-23）+ keepalive | 热治理：RAPL 墙需手动 `sudo bash scripts/thermal_limit.sh` |
 | 启动 | 2026-09-10 15:24，step 550 时 loss=1.17 @ 2.9 it/s | warmup 阶段（ISPN-only，phase2 后降至 ~1.1 it/s）|
 
@@ -233,6 +233,18 @@ L = Charbonnier(res_t, GT) + 0.2·(1−SSIM(res_t, GT))     ← 概念模型验�
 | **Kendall UW** | 7 个可学习 log_var 加权 | ✗ 全部固定权重 | **核心变更**：UW 稀释 pixel 梯度且无法纠正错误任务集合（15 项 vs 2 项的 +1.75dB 证据）|
 
 配置：`configs/delta_flight11_simple.yaml`（就绪未启动，S1 终判后接续——归因顺序：先骨干后损失，一次只动一个变量）。
+
+### S1.5 实现落地（2026-09-10 增补，代码已合入）
+
+| 落地点 | 内容 |
+|--------|------|
+| `losses/losses.py:581` | `TFSNetLossSimple` 类（160 行）：核心 Charbonnier+SSIM + DPE 反塌缩正则（复用 TFSNetLoss 的 `_illum_spatial_loss`/`_illum_tv_loss` 静态实现）+ 弱增益监督（ic detach）|
+| `train.py:130-134` | `loss.type` 分发：`TFSNetLossSimple` → 按配置构造 λ；缺省仍 `TFSNetLoss`（S1 运行中的 F11 不受影响）|
+| `configs/delta_flight11_simple.yaml` | `loss:` 节：λ_pix=1.0 / λ_ssim=0.2 / λ_illum_spatial=0.05 / λ_illum_tv=0.05 / λ_gain_sup=0.05 / `use_pe_charbonnier: true`；其余与 `delta_flight11.yaml` 逐字段一致（唯一变量=损失）|
+| 接口兼容 | `forward` 签名与 TFSNetLoss 完全一致（outputs/target/epoch/phase/unlock_ratio/model）；`loss_dict` **保留全部键**（移除项填 0 张量）——日志与监控代码零改动 |
+| 启动方式 | `scripts/keepalive_train.sh configs/delta_flight11_simple.yaml`（→ `outputs/sdsd_f11_simple/`，目标 40ep）|
+
+实现注意（已知偏差）：概念模型 +1.75dB 证据用的是**纯 L1**（`F.l1_loss`）；Simple 缺省 `use_pe_charbonnier=true` 换用 Charbonnier（restoration 标准做法，对离群值更平滑）。这是一处未经验证的小偏差——若 S1.5 对照需要严格归因，置 `use_pe_charbonnier: false` 即回到概念模型验证形态。
 
 ### S2（V1 达标后）
 
