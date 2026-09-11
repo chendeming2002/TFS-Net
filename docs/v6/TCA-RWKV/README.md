@@ -23,6 +23,12 @@ TSD-Net 是多帧低光视频增强网络（5 帧滑窗 → 中心帧增强）�
 | `code/blocks.py` | 197 | 依赖: `LayerNorm2d` 等 |
 | `code/encoder.py` | 148 | 上下文: `PyramidEncoder`（TCA 的输入 l2_lat 生产者，H/2 分辨率 64ch）|
 
+### encoder.py 血统注记（供审查）
+
+`PyramidEncoder` **直接演化自本项目前身的 MINS-Net 脚手架**（`reference_repos/MINS-Net/models/modules/encoder.py`，"PyTorch implementation scaffold for the first runnable version of MINS-Net on SDSD"——MINS-Net 是项目自己的第一版实现，非外部论文）。逐字继承 `EncoderStage`（每级 2×Conv3×3+GELU，stride 1/2/2）与三级金字塔 + 1×1 lateral 结构。后续演化：fuse 前 LayerNorm2d（v5.9.1，防 lateral 累加值域爆炸）、可选 bottleneck、Flight8 新增 `forward_single_lateral`（跳过 FPN 融合直出三尺度 lateral——**当前生产路径**）。
+
+架构模式归源：stride-2 conv-conv 级联 = U-Net 编码半支的通用形态；lateral 1×1 + 自顶向下相加（仅存于 `forward_single` 的 FPN 路径，生产路径未用）= FPN (Lin et al. 2017) 式。构件（Conv+GELU、标准残差、可选 Pre-LN+LayerScale）为通用件，无论文级特异设计；Pre-LN/LayerScale 变体受 NAFNet 启发但**默认关闭**（实证 LN 在浅 Conv 主干导致过拟合）。
+
 ## 2. 数据流（LocalTCA.forward 全景）
 
 ```
