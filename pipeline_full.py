@@ -176,17 +176,29 @@ def compute_ssim(img1_bgr, img2_bgr):
     return ssim_func(img1_bgr, img2_bgr, channel_axis=2, data_range=255)
 
 
+_NIQE_CTX = None
+
+
+def _load_niqe_context():
+    global _NIQE_CTX
+    if _NIQE_CTX is None:
+        hvi_dir = os.path.join(REPO_DIR, 'HVI-CIDNet')
+        spec = importlib.util.spec_from_file_location(
+            'niqe_utils', os.path.join(hvi_dir, 'loss', 'niqe_utils.py'))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        params = np.load(os.path.join(hvi_dir, 'loss', 'niqe_pris_params.npz'))
+        _NIQE_CTX = (mod, params['mu_pris_param'], params['cov_pris_param'],
+                     params['gaussian_window'])
+    return _NIQE_CTX
+
+
 def compute_niqe(img_bgr):
-    """Approximate NIQE using MSCN + GGD kurtosis. Lower = better."""
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(np.float64)
-    kernel = cv2.getGaussianKernel(7, 7 / 6)
-    window = kernel @ kernel.T
-    mu = cv2.filter2D(gray, -1, window, borderType=cv2.BORDER_REPLICATE)
-    mu_sq = mu * mu
-    sigma = np.sqrt(np.abs(cv2.filter2D(gray * gray, -1, window, borderType=cv2.BORDER_REPLICATE) - mu_sq))
-    mscn = (gray - mu) / (sigma + 1.0)
-    from scipy.stats import kurtosis
-    return abs(float(kurtosis(mscn.flatten(), fisher=True)))
+    """NIQE (BasicSR/HVI-CIDNet implementation + official pristine params).
+    Lower = better."""
+    mod, mu, cov, win = _load_niqe_context()
+    y = mod.to_y_channel(img_bgr).squeeze(-1)
+    return float(mod.niqe(np.float32(y), mu, cov, win))
 
 
 # ============================================================================
