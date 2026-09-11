@@ -89,6 +89,10 @@ class BiWKV(nn.Module):
     def forward(self, k: torch.Tensor, v: torch.Tensor,
                 total_tokens: int) -> torch.Tensor:
         B, L, C = k.shape
+        # P3-hardening: exp/累加路径强制 fp32 (AMP fp16 下 exp 累积可溢出 65504;
+        # 参考 kernel 同为 fp32 计算)。数学恒等, 仅精度提升。2026-09-11
+        k = k.float()
+        v = v.float()
         k = k.clamp(-8, 8)
         v = v.clamp(-8, 8)
         # Mod1: 强制 decay ∈ (0, 1)，用 -softplus 保证 w < 0
