@@ -136,7 +136,10 @@ def build_loss(cfg, device):
             lambda_ssim=loss_cfg.get("lambda_ssim", 0.2),
             lambda_illum_spatial=loss_cfg.get("lambda_illum_spatial", 0.05),
             lambda_illum_tv=loss_cfg.get("lambda_illum_tv", 0.05),
-            lambda_gain_sup=loss_cfg.get("lambda_gain_sup", 0.05),
+            lambda_gain_sup=loss_cfg.get("lambda_gain_sup", 0.3),
+            lambda_si_cap=loss_cfg.get("lambda_si_cap", 0.05),
+            lambda_inter=loss_cfg.get("lambda_inter", 0.3),
+            lambda_brightness=loss_cfg.get("lambda_brightness", 0.5),
             use_pe_charbonnier=loss_cfg.get("use_pe_charbonnier", True),
         )
         return criterion.to(device)

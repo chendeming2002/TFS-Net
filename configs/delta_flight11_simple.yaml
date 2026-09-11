@@ -1,5 +1,5 @@
 seed: 42
-output_dir: outputs/sdsd_f11_simple
+output_dir: outputs/sdsd_f11_simple2
 dataset:
   train_input_root: /home/a1005/yzy/dataset/SDSD/indoor/input
   train_target_root: /home/a1005/yzy/dataset/SDSD/indoor/GT
@@ -40,7 +40,10 @@ loss:
   lambda_ssim: 0.2
   lambda_illum_spatial: 0.05
   lambda_illum_tv: 0.05
-  lambda_gain_sup: 0.05
+  lambda_gain_sup: 0.3
+  lambda_si_cap: 0.05
+  lambda_inter: 0.3
+  lambda_brightness: 0.5
   use_pe_charbonnier: true
 eval:
   tile_size: 256

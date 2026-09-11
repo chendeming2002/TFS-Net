@@ -598,7 +598,9 @@ class TFSNetLossSimple(nn.Module):
 
     def __init__(self, lambda_pix: float = 1.0, lambda_ssim: float = 0.2,
                  lambda_illum_spatial: float = 0.05, lambda_illum_tv: float = 0.05,
-                 lambda_gain_sup: float = 0.05, use_pe_charbonnier: bool = True):
+                 lambda_gain_sup: float = 0.3, use_pe_charbonnier: bool = True,
+                 lambda_si_cap: float = 0.05, lambda_inter: float = 0.3,
+                 lambda_brightness: float = 0.5):
         super().__init__()
         self.lambda_pix = lambda_pix
         self.lambda_ssim = lambda_ssim
@@ -606,6 +608,10 @@ class TFSNetLossSimple(nn.Module):
         self.lambda_illum_tv = lambda_illum_tv
         self.lambda_gain_sup = lambda_gain_sup
         self.use_pe_charbonnier = use_pe_charbonnier
+        # v1.1 anchors (S1.5 v1 失败复盘: warmup 增益 sigmoid 饱和梯度死亡)
+        self.lambda_si_cap = lambda_si_cap          # s_illum 均值护栏 (改道失败实证)
+        self.lambda_inter = lambda_inter            # well-posed 增益约束 (igrf 注释自证)
+        self.lambda_brightness = lambda_brightness  # warmup 阶段提亮锚 (根因)
 
     def forward(self, outputs: dict, target: torch.Tensor, epoch: int = 0,
                 phase: str = 'phase2', unlock_ratio: float = 1.0, model=None):
@@ -637,11 +643,34 @@ class TFSNetLossSimple(nn.Module):
             gain_target = (gt_m / (ic_m + 1e-4)).clamp(0.5, 2.0)
             L_gain_sup = F.l1_loss(gain_pred, gain_target)
 
+        # ── v1.1 anchors ──
+        # s_illum 均值护栏: softplus 无上界, 防提亮负载改道 (v1 实测冲到 1.95)
+        L_si_cap = F.relu(s_illum - 1.0).mean() if s_illum is not None \
+            else pred.new_tensor(0.0)
+
+        # L_inter (well-posed 增益约束): img_s2·gain vs GT (igrf 自证形态)
+        L_inter = pred.new_tensor(0.0)
+        if "img_s2" in outputs and "gain_map" in outputs:
+            gain_up = F.interpolate(outputs["gain_map"], size=outputs["img_s2"].shape[-2:],
+                                    mode='bilinear', align_corners=False)
+            img_s2_lit = torch.clamp(outputs["img_s2"] * gain_up, 0.0, 1.0)
+            L_inter = charbonnier_loss(img_s2_lit, target)
+
+        # L_brightness_preserve (warmup 提亮锚): 迫使中间阶段变亮, 增益留动态范围
+        L_brightness = pred.new_tensor(0.0)
+        if "img_s1" in outputs and "img_s2" in outputs and "image_center" in outputs:
+            img_input = outputs["image_center"]
+            L_brightness = (F.relu(img_input.mean() * 0.8 - outputs["img_s1"].mean())
+                            + F.relu(outputs["img_s1"].mean() * 0.7 - outputs["img_s2"].mean()))
+
         L_total = (self.lambda_pix * L_pix
                    + self.lambda_ssim * L_ssim
                    + self.lambda_illum_spatial * L_illum_spatial
                    + self.lambda_illum_tv * L_illum_tv
-                   + self.lambda_gain_sup * L_gain_sup)
+                   + self.lambda_si_cap * L_si_cap
+                   + self.lambda_gain_sup * L_gain_sup
+                   + self.lambda_inter * L_inter
+                   + self.lambda_brightness * L_brightness)
 
         zero = pred.new_tensor(0.0)
         loss_dict = {
@@ -654,7 +683,9 @@ class TFSNetLossSimple(nn.Module):
             "loss_freq":        zero,
             "loss_perc":        zero,
             "loss_noise_sup":   zero,
-            "loss_inter":       zero,
+            "loss_inter":       L_inter.detach(),
             "loss_ifpn_sup":    zero,
+            "loss_si_cap":      L_si_cap.detach(),
+            "loss_brightness":  L_brightness.detach(),
         }
         return L_total, loss_dict
