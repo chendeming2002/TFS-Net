@@ -54,6 +54,9 @@ class SSIMLoss(nn.Module):
         img1, img2: (B, 3, H, W) ∈ [0, 1]
         Returns: 1 - SSIM (loss, 越小越好)
         """
+        # fp32 计算 (AMP 下输入可能是 Half, conv 窗口必须同 dtype 且 fp16 精度不足)
+        img1 = img1.float()
+        img2 = img2.float()
         if self.window.device != img1.device:
             self.window = self.window.to(img1.device)
         

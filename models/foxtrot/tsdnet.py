@@ -120,19 +120,17 @@ class TSDNet(nn.Module):
             num_blocks=fusion_blocks,
         )
     
-    def forward(self, x: torch.Tensor, return_intermediate: bool = False) -> Dict[str, torch.Tensor]:
+    def forward(self, x: torch.Tensor, return_intermediate: bool = True,
+                phase: str = None, frame_indices=None, **_) -> Dict[str, torch.Tensor]:
         """
         Args:
             x: (B, T, C, H, W) — 输入视频序列
-            return_intermediate: 是否返回中间结果 (用于损失计算)
+            return_intermediate: 是否返回中间结果 (默认 True, 训练/损失需要)
+            phase/frame_indices: 兼容 tiled_forward 的占位参数 (TSDNet 无 phase 课程)
         
         Returns:
-            dict with keys:
-              - O_t: (B, 3, H, W) — 最终输出 (中心帧增强结果)
-              - [若 return_intermediate=True]:
-                  Y_N, Y_L, Y_M: 各分支输出
-                  sigma_map, L_t, R_t, flow_vis, conf_map: 辅助输出
-                  fusion_weights: 融合权重
+            dict: 必含 "res_t" (最终输出, 兼容 utils.inference.tiled_forward)；
+                  return_intermediate=True 时附带全部中间态 (供 FoxtrotLoss/归因分析)
         """
         B, T, C, H, W = x.shape
         assert T == self.num_frames, f"Expected {self.num_frames} frames, got {T}"
@@ -194,7 +192,7 @@ class TSDNet(nn.Module):
         fusion_weights = fusion_out["weights"]
         
         # ==================== Output ====================
-        output = {"O_t": O_t}
+        output = {"O_t": O_t, "res_t": O_t}
         
         if return_intermediate:
             output.update({

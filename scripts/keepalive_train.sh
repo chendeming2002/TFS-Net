@@ -1,11 +1,18 @@
 #!/bin/bash
 # 通用训练 keepalive — 断点续训直到目标 epoch (断电重启后需手动重跑本脚本)
-# 用法: nohup bash scripts/keepalive_train.sh <config路径> <output_dir> <目标epoch> [额外train.py参数...] &
+# 用法: nohup bash scripts/keepalive_train.sh <config路径> <output_dir> <目标epoch> [训练脚本] [额外train.py参数...] &
+#   训练脚本可选, 默认 train.py (例: train_foxtrot.py)
 
-CONFIG=${1:?用法: keepalive_train.sh <config> <output_dir> <target_epoch> [extra args...]}
+CONFIG=${1:?用法: keepalive_train.sh <config> <output_dir> <target_epoch> [train_script] [extra args...]}
 OUTDIR=${2:?缺少 output_dir}
 TARGET=${3:?缺少目标 epoch}
 shift 3
+if [[ "${1:-}" == *.py ]]; then
+  TRAIN_SCRIPT=$1
+  shift
+else
+  TRAIN_SCRIPT=train.py
+fi
 EXTRA_ARGS="$@"
 
 ROOT=/home/a1005/25/TFS-Net
@@ -16,9 +23,9 @@ while true; do
   if [ -f "$OUTDIR/latest.pth" ]; then
     RESUME="--resume $OUTDIR/latest.pth"
   fi
-  echo "[$(date '+%F %T')] 启动 config=$CONFIG resume=${RESUME:+yes}" >> "$LOG"
+  echo "[$(date '+%F %T')] 启动 script=$TRAIN_SCRIPT config=$CONFIG resume=${RESUME:+yes}" >> "$LOG"
   cd $ROOT
-  taskset -c 16-23 /home/a1005/anaconda3/envs/ptorch/bin/python -u train.py \
+  taskset -c 16-23 /home/a1005/anaconda3/envs/ptorch/bin/python -u "$TRAIN_SCRIPT" \
       --config "$CONFIG" $RESUME $EXTRA_ARGS >> "$LOG" 2>&1
   CODE=$?
   echo "[$(date '+%F %T')] 训练退出 code=$CODE, 60 秒后检查" >> "$LOG"

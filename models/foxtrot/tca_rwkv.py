@@ -30,6 +30,38 @@ from models.modules.pure_rwkv_sace import BiWKV, MVCShift
 
 
 # ============================================================
+# FastBiWKV — 大 chunk 变体 (python 循环开销优化)
+# ============================================================
+class FastBiWKV(BiWKV):
+    """BiWKV with larger chunk size: 16384 tokens / 256 = 64 次 python 迭代 → /1024 = 16 次.
+    数学完全一致 (chunk 递推公式与长度无关), 仅减少 E-core taskset 下的 python 开销.
+    实测 Foxtrot 3 头 × 4 方向 × 双向 = 24 次调用/前向, 1536 → 384 次迭代."""
+
+    CHUNK = 1024
+
+    @staticmethod
+    def _scan_cumsum(ek, ekv, u_coef, ew_pow):
+        CHUNK = FastBiWKV.CHUNK
+        B, L, C = ek.shape
+        out = torch.zeros(B, L, C, device=ek.device)
+        state_num = torch.zeros(B, 1, C, device=ek.device)
+        state_den = torch.zeros(B, 1, C, device=ek.device)
+        for s in range(0, L, CHUNK):
+            e = min(s + CHUNK, L)
+            cs = e - s
+            ek_c, ekv_c = ek[:, s:e], ekv[:, s:e]
+            S_loc = (ekv_c / ew_pow[:, :cs].clamp(min=1e-12)).cumsum(dim=1) * ew_pow[:, :cs]
+            D_loc = (ek_c  / ew_pow[:, :cs].clamp(min=1e-12)).cumsum(dim=1) * ew_pow[:, :cs]
+            decay_state = ew_pow[:, 1:cs+1]
+            S = S_loc + state_num * decay_state
+            D = D_loc + state_den * decay_state
+            out[:, s:e] = (u_coef * ekv_c + S) / (u_coef * ek_c + D + 1e-8)
+            state_num = ew_pow[:, cs:cs+1] * state_num + S_loc[:, -1:]
+            state_den = ew_pow[:, cs:cs+1] * state_den + D_loc[:, -1:]
+        return out
+
+
+# ============================================================
 # RWKV-based 空间注意力头 (单路)
 # ============================================================
 class RWKVSpatialHead(nn.Module):
@@ -55,9 +87,9 @@ class RWKVSpatialHead(nn.Module):
         self.pre_norm = nn.LayerNorm(channels)
         self.post_norm = nn.LayerNorm(channels)
         
-        # BiWKV for each direction
+        # BiWKV for each direction (FastBiWKV: chunk=1024 降低 python 循环开销)
         self.bi_wkv_list = nn.ModuleList([
-            BiWKV(self.head_dim) for _ in range(num_directions)
+            FastBiWKV(self.head_dim) for _ in range(num_directions)
         ])
         
         # 零初始化输出投影 (稳定训练)
@@ -71,6 +103,41 @@ class RWKVSpatialHead(nn.Module):
         nn.init.uniform_(self.proj_v.weight, 
                          -0.5 / math.sqrt(channels), 
                           0.5 / math.sqrt(channels))
+        # 扫描索引缓存: 对角扫描坐标与逆索引按 (H,W,device) 缓存, 避免 python 循环逐帧重建
+        self._idx_cache = {}
+    
+    def _scan_indices(self, H: int, W: int, anti: bool, device: torch.device) -> torch.Tensor:
+        key = (H, W, anti, str(device))
+        if key not in self._idx_cache:
+            coords, used = [], set()
+            if anti:
+                for s in range(H + W - 1):
+                    for i in range(max(0, s - W + 1), min(s + 1, H)):
+                        j = W - 1 - (s - i)
+                        if 0 <= j < W:
+                            ij = i * W + j
+                            if ij not in used:
+                                coords.append(ij)
+                                used.add(ij)
+                for ij in range(H * W):
+                    if ij not in used:
+                        coords.append(ij)
+                coords = coords[:H * W]
+            else:
+                for s in range(H + W - 1):
+                    for i in range(max(0, s - W + 1), min(s + 1, H)):
+                        coords.append(i * W + (s - i))
+            self._idx_cache[key] = torch.tensor(coords, dtype=torch.long, device=device)
+        return self._idx_cache[key]
+    
+    def _inv_indices(self, H: int, W: int, anti: bool, device: torch.device) -> torch.Tensor:
+        key = (H, W, anti, str(device), 'inv')
+        if key not in self._idx_cache:
+            idx = self._scan_indices(H, W, anti, device)
+            inv = torch.zeros(H * W, dtype=torch.long, device=device)
+            inv.scatter_(0, idx, torch.arange(H * W, device=device))
+            self._idx_cache[key] = inv
+        return self._idx_cache[key]
     
     @staticmethod
     def _scan_h(x: torch.Tensor) -> torch.Tensor:
@@ -80,43 +147,29 @@ class RWKVSpatialHead(nn.Module):
     def _scan_v(x: torch.Tensor) -> torch.Tensor:
         return x.permute(0, 1, 3, 2).flatten(2).transpose(1, 2)
     
-    @staticmethod
-    def _scan_d1(x: torch.Tensor) -> torch.Tensor:
+    def _scan_d1(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
-        coords = []
-        for s in range(H + W - 1):
-            for i in range(max(0, s - W + 1), min(s + 1, H)):
-                coords.append(i * W + (s - i))
-        idx = torch.tensor(coords, device=x.device)
+        idx = self._scan_indices(H, W, anti=False, device=x.device)
         return x.flatten(2)[:, :, idx].transpose(1, 2)
     
-    @staticmethod
-    def _scan_d2(x: torch.Tensor) -> torch.Tensor:
+    def _scan_d2(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
-        coords, used = [], set()
-        for s in range(H + W - 1):
-            for i in range(max(0, s - W + 1), min(s + 1, H)):
-                j = W - 1 - (s - i)
-                if 0 <= j < W:
-                    ij = i * W + j
-                    if ij not in used:
-                        coords.append(ij)
-                        used.add(ij)
-        for ij in range(H * W):
-            if ij not in used:
-                coords.append(ij)
-        idx = torch.tensor(coords[:H * W], device=x.device)
+        idx = self._scan_indices(H, W, anti=True, device=x.device)
         return x.flatten(2)[:, :, idx].transpose(1, 2)
     
     def _get_scan_fns(self):
         return [self._scan_h, self._scan_v, self._scan_d1, self._scan_d2]
     
     def _inv_scan(self, scan_fn, B, C, H, W, device):
-        identity = torch.arange(H * W, device=device).float().view(1, 1, H, W)
-        scanned = scan_fn(identity).squeeze(-1).long()
-        inv_idx = torch.zeros(H * W, dtype=torch.long, device=device)
-        inv_idx.scatter_(0, scanned[0], torch.arange(H * W, device=device))
-        return inv_idx
+        # h/v 扫描是恒等排列的 flatten; 对角扫描走缓存逆索引
+        name = scan_fn.__name__
+        if name in ('_scan_h', '_scan_v'):
+            key = (H, W, name, str(device), 'inv')
+            if key not in self._idx_cache:
+                self._idx_cache[key] = torch.arange(H * W, dtype=torch.long, device=device)
+            return self._idx_cache[key]
+        anti = (name == '_scan_d2')
+        return self._inv_indices(H, W, anti=anti, device=device)
     
     def forward(self, center_feat: torch.Tensor,
                 context_feat: torch.Tensor) -> torch.Tensor:

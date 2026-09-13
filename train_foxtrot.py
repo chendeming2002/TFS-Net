@@ -1,378 +1,374 @@
+"""Foxtrot (TSD-Net) 训练脚本 — 与 train.py 同构 (keepalive/monitor 兼容)
+
+接口约定 (与既有基础设施对齐):
+  - 日志格式: "step %d/%d loss=..." / "Epoch %d / %d [%s] lr=..." / "Val stats: {...}"
+    → scripts/monitor.sh 直接可读
+  - checkpoint: latest.pth / best.pth, 键 "epoch"(int) → scripts/keepalive_train.sh 的 DONE 判据可用
+  - resume: --resume <latest.pth> (keepalive 自动传入)
+  - val: tiled_forward + tensor_psnr/tensor_ssim + LPIPS (与历史 run 同协议)
 """
-Foxtrot (TSD-Net) 训练脚本
-支持混合精度、梯度累积、warmup、val tile推理
-"""
-import os
-import sys
-import yaml
-import time
-import logging
 import argparse
-from pathlib import Path
-from typing import Dict, Any
+import os
 
 import torch
-import torch.nn as nn
-import torch.optim as optim
+import yaml
 from torch.cuda.amp import GradScaler, autocast
-from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
+from torch.optim import AdamW
+from torch.utils.data import DataLoader, Subset
 
+try:
+    from tqdm import tqdm
+except Exception:
+    class _TqdmFallback(object):
+        def __init__(self, iterable=None, *args, **kwargs):
+            self.iterable = iterable
+
+        def __iter__(self):
+            return iter(self.iterable)
+
+        def set_postfix(self, **kwargs):
+            return None
+
+    def tqdm(iterable=None, *args, **kwargs):
+        return _TqdmFallback(iterable, *args, **kwargs)
+
+from datasets import SDSDDataset
 from models.foxtrot import TSDNet
 from models.foxtrot.loss import FoxtrotLoss
-from data.video_loader import SDSDDataset
-from utils.metrics import calculate_psnr, calculate_ssim
+from utils.io import save_checkpoint
+from utils.inference import tiled_forward
+from utils.metrics import tensor_psnr, tensor_ssim
+from utils.misc import AverageMeter, create_logger, seed_everything
+
+_LPIPS_AVAILABLE = None
+_LPIPS_FN = None
 
 
-def setup_logger(log_path: Path):
-    """设置日志"""
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
-    
-    # 文件 handler
-    fh = logging.FileHandler(log_path, mode='a', encoding='utf-8')
-    fh.setLevel(logging.INFO)
-    fh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-    
-    # 控制台 handler
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
-    
-    logger.addHandler(fh)
-    logger.addHandler(ch)
-    
-    return logger
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--resume", type=str, default=None, help="checkpoint path to resume from")
+    parser.add_argument("--pretrained", type=str, default=None)
+    return parser.parse_args()
 
 
-def load_config(config_path: str) -> Dict[str, Any]:
-    """加载配置文件"""
-    with open(config_path, 'r', encoding='utf-8') as f:
-        config = yaml.safe_load(f)
-    return config
+def load_config(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
 
-def tile_inference(model: nn.Module, x: torch.Tensor, tile_size: int = 256, tile_overlap: int = 32) -> torch.Tensor:
-    """
-    Tile-based inference for large images
-    x: (B, T, C, H, W)
-    return: (B, C, H, W)
-    """
-    B, T, C, H, W = x.shape
-    device = x.device
-    
-    # 如果图像小于 tile_size，直接推理
-    if H <= tile_size and W <= tile_size:
-        with torch.no_grad():
-            out = model(x, return_intermediate=False)
-        return out['O_t']
-    
-    # Tile 推理
-    stride = tile_size - tile_overlap
-    output = torch.zeros(B, 3, H, W, device=device)
-    weight_map = torch.zeros(B, 1, H, W, device=device)
-    
-    # 分块推理
-    for h in range(0, H, stride):
-        for w in range(0, W, stride):
-            h_end = min(h + tile_size, H)
-            w_end = min(w + tile_size, W)
-            h_start = h_end - tile_size if h_end == H else h
-            w_start = w_end - tile_size if w_end == W else w
-            
-            tile_x = x[:, :, :, h_start:h_end, w_start:w_end]
-            
-            with torch.no_grad():
-                tile_out = model(tile_x, return_intermediate=False)['O_t']
-            
-            output[:, :, h_start:h_end, w_start:w_end] += tile_out
-            weight_map[:, :, h_start:h_end, w_start:w_end] += 1.0
-    
-    output = output / weight_map.clamp(min=1.0)
-    return output
+def build_dataloaders(cfg, smoke=False):
+    ds_cfg = cfg["dataset"]
+    max_train = ds_cfg.get("max_train_seqs", None)
+    max_val = ds_cfg.get("max_val_seqs", None)
+    train_set = SDSDDataset(
+        input_root=ds_cfg["train_input_root"],
+        target_root=ds_cfg["train_target_root"],
+        window_size=ds_cfg["window_size"],
+        mode="train",
+        crop_size=ds_cfg["crop_size"],
+        max_seqs=max_train,
+    )
+    val_set = SDSDDataset(
+        input_root=ds_cfg["val_input_root"],
+        target_root=ds_cfg["val_target_root"],
+        window_size=ds_cfg["window_size"],
+        mode="val",
+        crop_size=ds_cfg["crop_size"],
+        max_seqs=max_val,
+    )
+
+    if smoke:
+        train_set = Subset(train_set, list(range(min(8, len(train_set)))))
+        val_set = Subset(val_set, list(range(min(4, len(val_set)))))
+    else:
+        max_val_samples = ds_cfg.get("max_val_samples", None)
+        if max_val_samples is not None and len(val_set) > max_val_samples:
+            val_set = Subset(val_set, list(range(max_val_samples)))
+
+    train_loader = DataLoader(
+        train_set,
+        batch_size=cfg["train"]["batch_size"],
+        shuffle=True,
+        num_workers=cfg["dataset"]["num_workers"],
+        pin_memory=True,
+        drop_last=False,
+    )
+    val_loader = DataLoader(
+        val_set,
+        batch_size=1,
+        shuffle=False,
+        num_workers=cfg["dataset"]["num_workers"],
+        pin_memory=True,
+        drop_last=False,
+    )
+    return train_loader, val_loader
 
 
-def validate(model: nn.Module, val_loader: DataLoader, config: dict, logger: logging.Logger) -> Dict[str, float]:
-    """验证"""
-    model.eval()
-    
-    total_psnr = 0.0
-    total_ssim = 0.0
-    count = 0
-    
-    tile_size = config['eval'].get('tile_size', 256)
-    tile_overlap = config['eval'].get('tile_overlap', 32)
-    use_amp = config['eval'].get('amp', False)
-    
-    for batch in val_loader:
-        x = batch['input'].cuda()  # (B, T, C, H, W)
-        gt = batch['target'].cuda()  # (B, C, H, W)
-        B = x.shape[0]
-        
-        # Tile推理
-        with autocast(enabled=use_amp):
-            pred = tile_inference(model, x, tile_size, tile_overlap)
-        
-        # 计算指标
-        for i in range(B):
-            psnr = calculate_psnr(pred[i], gt[i])
-            ssim = calculate_ssim(pred[i].unsqueeze(0), gt[i].unsqueeze(0))
-            total_psnr += psnr
-            total_ssim += ssim
-            count += 1
-    
-    avg_psnr = total_psnr / count if count > 0 else 0.0
-    avg_ssim = total_ssim / count if count > 0 else 0.0
-    
-    logger.info(f"Val: PSNR={avg_psnr:.3f} dB, SSIM={avg_ssim:.4f}")
-    
-    return {"psnr": avg_psnr, "ssim": avg_ssim}
+def build_model(cfg, device):
+    model_cfg = {k: v for k, v in cfg["model"].items() if k != "type"}
+    model = TSDNet(**model_cfg)
+    return model.to(device)
 
 
-def train_epoch(
-    model: nn.Module,
-    train_loader: DataLoader,
-    loss_fn: nn.Module,
-    optimizer: optim.Optimizer,
-    scaler: GradScaler,
-    epoch: int,
-    config: dict,
-    writer: SummaryWriter,
-    logger: logging.Logger,
-    global_step: int,
-) -> int:
-    """训练一个 epoch"""
+def build_loss(cfg, device):
+    loss_cfg = {k: v for k, v in cfg["loss"].items() if k != "type"}
+    return FoxtrotLoss(**loss_cfg).to(device)
+
+
+def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp,
+                    logger, log_interval, epoch=0, grad_clip=1.0, grad_accum_steps=1):
     model.train()
-    
-    log_interval = config['train']['log_interval']
-    grad_accum_steps = config['train'].get('grad_accum_steps', 1)
-    grad_clip = config['train'].get('grad_clip', None)
-    use_amp = config['train'].get('amp', True)
-    
-    epoch_loss = 0.0
-    epoch_start = time.time()
-    
-    for batch_idx, batch in enumerate(train_loader):
-        x = batch['input'].cuda()  # (B, T, C, H, W)
-        gt = batch['target'].cuda()  # (B, C, H, W)
-        
-        # Forward
+    meter_total = AverageMeter()
+    meter_final = AverageMeter()
+    meter_bN = AverageMeter()
+    meter_bL = AverageMeter()
+    meter_bM = AverageMeter()
+    meter_ortho = AverageMeter()
+
+    progress = tqdm(enumerate(loader), total=len(loader), desc="train", leave=False)
+    for step, (clip, target, _) in progress:
+        clip = clip.to(device, non_blocking=True)
+        target = target.to(device, non_blocking=True)
+
         with autocast(enabled=use_amp):
-            out = model(x, return_intermediate=True)
-            losses = loss_fn(out, gt)
-            loss = losses['total_loss'] / grad_accum_steps
-        
-        # Backward
-        scaler.scale(loss).backward()
-        
-        # 梯度累积
-        if (batch_idx + 1) % grad_accum_steps == 0 or (batch_idx + 1) == len(train_loader):
-            if grad_clip is not None:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            
+            outputs = model(clip)
+        # 损失在 autocast 外计算 (与 train.py 模式一致, fp32 语义稳定)
+        loss_dict = criterion(outputs, target)
+        loss = loss_dict["total_loss"]
+
+        if not torch.isfinite(loss):
+            logger.warning("Skipping non-finite loss at step %d", step + 1)
+            optimizer.zero_grad(set_to_none=True)
+            del outputs, loss, loss_dict, clip, target
+            continue
+
+        loss_scaled = loss / grad_accum_steps
+        scaler.scale(loss_scaled).backward()
+
+        if (step + 1) % grad_accum_steps == 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
             scaler.step(optimizer)
             scaler.update()
-            optimizer.zero_grad()
-            
-            global_step += 1
-        
-        epoch_loss += losses['total_loss'].item()
-        
-        # 日志
-        if (batch_idx + 1) % log_interval == 0:
-            avg_loss = epoch_loss / (batch_idx + 1)
+            optimizer.zero_grad(set_to_none=True)
+
+        meter_total.update(loss_dict["total_loss"].item(), clip.size(0))
+        meter_final.update(loss_dict["L_final"], clip.size(0))
+        meter_bN.update(loss_dict["L_N"], clip.size(0))
+        meter_bL.update(loss_dict["L_L"], clip.size(0))
+        meter_bM.update(loss_dict["L_M"], clip.size(0))
+        meter_ortho.update(loss_dict["L_ortho"], clip.size(0))
+
+        progress.set_postfix(loss=meter_total.avg, final=meter_final.avg, ortho=meter_ortho.avg)
+        if (step + 1) % log_interval == 0:
             logger.info(
-                f"Epoch {epoch} [{batch_idx+1}/{len(train_loader)}] "
-                f"Loss={avg_loss:.4f} "
-                f"L_final={losses['L_final'].item():.4f} "
-                f"L_N={losses['L_N'].item():.4f} "
-                f"L_L={losses['L_L'].item():.4f} "
-                f"L_M={losses['L_M'].item():.4f} "
-                f"L_ortho={losses['L_ortho'].item():.4f}"
+                "step %d/%d loss=%.4f final=%.4f bN=%.4f bL=%.4f bM=%.4f ortho=%.4f",
+                step + 1, len(loader),
+                meter_total.avg, meter_final.avg,
+                meter_bN.avg, meter_bL.avg, meter_bM.avg, meter_ortho.avg,
             )
-            
-            # TensorBoard
-            writer.add_scalar('train/total_loss', losses['total_loss'].item(), global_step)
-            writer.add_scalar('train/L_final', losses['L_final'].item(), global_step)
-            writer.add_scalar('train/L_N', losses['L_N'].item(), global_step)
-            writer.add_scalar('train/L_L', losses['L_L'].item(), global_step)
-            writer.add_scalar('train/L_M', losses['L_M'].item(), global_step)
-            writer.add_scalar('train/L_ortho', losses['L_ortho'].item(), global_step)
-    
-    epoch_time = time.time() - epoch_start
-    avg_loss = epoch_loss / len(train_loader)
-    logger.info(f"Epoch {epoch} finished in {epoch_time/60:.1f} min, avg_loss={avg_loss:.4f}")
-    
-    return global_step
+            with torch.no_grad():
+                w = outputs.get("fusion_weights")
+                lt = outputs.get("L_t")
+                cv = outputs.get("conf_map")
+                w_std = w.std(dim=1).mean().item() if w is not None else 0.0
+                lt_m = lt.mean().item() if lt is not None else 0.0
+                lt_s = lt.std().item() if lt is not None else 0.0
+                cv_m = cv.mean().item() if cv is not None else 0.0
+                logger.info("diag: wstd=%.3f Lt=%.3f/%.3f conf=%.3f", w_std, lt_m, lt_s, cv_m)
+
+        del outputs, loss, loss_dict, clip, target
+        if (step + 1) % (grad_accum_steps * 50) == 0:
+            torch.cuda.empty_cache()
+    return {
+        "loss_total": meter_total.avg,
+        "loss_final": meter_final.avg,
+        "loss_bN": meter_bN.avg,
+        "loss_bL": meter_bL.avg,
+        "loss_bM": meter_bM.avg,
+        "loss_ortho": meter_ortho.avg,
+    }
+
+
+@torch.no_grad()
+def validate(model, loader, device, tile_size, tile_overlap, use_amp, val_crop_size=None):
+    model.eval()
+    psnr_meter = AverageMeter()
+    ssim_meter = AverageMeter()
+    loss_meter = AverageMeter()
+    lpips_meter = AverageMeter()
+    global _LPIPS_AVAILABLE, _LPIPS_FN
+    if _LPIPS_AVAILABLE is None:
+        try:
+            import lpips
+            _lpips_fn = lpips.LPIPS(net='alex', verbose=False).to(device)
+            _LPIPS_AVAILABLE = True
+            _LPIPS_FN = _lpips_fn
+        except Exception:
+            _LPIPS_AVAILABLE = False
+            _LPIPS_FN = None
+    _lpips_fn = _LPIPS_FN
+    for clip, target, _ in tqdm(loader, total=len(loader), desc="val", leave=False):
+        clip = clip.to(device, non_blocking=True)
+        target = target.to(device, non_blocking=True)
+        if val_crop_size is not None:
+            _, _, _, h, w = clip.shape
+            cs = min(val_crop_size, h, w)
+            top = (h - cs) // 2
+            left = (w - cs) // 2
+            clip = clip[:, :, :, top:top + cs, left:left + cs]
+            target = target[:, :, top:top + cs, left:left + cs]
+        pred = tiled_forward(
+            model=model,
+            clip=clip,
+            tile_size=tile_size,
+            tile_overlap=tile_overlap,
+            use_amp=use_amp,
+        )
+        loss = torch.mean(torch.abs(pred - target))
+        psnr_meter.update(tensor_psnr(pred, target), clip.size(0))
+        ssim_meter.update(tensor_ssim(pred, target), clip.size(0))
+        loss_meter.update(loss.item(), clip.size(0))
+        if _lpips_fn is not None:
+            lpips_meter.update(_lpips_fn(pred, target).mean().item(), clip.size(0))
+        del clip, target, pred, loss
+    result = {"val_l1": loss_meter.avg, "psnr": psnr_meter.avg, "ssim": ssim_meter.avg}
+    if _lpips_fn is not None:
+        result["lpips"] = lpips_meter.avg
+    return result
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='configs/foxtrot.yaml', help='配置文件路径')
-    parser.add_argument('--resume', type=str, default=None, help='恢复训练的 checkpoint 路径')
-    args = parser.parse_args()
-    
-    # 加载配置
-    config = load_config(args.config)
-    
-    # 创建输出目录
-    output_dir = Path(config['output_dir'])
-    output_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_dir = output_dir / 'checkpoints'
-    ckpt_dir.mkdir(exist_ok=True)
-    
-    # 设置日志
-    logger = setup_logger(output_dir / 'train.log')
-    logger.info(f"Config: {args.config}")
-    logger.info(f"Output dir: {output_dir}")
-    
-    # TensorBoard
-    writer = SummaryWriter(log_dir=str(output_dir / 'tensorboard'))
-    
-    # 设置随机种子
-    seed = config.get('seed', 42)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    
-    # 构建数据集
-    logger.info("Building datasets...")
-    train_dataset = SDSDDataset(
-        input_root=config['dataset']['train_input_root'],
-        target_root=config['dataset']['train_target_root'],
-        window_size=config['dataset']['window_size'],
-        crop_size=config['dataset']['crop_size'],
-        mode='train',
-    )
-    
-    val_dataset = SDSDDataset(
-        input_root=config['dataset']['val_input_root'],
-        target_root=config['dataset']['val_target_root'],
-        window_size=config['dataset']['window_size'],
-        crop_size=config['dataset'].get('val_crop_size', None),
-        mode='val',
-        max_seqs=config['dataset'].get('max_val_seqs', None),
-    )
-    
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config['train']['batch_size'],
-        shuffle=True,
-        num_workers=config['dataset']['num_workers'],
-        pin_memory=True,
-        drop_last=True,
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=1,
-        shuffle=False,
-        num_workers=config['dataset']['num_workers'],
-        pin_memory=True,
-    )
-    
-    logger.info(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
-    
-    # 构建模型
-    logger.info("Building model...")
-    model = TSDNet(**config['model']).cuda()
-    
-    total_params = sum(p.numel() for p in model.parameters())
-    logger.info(f"Model parameters: {total_params / 1e6:.2f}M")
-    
-    # 损失函数
-    loss_fn = FoxtrotLoss(**config['loss']).cuda()
-    
-    # 优化器
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=config['train']['lr'],
-        weight_decay=config['train']['weight_decay'],
-    )
-    
-    # 学习率调度器 (cosine with warmup)
-    warmup_epochs = config['train'].get('warmup_epochs', 0)
-    total_epochs = config['train']['epochs']
-    
-    def lr_lambda(epoch):
+    args = parse_args()
+    cfg = load_config(args.config)
+    seed_everything(cfg["seed"])
+
+    output_dir = cfg["output_dir"]
+    os.makedirs(output_dir, exist_ok=True)
+    logger = create_logger(output_dir)
+    logger.info("Loading config from %s", args.config)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info("Using device: %s", device)
+
+    train_loader, val_loader = build_dataloaders(cfg, smoke=args.smoke)
+    model = build_model(cfg, device)
+
+    n_params = sum(p.numel() for p in model.parameters())
+    logger.info("TSDNet params: %.2fM", n_params / 1e6)
+
+    criterion = build_loss(cfg, device)
+    optimizer = AdamW(model.parameters(), lr=cfg["train"]["lr"], weight_decay=cfg["train"]["weight_decay"])
+    total_epochs = cfg["train"]["epochs"] if not args.smoke else 1
+    warmup_epochs = cfg["train"].get("warmup_epochs", 5)
+
+    def get_phase(epoch):
         if epoch < warmup_epochs:
-            return (epoch + 1) / warmup_epochs
+            return 'phase1_warmup'
+        return 'phase2'
+
+    def get_lr(epoch, base=cfg["train"]["lr"]):
+        if epoch < warmup_epochs:
+            return base * (0.01 + 0.99 * epoch / warmup_epochs)
+        elif epoch < 11:
+            return base * 0.75
+        elif epoch < 26:
+            return base * 0.75 * (1 - (epoch - 11) / 15 * 0.33)
+        elif epoch < 51:
+            return base * 0.5
         else:
-            progress = (epoch - warmup_epochs) / (total_epochs - warmup_epochs)
-            return 0.5 * (1.0 + torch.cos(torch.tensor(progress * 3.141592653589793)))
-    
-    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    
-    # AMP scaler
-    scaler = GradScaler(enabled=config['train'].get('amp', True))
-    
-    # 恢复训练
-    start_epoch = 1
-    global_step = 0
-    best_psnr = 0.0
-    
+            return base * 0.125
+
+    scaler = GradScaler(enabled=cfg["train"]["amp"] and device.type == "cuda")
+    grad_clip = cfg["train"].get("grad_clip", 1.0)
+    grad_accum_steps = cfg["train"].get("grad_accum_steps", 1)
+
+    best_psnr = -1.0
+    start_epoch = 0
+
     if args.resume:
-        logger.info(f"Resuming from {args.resume}")
-        ckpt = torch.load(args.resume, map_location='cuda')
-        model.load_state_dict(ckpt['model'])
-        optimizer.load_state_dict(ckpt['optimizer'])
-        scheduler.load_state_dict(ckpt['scheduler'])
-        scaler.load_state_dict(ckpt['scaler'])
-        start_epoch = ckpt['epoch'] + 1
-        global_step = ckpt['global_step']
-        best_psnr = ckpt.get('best_psnr', 0.0)
-        logger.info(f"Resumed at epoch {start_epoch}, best_psnr={best_psnr:.3f}")
-    
-    # 训练循环
-    logger.info("Start training...")
-    for epoch in range(start_epoch, total_epochs + 1):
-        logger.info(f"Epoch {epoch}/{total_epochs}, LR={optimizer.param_groups[0]['lr']:.6f}")
-        
-        # 训练
-        global_step = train_epoch(
-            model, train_loader, loss_fn, optimizer, scaler,
-            epoch, config, writer, logger, global_step
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model"], strict=True)
+        if "optimizer" in ckpt:
+            try:
+                optimizer.load_state_dict(ckpt["optimizer"])
+            except Exception:
+                logger.warning("Optimizer state load failed, starting fresh optimizer")
+        start_epoch = ckpt["epoch"]
+        best_psnr = ckpt.get("best_psnr", -1.0)
+        logger.info("Resumed from %s (epoch %d, best_psnr=%.4f)", args.resume, start_epoch, best_psnr)
+
+    if args.pretrained:
+        ckpt = torch.load(args.pretrained, map_location=device, weights_only=False)
+        missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+        logger.info("Loaded pretrained from %s (missing=%d, unexpected=%d)",
+                    args.pretrained, len(missing), len(unexpected))
+
+    for epoch in range(start_epoch, total_epochs):
+        phase = get_phase(epoch)
+        lr = get_lr(epoch)
+        logger.info("Epoch %d / %d [%s] lr=%.2e unlock=1.00", epoch + 1, total_epochs, phase, lr)
+
+        for pg in optimizer.param_groups:
+            pg['lr'] = lr
+
+        train_stats = train_one_epoch(
+            model=model,
+            criterion=criterion,
+            optimizer=optimizer,
+            scaler=scaler,
+            loader=train_loader,
+            device=device,
+            use_amp=cfg["train"]["amp"] and device.type == "cuda",
+            epoch=epoch,
+            logger=logger,
+            log_interval=cfg["train"]["log_interval"],
+            grad_clip=grad_clip,
+            grad_accum_steps=grad_accum_steps,
         )
-        
-        # 学习率更新
-        scheduler.step()
-        
-        # 验证
-        if epoch % config['train']['val_interval'] == 0 or epoch == total_epochs:
-            val_metrics = validate(model, val_loader, config, logger)
-            writer.add_scalar('val/psnr', val_metrics['psnr'], epoch)
-            writer.add_scalar('val/ssim', val_metrics['ssim'], epoch)
-            
-            # 保存最优模型
-            if val_metrics['psnr'] > best_psnr:
-                best_psnr = val_metrics['psnr']
-                torch.save({
-                    'epoch': epoch,
-                    'global_step': global_step,
-                    'model': model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'scheduler': scheduler.state_dict(),
-                    'scaler': scaler.state_dict(),
-                    'best_psnr': best_psnr,
-                }, ckpt_dir / 'best.pth')
-                logger.info(f"Best model saved: {best_psnr:.3f} dB")
-        
-        # 定期保存 checkpoint
-        if epoch % 10 == 0 or epoch == total_epochs:
-            torch.save({
-                'epoch': epoch,
-                'global_step': global_step,
-                'model': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'scheduler': scheduler.state_dict(),
-                'scaler': scaler.state_dict(),
-                'best_psnr': best_psnr,
-            }, ckpt_dir / f'epoch_{epoch}.pth')
-            logger.info(f"Checkpoint saved: epoch_{epoch}.pth")
-    
-    logger.info(f"Training finished! Best PSNR: {best_psnr:.3f} dB")
-    writer.close()
+        logger.info("Train stats: %s", train_stats)
+
+        val_stats = None
+        if (epoch + 1) % cfg["train"]["val_interval"] == 0:
+            val_stats = validate(
+                model,
+                val_loader,
+                device,
+                tile_size=cfg["eval"]["tile_size"],
+                tile_overlap=cfg["eval"]["tile_overlap"],
+                use_amp=cfg["eval"]["amp"] and device.type == "cuda",
+                val_crop_size=cfg["dataset"].get("val_crop_size", None),
+            )
+            logger.info("Val stats: %s", val_stats)
+
+        save_checkpoint(
+            {
+                "epoch": epoch + 1,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "config": cfg,
+            },
+            os.path.join(output_dir, "latest.pth"),
+        )
+        if val_stats is not None:
+            if val_stats["psnr"] > best_psnr:
+                best_psnr = val_stats["psnr"]
+                save_checkpoint(
+                    {
+                        "epoch": epoch + 1,
+                        "model": model.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "config": cfg,
+                        "best_psnr": best_psnr,
+                    },
+                    os.path.join(output_dir, "best.pth"),
+                )
+                logger.info("Saved best.pth (psnr=%.4f)", best_psnr)
+        if args.smoke:
+            break
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
