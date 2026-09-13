@@ -84,6 +84,8 @@ def main():
         num_bottleneck_blocks=cfg["model"].get("num_bottleneck_blocks", 0),
         num_igrf_res_blocks=cfg["model"].get("num_igrf_res_blocks", 2),
         use_amp_enhance=cfg["model"].get("use_amp_enhance", False),
+        use_local_tca=cfg["model"].get("use_local_tca", False),
+        tca_bootstrap=cfg["model"].get("tca_bootstrap", "bias"),
     ).to(device)
     checkpoint = load_checkpoint(args.checkpoint, map_location=device)
     model.load_state_dict(checkpoint["model"], strict=True)
