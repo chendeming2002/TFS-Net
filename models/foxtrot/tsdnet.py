@@ -70,7 +70,6 @@ class TSDNet(nn.Module):
         tca_num_blocks: int = 6,
         branch_blocks: List[int] = [2, 2, 3],
         fusion_blocks: int = 2,
-        ema_alpha: float = 0.7,
         gamma: float = 2.0,
     ):
         super().__init__()
@@ -103,12 +102,12 @@ class TSDNet(nn.Module):
         self.branch_l = BranchL(
             channels=tca_channels,
             num_blocks=branch_blocks[1],
-            ema_alpha=ema_alpha,
-            gamma=gamma,
+            gamma_init=gamma,
         )
         
         self.branch_m = BranchM(
             channels=tca_channels,
+            enc_channels=encoder_channels[1],   # 编码器 F2 通道数
             num_frames=num_frames,
             num_blocks=branch_blocks[2],
         )
@@ -161,27 +160,20 @@ class TSDNet(nn.Module):
         var_map = tca_output["var_map"]  # (B, 1, H/2, W/2)
         ortho_loss = tca_output["ortho_loss"]  # scalar
         
-        # 将 F_seq 转换为 TCA 通道数 (用于分支时序处理)
-        # 这里简化处理: 使用 F_N/F_L/F_M 的时序版本
-        # 完整实现应对 F2_seq 全序列做 TCA，这里为简化只传中心帧特征
-        F_N_seq = F_N.unsqueeze(1).repeat(1, T, 1, 1, 1)  # 简化: 复制中心帧
-        F_L_seq = F_L.unsqueeze(1).repeat(1, T, 1, 1, 1)
-        F_M_seq = F_M.unsqueeze(1).repeat(1, T, 1, 1, 1)
-        
         # ==================== Stage 3: 三分支处理 ====================
-        # Branch-N
+        # Branch-N: 用 TCA 噪声分量特征 (已融合时序均值)
         branch_n_out = self.branch_n(F_N, var_map)
         Y_N = branch_n_out["Y_N"]
         sigma_map = branch_n_out["sigma_map"]
         
-        # Branch-L
-        branch_l_out = self.branch_l(F_L, X_t, F_L_seq)
+        # Branch-L: 用 TCA 光照分量特征 (已融合时序光照) + 中心帧原图
+        branch_l_out = self.branch_l(F_L, X_t)
         Y_L = branch_l_out["Y_L"]
         L_t = branch_l_out["L_t"]
         R_t = branch_l_out["R_t"]
         
-        # Branch-M
-        branch_m_out = self.branch_m(F_M, F_M_seq)
+        # Branch-M: 用 TCA 运动分量特征 (中心帧) + F2_seq 真实多帧时序 (做光流对齐)
+        branch_m_out = self.branch_m(F_M, F2_seq)
         Y_M = branch_m_out["Y_M"]
         flow_vis = branch_m_out["flow_vis"]
         conf_map = branch_m_out["conf_map"]

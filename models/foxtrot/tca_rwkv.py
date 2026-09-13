@@ -46,18 +46,20 @@ class FastBiWKV(BiWKV):
         out = torch.zeros(B, L, C, device=ek.device)
         state_num = torch.zeros(B, 1, C, device=ek.device)
         state_den = torch.zeros(B, 1, C, device=ek.device)
+        # 末尾补一位避免 ew_pow[:, 1:cs+1] 越界 (当 cs == L 时 1:cs+1 越界)
+        ew_pow_ext = torch.cat([ew_pow, ew_pow[:, -1:]], dim=1)  # (1, L+1, C)
         for s in range(0, L, CHUNK):
             e = min(s + CHUNK, L)
             cs = e - s
             ek_c, ekv_c = ek[:, s:e], ekv[:, s:e]
             S_loc = (ekv_c / ew_pow[:, :cs].clamp(min=1e-12)).cumsum(dim=1) * ew_pow[:, :cs]
             D_loc = (ek_c  / ew_pow[:, :cs].clamp(min=1e-12)).cumsum(dim=1) * ew_pow[:, :cs]
-            decay_state = ew_pow[:, 1:cs+1]
+            decay_state = ew_pow_ext[:, 1:cs+1]   # 用 ext 避免越界
             S = S_loc + state_num * decay_state
             D = D_loc + state_den * decay_state
             out[:, s:e] = (u_coef * ekv_c + S) / (u_coef * ek_c + D + 1e-8)
-            state_num = ew_pow[:, cs:cs+1] * state_num + S_loc[:, -1:]
-            state_den = ew_pow[:, cs:cs+1] * state_den + D_loc[:, -1:]
+            state_num = ew_pow_ext[:, cs:cs+1] * state_num + S_loc[:, -1:]
+            state_den = ew_pow_ext[:, cs:cs+1] * state_den + D_loc[:, -1:]
         return out
 
 

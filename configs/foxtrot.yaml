@@ -22,7 +22,6 @@ model:
   tca_num_blocks: 6
   branch_blocks: [2, 2, 3]
   fusion_blocks: 2
-  ema_alpha: 0.7
   gamma: 2.0
 
 train:

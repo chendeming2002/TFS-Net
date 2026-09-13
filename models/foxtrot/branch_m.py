@@ -128,28 +128,34 @@ class BranchM(nn.Module):
     """Branch-M: Motion Compensation
     
     Args:
-        channels: 输入特征通道数 (默认128)
+        channels: TCA 分量特征通道数 (默认128) - 用于 F_M 中心帧
+        enc_channels: 编码器输出通道数 (默认64) - 用于 F2_seq 时序邻帧
         num_frames: 时序窗口大小 (默认5)
         num_blocks: 聚合后的细化 block 数 (默认3)
         out_channels: 输出通道数 (默认3)
     
     Input:
-        F_M: (B, C, H/2, W/2) — TCA 解耦的运动分量 (中心帧)
-        F_M_seq: (B, T, C, H/2, W/2) — 全时序特征 (用于对齐聚合)
-        pyramid_feats: List[(B, C_i, H_i, W_i)] — 多尺度编码特征 (可选，用于多尺度对齐)
+        F_M:    (B, channels, H/2, W/2)     — TCA 解耦的运动分量 (中心帧)
+        F2_seq: (B, T, enc_channels, H/2, W/2) — 编码器输出的真实多帧时序特征
     
     Output:
-        Y_M: (B, 3, H, W) — 运动补偿后的图像
-        flow_vis: (B, 2, H/2, W/2) — 中心帧光流 (供可视化/损失)
-        conf_map: (B, 1, H/2, W/2) — 置信度图
+        Y_M:      (B, 3, H, W)         — 运动补偿后的图像
+        flow_vis: (B, 2, H/2, W/2)     — 平均光流 (供可视化/损失)
+        conf_map: (B, 1, H/2, W/2)     — 平均置信度
     """
     
-    def __init__(self, channels: int = 128, num_frames: int = 5,
-                 num_blocks: int = 3, out_channels: int = 3):
+    def __init__(self, channels: int = 128, enc_channels: int = 64,
+                 num_frames: int = 5, num_blocks: int = 3, out_channels: int = 3):
         super().__init__()
         self.channels = channels
         self.num_frames = num_frames
         self.center_idx = num_frames // 2
+        
+        # 邻帧编码器特征投影到 channels (enc_channels → channels)
+        self.neigh_proj = nn.Sequential(
+            nn.Conv2d(enc_channels, channels, 1, bias=True),
+            LayerNorm2d(channels),
+        )
         
         # 光流估计器
         self.flow_estimator = FlowEstimator(channels)
@@ -186,16 +192,19 @@ class BranchM(nn.Module):
         )
     
     def _align_and_aggregate(self, F_M: torch.Tensor,
-                             F_M_seq: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                             F2_seq: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """对齐并聚合邻帧
         
+        F_M:    (B, channels, H, W)      — TCA 中心帧特征
+        F2_seq: (B, T, enc_channels, H, W) — 编码器真实多帧时序特征
+        
         Returns:
-            aggregated: (B, C, H, W) — 聚合后的特征
-            flow_center: (B, 2, H, W) — 中心帧的平均光流 (可视化用)
-            conf_avg: (B, 1, H, W) — 平均置信度
+            aggregated: (B, channels, H, W) — 聚合后的特征
+            flow_center: (B, 2, H, W)       — 平均光流
+            conf_avg:   (B, 1, H, W)        — 平均置信度
         """
-        B, T, C, H, W = F_M_seq.shape
-        center = F_M  # (B, C, H, W)
+        B, T, C_enc, H, W = F2_seq.shape
+        center = F_M  # (B, channels, H, W)
         
         aligned_list = [center]  # 中心帧不需要对齐
         flow_list = []
@@ -205,7 +214,8 @@ class BranchM(nn.Module):
             if t == self.center_idx:
                 continue
             
-            neigh = F_M_seq[:, t]  # (B, C, H, W)
+            # 投影邻帧到 channels
+            neigh = self.neigh_proj(F2_seq[:, t])  # (B, channels, H, W)
             
             # 光流估计
             flow = self.flow_estimator(center, neigh)  # (B, 2, H, W)
@@ -223,38 +233,32 @@ class BranchM(nn.Module):
             aligned_list.append(warped_gated)
         
         # 聚合
-        aggregated_cat = torch.cat(aligned_list, dim=1)  # (B, C*T, H, W)
+        aggregated_cat = torch.cat(aligned_list, dim=1)  # (B, channels*T, H, W)
         aggregated = self.fusion_conv(aggregated_cat)
         
-        # 平均光流和置信度 (用于监督/可视化)
+        # 平均光流和置信度
         flow_center = torch.stack(flow_list, dim=1).mean(dim=1) if flow_list else torch.zeros(B, 2, H, W, device=F_M.device)
-        conf_avg = torch.stack(conf_list, dim=1).mean(dim=1) if conf_list else torch.ones(B, 1, H, W, device=F_M.device)
+        conf_avg    = torch.stack(conf_list, dim=1).mean(dim=1) if conf_list else torch.ones(B, 1, H, W, device=F_M.device)
         
         return aggregated, flow_center, conf_avg
     
-    def forward(self, F_M: torch.Tensor, F_M_seq: torch.Tensor,
-                pyramid_feats: List[torch.Tensor] = None) -> dict:
+    def forward(self, F_M: torch.Tensor, F2_seq: torch.Tensor) -> dict:
         """
-        F_M: (B, C, H/2, W/2)
-        F_M_seq: (B, T, C, H/2, W/2)
-        pyramid_feats: 暂时未使用，预留多尺度对齐接口
+        F_M:    (B, channels, H/2, W/2)       — TCA 运动分量 (中心帧)
+        F2_seq: (B, T, enc_channels, H/2, W/2) — 编码器真实多帧特征
         
         Returns dict: Y_M, flow_vis, conf_map
         """
         # 对齐并聚合
-        aggregated, flow_vis, conf_map = self._align_and_aggregate(F_M, F_M_seq)
+        aggregated, flow_vis, conf_map = self._align_and_aggregate(F_M, F2_seq)
         
         # 细化
         x = self.refine_blocks(aggregated)
         
         # 上采样到原分辨率
-        x = self.upsample(x)  # (B, C, H, W)
+        x = self.upsample(x)  # (B, channels, H, W)
         
         # 输出 RGB
         Y_M = self.to_rgb(x)  # (B, 3, H, W)
         
-        return {
-            "Y_M": Y_M,
-            "flow_vis": flow_vis,
-            "conf_map": conf_map,
-        }
+        return {"Y_M": Y_M, "flow_vis": flow_vis, "conf_map": conf_map}
