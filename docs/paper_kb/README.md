@@ -13,6 +13,7 @@
 | [trends_llie_llve_2026.md](trends_llie_llve_2026.md) | 领域研究动向趋势综述 | 了解最新技术方向、判断我们的位置 |
 | [ideas_top_transferable.md](ideas_top_transferable.md) | 可迁移创新点 idea 池（S/A/B 分级）| 候选改进方向、论文创新点素材 |
 | [foxtrot_analysis.md](foxtrot_analysis.md) | Foxtrot 实验结果、架构分析、棋盘格诊断 | 本项目的问题诊断与改进方案 |
+| [**sota_survey_2026.md**](sota_survey_2026.md) | **5篇SOTA论文深度代码调研（23个技术点）** | **完整实现分析+Golf改进路线图** |
 | [Golf-plan.md](../v6/Golf-plan.md) | Golf 版本设计（Foxtrot 修复版）| 下一版架构设计文档 |
 
 ---
@@ -58,11 +59,13 @@
 |------|------|:---:|------|
 | MobileIE | github.com/AVC2-UESTC/MobileIE | ✅ | MBRConv/FST/HDPA |
 | SSGformer | github.com/jeongyh98/SSGformer | ✅ | Sobel+SVD光谱先验/FGA_C分组注意力 |
-| LASQ | github.com/XYLGroup/LASQ | ⏳ 网络超时 | — |
-| AFUNet | github.com/eezkni/AFUNet | ⏳ 网络超时 | — |
-| PRE-Mamba | github.com/softword-tt/PRE-Mamba | ⏳ 网络超时 | — |
+| **MODEM** | **BasicSR框架** | ✅ | Morton-Order扫描/DAFM退化调制/两阶段蒸馏 |
+| **DGAF-VSR** | **Diffusers集成** | ✅ | 超分辨率域warp/zero-init/全层级dense residual |
+| **PRE-Mamba** | **PointCept框架** | ✅ | 双流MSSM门控/STDF时序差分/Hilbert序列化 |
+| **LASQ** | **NeurIPS2026** | ✅ | MCMC-Gamma分层量化/特征空间扩散/对抗训练 |
+| **AFUNet** | **ICCV2025** | ✅ | W-MCA跨帧对齐/Deep Unfolding/μ域FFTLoss |
 
-**待补**：LASQ、AFUNet、PRE-Mamba 代码细节（网络恢复后补读）
+**最新补完**（2026-09-16）：MODEM/DGAF-VSR/PRE-Mamba/LASQ/AFUNet 5篇完整代码精读完成，详见 [sota_survey_2026.md](sota_survey_2026.md)
 
 ---
 
