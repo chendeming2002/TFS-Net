@@ -4,11 +4,24 @@
     <mapping directory="$PROJECT_DIR$" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/Experience/SDSD-Trid/CED" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/reference_repos/BasicSR" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/reference_repos/CDVD-TSP" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/reference_repos/Condformer" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/reference_repos/DAT" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/reference_repos/DRWKV" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/reference_repos/DarkIR" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/reference_repos/EvRWKV" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/reference_repos/FRBNet" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/reference_repos/FourLLIE" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/reference_repos/HVI-CIDNet" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/reference_repos/LLVE_STCD" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/reference_repos/MINS-Net" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/reference_repos/NAFNet" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/reference_repos/RWKV-LM" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/reference_repos/RWKV-block" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/reference_repos/Retinexformer" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/reference_repos/StableLLVE" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/reference_repos/URWKV" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/reference_repos/Vision-RWKV" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/reference_repos/fastdvdnet" vcs="Git" />
   </component>
 </project>

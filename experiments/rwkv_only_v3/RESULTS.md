@@ -1,7 +1,7 @@
 # RWKV-LLVE 概念模型 — 实验结果与阶段性结论
 
 > 本文是《RWKV-LLVE概念模型V3设计.md》的执行结果记录。
-> 更新至: 2026-09-04（ablation A 完成，BC 进行中）
+> 更新至: 2026-09-16（Golf r1 启动；棋盘格伪影诊断 + 修复；Foxtrot §8 归档）
 
 ---
 
@@ -25,6 +25,8 @@
 | F11-S1 | **完整模型**+T-BC1b+旧15项损失+课程解锁（ep12 主动停止作对照） | — | 16.69 | — | — | 未训 | 16.69@10 | ✅(预算截断,仅存 ep10 对照点) |
 | F11-S1.5v1 | 完整模型+T-BC1b+纯5项 Simple 损失（无锚定项） | — | 12.54 | — | — | — | 12.54@10 | ❌(warmup 增益 sigmoid 饱和死锁,存档 sdsd_f11_simple) |
 | **F11-S1.5v1.1** | **完整模型+T-BC1b+8项含锚 Simple 损失+课程解锁 40ep/AMP** | — | 14.33 | 17.55 | **18.72** | 18.29 | **18.72**@30 | ✅训练完成 ❌未达基线（val -1.27, pair45 13.51, 见 §7）|
+| **Foxtrot** | **TSD-Net 三分支 (TCA-RWKV) + 8项损失, 60→70ep** | 2.57M | 18.10 | 17.48 | 18.23 | 18.51 | **19.72**@60 | ✅训练完成（pair45 14.37; 见 §8）|
+| **Golf** | **Foxtrot + resize-conv 上采样 + F1 skip + 3项新损失, 40ep** | 3.50M | — | — | — | — | 训练中 | 🔄 2026-09-16 启动 |
 
 （BC = 组合验证的推论配置：去掉有害的方案3，保留疑似有益的 2A+4）
 
@@ -380,3 +382,82 @@ TA 实测：ep10=19.31, ep20=**19.55**，vs v2@20=19.63 → **-0.08dB（中性�
 - BiWKV fp32 加固（`840596e`）
 - `scripts/ablate_x3.py`（链式分支消融：monkey-patch 单开关 + 全量推理 + 位置配对评估，可复用于任意 checkpoint 的归因分析）
 - `outputs/x3_ablation/`（results.json + 4 组 131 帧输出图，供视觉对照）
+
+---
+
+## 8. Foxtrot (TSD-Net) — 三分支结构化分解网络（2026-09-16）
+
+> 基于 `docs/TSD-Foxtrot/TSD-Foxtrot.md` 的 TSDR 三源分解设计，全新架构（非 RWKV 概念模型线）。
+> 详见 `docs/paper_kb/foxtrot_analysis.md`。
+
+### 8.1 架构与结果
+
+| 项 | 值 |
+|------|------|
+| 架构 | SharedEncoder(3尺度) + TCA-RWKV(三查询解耦) + Branch-N/L/M + AdaptiveFusion |
+| 参数 | 2.57M |
+| 训练 | 60ep + 10ep 续训，2.57M，~56min/ep |
+| **val 峰值** | **PSNR 19.716@60 / SSIM 0.7402@70 / LPIPS 0.3199@70** |
+| pair45 | PSNR 14.37 / SSIM 0.658 |
+
+### 8.2 关键发现
+
+1. **三指标错位**：PSNR 在 ep60 达峰后回落（-0.07），SSIM/LPIPS 在 ep70 仍改善——感知-保真权衡
+2. **+1.26dB 跃升**（ep50→60）纯由 lr 降档（4e-4→1e-4）触发
+3. **注意力"部分有效"**：L_ortho 2.96→0.003（解耦成功），但参数效率低（2.9× 参数 vs TBC1B 仍 -0.27dB）
+4. **结构浪费**：F1/F3 编码器特征完全闲置、全流程 H/2 无 skip
+5. **工程 bug**：resume 时 latest.pth 未保存 best_psnr → ep70 覆盖了 ep60 最优权重（已修复 train_foxtrot.py）
+
+### 8.3 棋盘格/分格伪影诊断（重要）
+
+推理帧观察到分格现象，诊断出**两个独立来源**（详见 §7 of `foxtrot_analysis.md`）：
+
+| 来源 | 机制 | 尺度 | 修复 |
+|------|------|:---:|------|
+| A（主因）| `tiled_forward` 均匀平均，重叠带权重 2.0 稀释 | ~224px 分格 | 余弦窗口混合 |
+| B（次因）| 三分支 PixelShuffle 上采样子像素隔离 | 2px 棋盘 | resize-conv |
+
+**核心认识：这不是训练问题** —— 来源 A 推理时即可复现；来源 B 是结构缺陷。
+
+---
+
+## 9. Golf — Foxtrot 修复版（2026-09-16 启动）
+
+> 设计文档：`docs/v6/Golf-plan.md`
+> 训练：`outputs/golf_r1`（40ep，2026-09-16 11:44 启动）
+
+### 9.1 相对 Foxtrot 的改动
+
+| # | 改动 | 对应问题 |
+|---|------|---------|
+| G1 | resize-conv 上采样（`UpsampleBlock`）| 棋盘格来源 B |
+| G2 | F1 高分辨率 skip 接入三分支 | P1+P2 特征浪费 |
+| G3 | `tiled_forward` 余弦窗口混合 | 棋盘格来源 A |
+| G4 | 棋盘格频域损失 `L_chess` | 兜底抑制 |
+| G5 | 分支差异化弱监督 `L_div` | P3 功能冗余 |
+| G6 | 高频稳定损失 `L_temp` | P4 时序缺失 |
+| G7 | Fusion 权重网络 2层→4层 | 表达力 |
+| G8 | 残差 gamma 上界 0.5→0.9 | 中心帧贡献 |
+
+### 9.2 启动状态
+
+```
+参数: 3.50M (Foxtrot +0.93M)
+epochs: 40
+loss: 1.77 → 0.89 (ep1 step200, 健康下降)
+速度: ~1.2 it/s ≈ 57min/ep
+GPU: 11.1GB / 24GB
+```
+
+### 9.3 成功判据
+
+1. pair45 PSNR ≥ 15.0（超越 Foxtrot 14.37）
+2. val PSNR ≥ 19.7（持平/超越 Foxtrot ep60）
+3. 推理帧无可见分格（视觉）+ 自相关第一峰 ≠ 2px（数值）
+
+### 9.4 工程资产
+
+- `models/golf/`（upsample / encoder / tca_rwkv / branch_n,l,m / fusion / loss / golfnet）
+- `train_golf.py`（与基础设施同构：keepalive/monitor 兼容）
+- `configs/golf_r1.yaml`
+- `utils/inference.py` 余弦窗口 `tiled_forward`（全局生效，所有模型受益）

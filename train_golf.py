@@ -33,8 +33,8 @@ except Exception:
         return _TqdmFallback(iterable, *args, **kwargs)
 
 from datasets import SDSDDataset
-from models.foxtrot import TSDNet
-from models.foxtrot.loss import FoxtrotLoss
+from models.golf import GolfNet
+from models.golf.loss import GolfLoss
 from utils.io import save_checkpoint
 from utils.inference import tiled_forward
 from utils.metrics import tensor_psnr, tensor_ssim
@@ -108,13 +108,13 @@ def build_dataloaders(cfg, smoke=False):
 
 def build_model(cfg, device):
     model_cfg = {k: v for k, v in cfg["model"].items() if k != "type"}
-    model = TSDNet(**model_cfg)
+    model = GolfNet(**model_cfg)
     return model.to(device)
 
 
 def build_loss(cfg, device):
     loss_cfg = {k: v for k, v in cfg["loss"].items() if k != "type"}
-    return FoxtrotLoss(**loss_cfg).to(device)
+    return GolfLoss(**loss_cfg).to(device)
 
 
 def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp,
@@ -126,6 +126,9 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
     meter_bL = AverageMeter()
     meter_bM = AverageMeter()
     meter_ortho = AverageMeter()
+    meter_chess = AverageMeter()
+    meter_temp = AverageMeter()
+    meter_div = AverageMeter()
 
     progress = tqdm(enumerate(loader), total=len(loader), desc="train", leave=False)
     for step, (clip, target, _) in progress:
@@ -160,14 +163,19 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
         meter_bL.update(loss_dict["L_L"], clip.size(0))
         meter_bM.update(loss_dict["L_M"], clip.size(0))
         meter_ortho.update(loss_dict["L_ortho"], clip.size(0))
+        meter_chess.update(loss_dict["L_chess"], clip.size(0))
+        meter_temp.update(loss_dict["L_temp"], clip.size(0))
+        meter_div.update(loss_dict["L_div"], clip.size(0))
 
-        progress.set_postfix(loss=meter_total.avg, final=meter_final.avg, ortho=meter_ortho.avg)
+        progress.set_postfix(loss=meter_total.avg, final=meter_final.avg,
+                             chess=meter_chess.avg, ortho=meter_ortho.avg)
         if (step + 1) % log_interval == 0:
             logger.info(
-                "step %d/%d loss=%.4f final=%.4f bN=%.4f bL=%.4f bM=%.4f ortho=%.4f",
+                "step %d/%d loss=%.4f final=%.4f bN=%.4f bL=%.4f bM=%.4f ortho=%.4f chess=%.4f temp=%.4f div=%.4f",
                 step + 1, len(loader),
                 meter_total.avg, meter_final.avg,
                 meter_bN.avg, meter_bL.avg, meter_bM.avg, meter_ortho.avg,
+                meter_chess.avg, meter_temp.avg, meter_div.avg,
             )
             with torch.no_grad():
                 w = outputs.get("fusion_weights")
@@ -189,6 +197,9 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
         "loss_bL": meter_bL.avg,
         "loss_bM": meter_bM.avg,
         "loss_ortho": meter_ortho.avg,
+        "loss_chess": meter_chess.avg,
+        "loss_temp": meter_temp.avg,
+        "loss_div": meter_div.avg,
     }
 
 
@@ -257,7 +268,7 @@ def main():
     model = build_model(cfg, device)
 
     n_params = sum(p.numel() for p in model.parameters())
-    logger.info("TSDNet params: %.2fM", n_params / 1e6)
+    logger.info("GolfNet params: %.2fM", n_params / 1e6)
 
     criterion = build_loss(cfg, device)
     optimizer = AdamW(model.parameters(), lr=cfg["train"]["lr"], weight_decay=cfg["train"]["weight_decay"])

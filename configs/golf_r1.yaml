@@ -1,5 +1,5 @@
 seed: 42
-output_dir: outputs/foxtrot_r1
+output_dir: outputs/golf_r1
 
 dataset:
   train_input_root: /home/a1005/yzy/dataset/SDSD/indoor/input
@@ -13,20 +13,20 @@ dataset:
   val_crop_size: 256
 
 model:
-  type: TSDNet
+  type: GolfNet
   in_channels: 3
   num_frames: 5
   encoder_channels: [32, 64, 128]
   tca_channels: 128
   tca_heads: 4
   tca_num_blocks: 6
-  branch_blocks: [2, 2, 3]
+  branch_blocks: [3, 2, 3]
   fusion_blocks: 2
   gamma: 2.0
 
 train:
   batch_size: 2
-  epochs: 70
+  epochs: 40
   lr: 0.0008
   weight_decay: 0.0001
   amp: true
@@ -37,12 +37,14 @@ train:
   grad_accum_steps: 8
 
 loss:
-  type: FoxtrotLoss
+  type: GolfLoss
   lambda_N: 0.3
   lambda_L: 0.3
   lambda_M: 0.3
   lambda_ortho: 0.01
-  lambda_temp: 0.0
+  lambda_chess: 0.05
+  lambda_temp: 0.02
+  lambda_div: 0.05
   use_ssim: true
   ssim_weight: 0.3
 
