@@ -3,32 +3,30 @@ Golf Loss Function
 ===================
 在 FoxtrotLoss 基础上新增两项:
 
-1. [棋盘格抑制] L_chess — 频域棋盘格惩罚
-   棋盘格在 FFT 频谱的 Nyquist 频率 (周期2px) 有能量尖峰。
-   直接惩罚该频段能量, 主动抑制残余格纹:
-     L_chess = |FFT_shift(O_t)|[Nyquist 十字带] 的均值
-   虽然 Golf 的 resize-conv 已从结构上消除主要来源, 此损失作为兜底
-   并防止 fusion 的 3×3 卷积重新引入周期伪影。
+1. [时序一致性] L_temp — 高频稳定
+   对 O_t 与低通(X_t) 的高频残差做正则, 保证输出不引入不自然的
+   帧间高频跳变 (单帧可算)。
 
-2. [时序一致性] L_temp — 多帧输出一致性
-   Foxtrot 的 L_temp 未实现 (lambda_temp=0)。
-   Golf 实现: 利用相邻帧预测的一致性约束。
-   由于网络只输出中心帧, 采用"相邻窗口重叠预测"策略:
-   用相邻的 GT 帧与当前输出做时序平滑 (需要多帧输出, 成本高)
-   → Golf 改用轻量方案: 对 O_t 与低通(X_t) 的高频残差做正则,
-     保证输出不引入不自然的帧间高频跳变 (单帧可算)。
-
-3. [分支差异化弱监督] L_branch_div
+2. [分支差异化弱监督] L_branch_div
    Foxtrot 三分支都回归同一 GT → 功能冗余。
    Golf 给分支加差异化引导:
-     - Branch-N (噪声): 侧重暗区/平坦区域的平滑
+     - Branch-N (噪声): 侧重暗区/平坦区域
      - Branch-L (光照): 侧重全局亮度一致性
      - Branch-M (运动): 侧重边缘/结构保持
-   通过空间加权 mask 实现 (不需要额外 GT)
+   通过空间加权 mask 实现 (不需要额外 GT), 最小化 = 最大化区域专属性。
+
+[已于 2026-09-17 删除] L_chess — 频域棋盘格惩罚
+   删除理由:
+   (1) 棋盘格是推理期结构问题 (PixelShuffle 子像素隔离 + tiled_forward
+       均匀平均), 已由 resize-conv 上采样 + 余弦窗口缝合从结构上修复;
+       用训练损失去补救推理期伪影属于原理错位。
+   (2) 实测该损失项在 Golf 训练中恒为 0 (mask 逻辑错误致死代码),
+       从未产生任何贡献; 且其绝对能量形式会无差别压制正常高频细节。
+   (3) 标定困难: 需要同时调对 mask 位置与半径, 收益为负。
 
 损失结构:
   L_total = L_final + λ_N·L_N + λ_L·L_L + λ_M·L_M
-            + λ_ortho·L_ortho + λ_chess·L_chess + λ_temp·L_temp
+            + λ_ortho·L_ortho + λ_temp·L_temp + λ_div·L_div
 """
 
 import torch
@@ -83,16 +81,15 @@ class GolfLoss(nn.Module):
     Args:
         lambda_N/L/M:    分支监督权重
         lambda_ortho:    正交约束权重
-        lambda_chess:    棋盘格抑制权重 (Golf 新增)
-        lambda_temp:     时序/高频稳定权重 (Golf 新增)
-        lambda_div:      分支差异化权重 (Golf 新增)
+        lambda_temp:     时序/高频稳定权重
+        lambda_div:      分支差异化权重
         use_ssim:        是否用 SSIM
         ssim_weight:     SSIM 权重
     """
 
     def __init__(self, lambda_N: float = 0.3, lambda_L: float = 0.3,
                  lambda_M: float = 0.3, lambda_ortho: float = 0.01,
-                 lambda_chess: float = 0.05, lambda_temp: float = 0.02,
+                 lambda_temp: float = 0.02,
                  lambda_div: float = 0.05,
                  use_ssim: bool = True, ssim_weight: float = 0.3):
         super().__init__()
@@ -100,7 +97,6 @@ class GolfLoss(nn.Module):
         self.lambda_L = lambda_L
         self.lambda_M = lambda_M
         self.lambda_ortho = lambda_ortho
-        self.lambda_chess = lambda_chess
         self.lambda_temp = lambda_temp
         self.lambda_div = lambda_div
         self.use_ssim = use_ssim
@@ -125,36 +121,6 @@ class GolfLoss(nn.Module):
         gx = torch.abs(flow[:, :, :, :-1] - flow[:, :, :, 1:])
         gy = torch.abs(flow[:, :, :-1, :] - flow[:, :, 1:, :])
         return gx.mean() + gy.mean()
-
-    def _checkerboard_loss(self, img: torch.Tensor) -> torch.Tensor:
-        """棋盘格抑制: 惩罚 FFT 频谱中周期 2px 的 Nyquist 频段能量.
-
-        棋盘格在频域的表现为 (H/2, 0) 与 (0, W/2) 附近的能量尖峰。
-        通过遮蔽低频/中频, 只统计 Nyquist 十字带, 惩罚其能量。
-        """
-        gray = img.float().mean(dim=1)              # (B,H,W)
-        fft = torch.fft.fft2(gray, norm='ortho')
-        mag = torch.abs(torch.fft.fftshift(fft, dim=(-2, -1)))  # (B,H,W)
-        H, W = gray.shape[-2:]
-
-        # Nyquist 十字带: 中心 ± 1 像素的行/列
-        mask = torch.zeros(1, H, W, device=img.device, dtype=mag.dtype)
-        cy, cx = H // 2, W // 2
-        # 垂直 Nyquist 线 (列 cx)
-        mask[:, cy, :] = 1.0
-        mask[:, :, cx] = 1.0
-        # 只保留端点附近的 Nyquist 频率 (周期≈2px)
-        # 用带阻: 去掉中心低频
-        band = torch.zeros(1, H, W, device=img.device, dtype=mag.dtype)
-        k = max(3, min(H, W) // 16)
-        band[:, cy - k:cy + k + 1, :] = 1.0
-        band[:, :, cx - k:cx + k + 1] = 1.0
-        mask = mask * (1.0 - band)   # 十字带 减去 中心低频区
-
-        # 归一化: 除以总能量避免尺度依赖
-        total = mag.sum(dim=(-2, -1), keepdim=True).clamp(min=1e-8)
-        loss = (mag * mask).sum(dim=(-2, -1)) / total.squeeze(-1).squeeze(-1) * 1e3
-        return loss.mean()
 
     def _temporal_highfreq_stability(self, O_t: torch.Tensor,
                                      X_t: torch.Tensor) -> torch.Tensor:
@@ -198,8 +164,9 @@ class GolfLoss(nn.Module):
         d_M = (Y_M - X_t).abs().mean(dim=1, keepdim=True)
 
         # 期望: 暗区 N 变化大, 亮区 L 变化大, 边缘区 M 变化大
-        L_div = -(dark * d_N).mean() - (bright * d_L).mean() - (grad * d_M).mean()
-        return -L_div  # 取负 → 最大化差异 (loss 下降)
+        # 最小化 L_div = 最大化三项加权差异 (loss 下降)
+        L_div = (dark * d_N).mean() + (bright * d_L).mean() + (grad * d_M).mean()
+        return -L_div  # 取负 → 最大化差异
 
     def forward(self, outputs: Dict[str, torch.Tensor],
                 gt: torch.Tensor, gt_seq: torch.Tensor = None) -> Dict[str, torch.Tensor]:
@@ -221,16 +188,13 @@ class GolfLoss(nn.Module):
         # 3. 正交约束
         L_ortho = ortho_loss
 
-        # 4. [Golf] 棋盘格抑制
-        L_chess = self._checkerboard_loss(O_t)
-
-        # 5. [Golf] 高频稳定
+        # 4. [Golf] 高频稳定
         if X_t is not None:
             L_temp = self._temporal_highfreq_stability(O_t, X_t)
         else:
             L_temp = torch.tensor(0.0, device=O_t.device)
 
-        # 6. [Golf] 分支差异化
+        # 5. [Golf] 分支差异化（L_div < 0, 最小化 = 最大化区域专属差异）
         if X_t is not None:
             L_div = self._branch_divergence(Y_N, Y_L, Y_M, X_t)
         else:
@@ -241,7 +205,6 @@ class GolfLoss(nn.Module):
                       self.lambda_L * L_L +
                       self.lambda_M * L_M +
                       self.lambda_ortho * L_ortho +
-                      self.lambda_chess * L_chess +
                       self.lambda_temp * L_temp +
                       self.lambda_div * L_div)
 
@@ -252,7 +215,6 @@ class GolfLoss(nn.Module):
             "L_L": L_L.item(),
             "L_M": L_M.item(),
             "L_ortho": L_ortho.item() if isinstance(L_ortho, torch.Tensor) else L_ortho,
-            "L_chess": L_chess.item() if isinstance(L_chess, torch.Tensor) else L_chess,
             "L_temp": L_temp.item() if isinstance(L_temp, torch.Tensor) else L_temp,
             "L_div": L_div.item() if isinstance(L_div, torch.Tensor) else L_div,
         }

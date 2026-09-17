@@ -1,5 +1,5 @@
 seed: 42
-output_dir: outputs/golf_r1
+output_dir: outputs/golf_r2
 
 dataset:
   train_input_root: /home/a1005/yzy/dataset/SDSD/indoor/input

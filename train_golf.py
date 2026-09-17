@@ -126,7 +126,6 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
     meter_bL = AverageMeter()
     meter_bM = AverageMeter()
     meter_ortho = AverageMeter()
-    meter_chess = AverageMeter()
     meter_temp = AverageMeter()
     meter_div = AverageMeter()
 
@@ -163,19 +162,18 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
         meter_bL.update(loss_dict["L_L"], clip.size(0))
         meter_bM.update(loss_dict["L_M"], clip.size(0))
         meter_ortho.update(loss_dict["L_ortho"], clip.size(0))
-        meter_chess.update(loss_dict["L_chess"], clip.size(0))
         meter_temp.update(loss_dict["L_temp"], clip.size(0))
         meter_div.update(loss_dict["L_div"], clip.size(0))
 
         progress.set_postfix(loss=meter_total.avg, final=meter_final.avg,
-                             chess=meter_chess.avg, ortho=meter_ortho.avg)
+                             div=meter_div.avg, ortho=meter_ortho.avg)
         if (step + 1) % log_interval == 0:
             logger.info(
-                "step %d/%d loss=%.4f final=%.4f bN=%.4f bL=%.4f bM=%.4f ortho=%.4f chess=%.4f temp=%.4f div=%.4f",
+                "step %d/%d loss=%.4f final=%.4f bN=%.4f bL=%.4f bM=%.4f ortho=%.4f temp=%.4f div=%.4f",
                 step + 1, len(loader),
                 meter_total.avg, meter_final.avg,
                 meter_bN.avg, meter_bL.avg, meter_bM.avg, meter_ortho.avg,
-                meter_chess.avg, meter_temp.avg, meter_div.avg,
+                meter_temp.avg, meter_div.avg,
             )
             with torch.no_grad():
                 w = outputs.get("fusion_weights")
@@ -197,7 +195,6 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
         "loss_bL": meter_bL.avg,
         "loss_bM": meter_bM.avg,
         "loss_ortho": meter_ortho.avg,
-        "loss_chess": meter_chess.avg,
         "loss_temp": meter_temp.avg,
         "loss_div": meter_div.avg,
     }
