@@ -13,7 +13,7 @@
 | [trends_llie_llve_2026.md](trends_llie_llve_2026.md) | 领域研究动向趋势综述 | 了解最新技术方向、判断我们的位置 |
 | [ideas_top_transferable.md](ideas_top_transferable.md) | 可迁移创新点 idea 池（S/A/B 分级）| 候选改进方向、论文创新点素材 |
 | [foxtrot_analysis.md](foxtrot_analysis.md) | Foxtrot 实验结果、架构分析、棋盘格诊断 | 本项目的问题诊断与改进方案 |
-| [**sota_survey_2026.md**](sota_survey_2026.md) | **5篇SOTA论文深度代码调研（23个技术点）** | **完整实现分析+Golf改进路线图** |
+| [**ssm_visual_survey.md**](ssm_visual_survey.md) | **SSM在视觉任务应用的系统调研（扩展版，33篇）** | **Mamba/RWKV/RetNet竞争格局 + 引用加权分析 + 趋势预测** |
 | [Golf-plan.md](../v6/Golf-plan.md) | Golf 版本设计（Foxtrot 修复版）| 下一版架构设计文档 |
 
 ---
