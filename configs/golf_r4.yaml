@@ -1,0 +1,60 @@
+seed: 42
+output_dir: outputs/golf_r4
+
+dataset:
+  train_input_root: /home/a1005/yzy/dataset/SDSD/indoor/input
+  train_target_root: /home/a1005/yzy/dataset/SDSD/indoor/GT
+  val_input_root: /home/a1005/yzy/dataset/SDSD/test/low-light
+  val_target_root: /home/a1005/yzy/dataset/SDSD/test/GT
+  window_size: 5
+  crop_size: 256
+  num_workers: 2
+  max_val_seqs: 5
+  val_crop_size: 256
+  # R3-D: 专项运动测试集（pair45），训练时同步监控
+  pair45_input_root: /home/a1005/yzy/dataset/SDSD/test/low-light/pair45
+  pair45_gt_root: /home/a1005/yzy/dataset/SDSD/test/GT/pair45
+
+model:
+  type: GolfNet_R4
+  in_channels: 3
+  num_frames: 5
+  encoder_channels: [32, 64, 128]
+  tca_channels: 128
+  tca_heads: 4
+  tca_num_blocks: 6
+  branch_blocks: [3, 2, 3]
+  fusion_blocks: 2
+  gamma: 2.0
+  use_f3_film: true         # R3-C: F3 FiLM 退化感知查询调制
+  use_hires_warp: true      # R3-B: Branch-M 高分辨率 warp
+
+train:
+  batch_size: 2
+  epochs: 60
+  lr: 0.0008
+  weight_decay: 0.0001
+  amp: true
+  log_interval: 50
+  val_interval: 10
+  warmup_epochs: 5
+  grad_clip: 0.5
+  grad_accum_steps: 8
+
+loss:
+  type: GolfLoss_R4
+  lambda_N: 0.3
+  lambda_L: 0.3
+  lambda_M: 0.3
+  lambda_ortho: 0.01
+  lambda_temp: 0.02
+  lambda_div: 0.05
+  temp_threshold: 1.2       # R3-E: 降低 L_temp 触发阈值（1.5→1.2）
+  use_ssim: true
+  ssim_weight: 0.3
+
+eval:
+  tile_size: 256
+  tile_overlap: 32
+  amp: false
+  lambda_prior: 0.01

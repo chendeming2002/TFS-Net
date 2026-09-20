@@ -25,14 +25,15 @@ if [ -n "$VAL" ]; then echo "$VAL" | sed 's/.*Val stats:/  val  :/'; else echo "
 if [ -n "$P45" ]; then echo "$P45" | sed 's/.*Pair45 stats:/  pair45:/'; else echo "  pair45: (未到验证 epoch)"; fi
 
 echo ""
-echo "══════════ 诊断指标 (Golf-R3) ══════════"
-# conf_map / FiLM / L_temp 激活 (若日志含 diag 行)
+echo "══════════ 诊断指标 ══════════"
+# conf_map / FiLM / 时序损失 (若日志含 diag 行)
 DIAG=$(grep -a "diag:" "$LOG" | tail -1)
 if [ -n "$DIAG" ]; then echo "  $DIAG" | sed 's/.*diag:/diag:/'; fi
-LTEMP=$(grep -a "step" "$LOG" | tail -1 | grep -oE "temp=[0-9.]+" | head -1)
-if [ -n "$LTEMP" ]; then echo "  L_temp  $LTEMP"; fi
-LDIV=$(grep -a "step" "$LOG" | tail -1 | grep -oE "div=-?[0-9.]+" | head -1)
-if [ -n "$LDIV" ]; then echo "  L_div   $LDIV"; fi
+LAST=$(grep -a "step" "$LOG" | tail -1)
+LTEMP=$(echo "$LAST" | grep -oE "temp=[0-9.]+" | head -1)
+if [ -n "$LTEMP" ]; then echo "  $LTEMP  (R4: 真时序一致性)"; fi
+LDIV=$(echo "$LAST" | grep -oE "div=-?[0-9.]+" | head -1)
+if [ -n "$LDIV" ]; then echo "  $LDIV"; fi
 
 # 速度 (最近两条 step 的时间差)
 S1=$(grep -a "step" "$LOG" | tail -2 | head -1)
