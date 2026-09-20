@@ -152,9 +152,17 @@ class GolfLoss(nn.Module):
         d_M = (Y_M - X_t).abs().mean(dim=1, keepdim=True)
 
         # 期望: 暗区 N 变化大, 亮区 L 变化大, 边缘区 M 变化大
-        # 最小化 L_div = 最大化三项加权差异 (loss 下降)
-        L_div = (dark * d_N).mean() + (bright * d_L).mean() + (grad * d_M).mean()
-        return -L_div  # 取负 → 最大化差异
+        # 尺度不变化: 各分支差异用其输出幅度归一化, 避免随量级无界增长
+        n_scale = d_N.abs().mean().detach() + 1e-6
+        l_scale = d_L.abs().mean().detach() + 1e-6
+        m_scale = d_M.abs().mean().detach() + 1e-6
+        rel_N = (dark * d_N).mean() / n_scale
+        rel_L = (bright * d_L).mean() / l_scale
+        rel_M = (grad * d_M).mean() / m_scale
+
+        # tanh 饱和到 (-1,1), 保证 L_div 有界 (原实现理论可 → -∞)
+        L_div = torch.tanh(rel_N + rel_L + rel_M)
+        return -L_div  # 取负 → 最小化 = 最大化区域专属差异
 
     def _temporal_hf_consistency(self, Y_branch: torch.Tensor,
                                  X_mean: torch.Tensor) -> torch.Tensor:

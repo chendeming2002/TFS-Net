@@ -303,27 +303,39 @@ class StructuredPriorWrapper(nn.Module):
             # 噪声: feat + scale * (时序均值)  — 强化 i.i.d. 平均分量
             src = seq_mean if seq_mean is not None else context
             enhanced = feat + self.mean_scale * src
-            # 负熵正则: 鼓励 N 路输出趋向时序均值 (均匀聚合)
-            # 此处用 "输出与均值的一致性" 近似熵最大化 (熵在该层不可直接得)
-            prior_loss = F.mse_loss(feat, src.detach())
+            # 负熵正则 (尺度不变): 用【余弦相似度】而非 MSE
+            #   原 F.mse_loss(feat, src) 随 feat 量级【平方】增长 → 正反馈发散
+            #   (实测 L_prior 1.15 → 587, total_loss 1.2 → 8.9)
+            #   余弦相似度 ∈ [-1,1] 且对尺度不变 (k^0), 有界 → 无发散风险
+            f_flat = feat.flatten(1)
+            s_flat = src.detach().flatten(1)
+            cos = F.cosine_similarity(f_flat, s_flat, dim=1, eps=1e-6)
+            prior_loss = (1.0 - cos).mean()   # ∈ [0,2], 一致时→0
             return enhanced, prior_loss
 
         elif self.branch_type == 'L':
             # 光照: feat + scale * 低通(feat) — 强化低频慢变分量
             lp = self.lowpass(feat)
             enhanced = feat + self.lp_scale * lp
-            # 时间平滑正则: 光照应帧间慢变, 用空间 TV 近似"低频"约束
+            # 低频约束 (尺度不变): 归一化 TV = TV(feat) / rms(feat)
+            #   rms 分母 detach, 避免梯度通过分母"刷分"
             gx = (feat[:, :, :, 1:] - feat[:, :, :, :-1]).abs().mean()
             gy = (feat[:, :, 1:, :] - feat[:, :, :-1, :]).abs().mean()
-            prior_loss = gx + gy
+            rms = feat.pow(2).mean().sqrt().detach() + 1e-6
+            prior_loss = (gx + gy) / rms
             return enhanced, prior_loss
 
         else:  # M
             # 运动: feat + scale * diff_proj(center-context) — 强化位移分量
             diff = center - context
             enhanced = feat + self.diff_scale * self.diff_proj(diff)
-            # 稀疏正则 (L1): 运动是局部现象, 鼓励大多数位置响应接近零
-            prior_loss = self.diff_proj(diff).abs().mean()
+            # 稀疏正则 (尺度不变): L1/rms 比值 ∈ (0,1]
+            #   稀疏信号(少数大峰) → L1/rms 小; 稠密信号 → 趋近 1
+            #   最小化 → 鼓励运动响应稀疏化 (运动是局部现象)
+            d = self.diff_proj(diff)
+            l1 = d.abs().mean()
+            rms = d.pow(2).mean().sqrt().detach() + 1e-6
+            prior_loss = l1 / rms
             return enhanced, prior_loss
 
 
