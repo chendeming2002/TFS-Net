@@ -16,10 +16,22 @@ LOG_DIR = os.path.join(ROOT, "scripts/monitor_data")
 CSV_PATH = os.path.join(LOG_DIR, "temp_log.csv")
 CHART_PATH = os.path.join(LOG_DIR, "temp_chart.png")
 PLOT_SCRIPT = os.path.join(ROOT, "scripts/plot_temps.py")
-TRAIN_LOGS = [
-    os.path.join(ROOT, "experiments/rwkv_only_v3/outputs_ablation_A/train.log"),
-    os.path.join(ROOT, "experiments/rwkv_only_v3/outputs_notca/train.log"),
-]
+def _discover_train_logs():
+    """自动发现活跃训练日志: 取最近修改的若干 train.log (覆盖 outputs/* 与概念模型消融)"""
+    import glob
+    patterns = [
+        os.path.join(ROOT, "outputs/*/train.log"),
+        os.path.join(ROOT, "experiments/rwkv_only_v3/outputs*/train.log"),
+    ]
+    logs = []
+    for p in patterns:
+        logs.extend(glob.glob(p))
+    # 按修改时间倒序, 取最近 3 个
+    logs.sort(key=lambda x: os.path.getmtime(x) if os.path.exists(x) else 0, reverse=True)
+    return logs[:3] or [os.path.join(ROOT, "outputs/golf_r3/train.log")]
+
+
+TRAIN_LOGS = _discover_train_logs()
 
 SAMPLE_INTERVAL = 5       # 秒
 PLOT_EVERY = 60           # 每 60 个样本 (~5 分钟) 重画图
@@ -33,7 +45,7 @@ SENSORS_RE = {
     "core20": re.compile(r"^Core 20:\s*\+(\d+\.?\d*)"),
 }
 STEP_RE = re.compile(r"step (\d+)/(\d+)")
-EPOCH_RE = re.compile(r"Epoch (\d+)/(\d+) train")
+EPOCH_RE = re.compile(r"Epoch (\d+)\s*/\s*(\d+)")
 
 RAPL_PL1 = "/sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw"
 NVME_TEMP = "/sys/class/hwmon/hwmon1/temp2_input"
@@ -72,13 +84,16 @@ def read_train():
             with open(path, "rb") as f:
                 f.seek(0, 2)
                 size = f.tell()
-                f.seek(max(0, size - 2048))
+                # 扫描较大尾部: epoch 行每个 epoch 仅出现一次, 2048B 常常扫不到
+                f.seek(max(0, size - 65536))
                 tail = f.read().decode("utf-8", errors="ignore")
-            m = EPOCH_RE.search(tail) or STEP_RE.search(tail)
-            if m:
-                if "Epoch" in m.re.pattern:
-                    return f"ep{m.group(1)}"
-                return f"ep? s{m.group(1)}"
+            # 优先取最后一个 epoch 标记
+            epochs = EPOCH_RE.findall(tail)
+            if epochs:
+                return f"ep{epochs[-1][0]}"
+            steps = STEP_RE.findall(tail)
+            if steps:
+                return f"ep? s{steps[-1][0]}"
         except Exception:
             continue
     return ""

@@ -16,6 +16,24 @@ echo "══════════ 训练进度 [$TAG] ═══════�
 # 最近 3 条 step/Epoch/Val
 grep -a "step\|Epoch\|Val:" "$LOG" | tail -3
 
+echo ""
+echo "══════════ 验证指标 ══════════"
+# val 与 pair45 双指标 (Golf-R3 R3-D)
+VAL=$(grep -a "Val stats:" "$LOG" | tail -1)
+P45=$(grep -a "Pair45 stats:" "$LOG" | tail -1)
+if [ -n "$VAL" ]; then echo "$VAL" | sed 's/.*Val stats:/  val  :/'; else echo "  val  : (未到验证 epoch)"; fi
+if [ -n "$P45" ]; then echo "$P45" | sed 's/.*Pair45 stats:/  pair45:/'; else echo "  pair45: (未到验证 epoch)"; fi
+
+echo ""
+echo "══════════ 诊断指标 (Golf-R3) ══════════"
+# conf_map / FiLM / L_temp 激活 (若日志含 diag 行)
+DIAG=$(grep -a "diag:" "$LOG" | tail -1)
+if [ -n "$DIAG" ]; then echo "  $DIAG" | sed 's/.*diag:/diag:/'; fi
+LTEMP=$(grep -a "step" "$LOG" | tail -1 | grep -oE "temp=[0-9.]+" | head -1)
+if [ -n "$LTEMP" ]; then echo "  L_temp  $LTEMP"; fi
+LDIV=$(grep -a "step" "$LOG" | tail -1 | grep -oE "div=-?[0-9.]+" | head -1)
+if [ -n "$LDIV" ]; then echo "  L_div   $LDIV"; fi
+
 # 速度 (最近两条 step 的时间差)
 S1=$(grep -a "step" "$LOG" | tail -2 | head -1)
 S2=$(grep -a "step" "$LOG" | tail -1)
