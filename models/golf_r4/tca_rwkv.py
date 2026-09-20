@@ -269,8 +269,10 @@ class StructuredPriorWrapper(nn.Module):
         self.branch_type = branch_type
 
         if branch_type == 'N':
-            # 噪声: 时序均值投影 (可学习残差权重, 零初始化 → 从恒等起步)
-            self.mean_scale = nn.Parameter(torch.zeros(1, channels, 1, 1))
+            # 噪声: 时序均值投影 (可学习残差权重)
+            # 非零初始化 (R2 风格 0.1): 提供对称破缺, 否则三分支初始恒等 →
+            #   ortho 落在鞍点 (grad≈1e-8) 无法下降 (实测 R4 卡在 3.000)
+            self.mean_scale = nn.Parameter(torch.full((1, channels, 1, 1), 0.1))
         elif branch_type == 'L':
             # 光照: 全局长程池化门控 (空间低频) — 用大核深度可分离卷积近似低通
             self.lowpass = nn.Sequential(
@@ -278,14 +280,14 @@ class StructuredPriorWrapper(nn.Module):
                 nn.Conv2d(channels, channels, 1, bias=False),
                 nn.Sigmoid(),
             )
-            self.lp_scale = nn.Parameter(torch.zeros(1, channels, 1, 1))
+            self.lp_scale = nn.Parameter(torch.full((1, channels, 1, 1), 0.1))
         else:  # M
-            # 运动: 差分 (位移) 投影, 零初始化 → 从恒等起步
+            # 运动: 差分 (位移) 投影 (非零初始化 0.5, 同 R2)
             self.diff_proj = nn.Sequential(
                 nn.Conv2d(channels, channels, 3, 1, 1, bias=True),
                 nn.GELU(),
             )
-            self.diff_scale = nn.Parameter(torch.zeros(1, channels, 1, 1))
+            self.diff_scale = nn.Parameter(torch.full((1, channels, 1, 1), 0.5))
 
     def forward(self, feat: torch.Tensor,
                 center: torch.Tensor,
