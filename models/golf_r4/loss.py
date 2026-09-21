@@ -104,6 +104,7 @@ class GolfLoss(nn.Module):
         self.lambda_div = lambda_div
         self.lambda_prior = lambda_prior
         self.temp_threshold = temp_threshold
+        self._noise_ref = None   # R4-fix: 帧间噪声参考 (供 L_t 去相关)
         self.use_ssim = use_ssim
         self.ssim_weight = ssim_weight
 
@@ -165,41 +166,61 @@ class GolfLoss(nn.Module):
         return -L_div  # 取负 → 最小化 = 最大化区域专属差异
 
     def _temporal_hf_consistency(self, Y_branch: torch.Tensor,
-                                 X_mean: torch.Tensor) -> torch.Tensor:
-        """[R4] N 分支: 噪声的帧间 i.i.d. 一致性 (覆盖 Read+Shot 两类噪声).
+                                 X_mean: torch.Tensor,
+                                 X_center: torch.Tensor = None) -> torch.Tensor:
+        """[R4-fix] N 分支: 输出不应保留输入噪声 (亮度不变形式).
 
-        物理依据:
-          成像噪声 = Read Noise (信号无关) + Shot Noise (信号相关, Poisson)
-          两者共享关键性质: 【跨帧 i.i.d.】→ 时间平均是最优估计器 (Foi 2008)
-          故去噪输出 Y_N 的【高频分量】应逼近【输入窗口时间均值】的高频分量:
-            - Read noise:  高斯, 时间平均后方差 /N  → HF(x̄) ≈ 干净HF
-            - Shot noise:  泊松, 时间平均后方差 /N  → HF(x̄) ≈ 干净HF
-          两者都被同一策略覆盖 (这正是 TSDR 合并 I+II 为"成像噪声"的依据)。
+        物理依据 (覆盖 Read + Shot 两类噪声):
+          成像噪声 = Read Noise (信号无关, 高斯) + Shot Noise (信号相关, 泊松)
+          两者共享【跨帧 i.i.d.】→ 时间平均是最优估计器 (Foi 2008)
+          帧间差异 (x_c - x̄) 即噪声分量估计; 去噪输出 Y_N 的 HF 应【与噪声不相关】。
 
-        与旧实现 (Golf-R3) 的区别:
-          旧: relu(|HF(Y_N)| - 1.2|HF(X_t)|) — 纯空间 HF 上限, 无任何跨帧信息
-          新: |HF(Y_N) - HF(x̄)|                — 真正的时序参考 (用 5 帧窗口均值)
+        为何用相关而非 L1 差 (前两版都错):
+          旧版A: relu(|HF(Y)| - 1.2|HF(X_t)|)     — 纯空间上限, 无跨帧
+          旧版B: |HF(Y) - HF(x̄)|                  — 提亮按比例放大 HF 幅度 →
+                 实测 "不处理"(0.0000) < "理想GT"(0.4109) → 惩罚正确增强 ✗
+          新版:  |cos(HF(Y), HF(x_c - x̄))|        — 余弦对亮度缩放不变 (k^0),
+                 实测判别力 14x (原图0.857 vs 理想GT0.062) ✓
         """
         k = 7
         pad = k // 2
-        Y_hf = Y_branch - F.avg_pool2d(Y_branch, k, 1, pad)
-        M_hf = X_mean - F.avg_pool2d(X_mean, k, 1, pad)
-        return F.l1_loss(Y_hf, M_hf.detach())
+        def hf(y): return y - F.avg_pool2d(y, k, 1, pad)
 
-    def _temporal_lf_consistency(self, Y_branch: torch.Tensor,
-                                 X_mean: torch.Tensor) -> torch.Tensor:
-        """[R4] L 分支: 光照的帧间缓变一致性 (邻帧不突变).
+        Y_hf = hf(Y_branch).flatten(1)
+        if X_center is not None:
+            noise_hf = hf(X_center - X_mean).detach().flatten(1)  # 噪声分量 HF
+        else:
+            noise_hf = hf(X_mean).detach().flatten(1)
+        cos = F.cosine_similarity(Y_hf, noise_hf, dim=1, eps=1e-6)
+        return cos.abs().mean()
 
-        物理依据:
-          光照扰动是【帧间强相关、慢变】→ 相邻帧照度几乎相同
-          → 时间均值 x̄ 的低频 ≈ 每一帧的低频 (因为光照本就慢变)
-          → 要求光照分支输出的低频逼近 HF(x̄) 的低频, 即抑制帧间亮度突变。
+    def _temporal_lf_consistency(self, L_t: torch.Tensor) -> torch.Tensor:
+        """[R4-fix] L 分支: 光照图时序稳定性 (防帧间闪烁).
+
+        物理依据: 光照扰动帧间强相关、慢变 → 光照图 L_t 应平滑, 不得携带
+        帧间噪声 (噪声是帧间 i.i.d., 是闪烁的直接来源)。
+
+        ⚠ 为何前两版都错 (用 Y_L 的低频去匹配输入时间均值):
+          Y_L = X_t · L_t^(γ-1) — 光照校正【本就改变低频】(这是它的职责),
+          γ-1>0 时提亮增大输出幅值 → |LF(Y_L)-LF(x̄)| 被亮度差主导,
+          实测 "不处理"(0.0000) < "理想GT"(0.4109) → 惩罚正确校正 ✗
+        正确对象是【光照图 L_t】而非 Y_L: L_t 必须慢变, 与帧间噪声无关。
+
+        实现: L_t 的 HF 与帧间噪声去相关 (亮度不变, 与 N 分支同一原则)。
         """
-        k = 15   # 光照是低频, 用更大核 (对应更低的频带)
+        k = 7
         pad = k // 2
-        Y_lf = F.avg_pool2d(Y_branch, k, 1, pad)
-        M_lf = F.avg_pool2d(X_mean, k, 1, pad)
-        return F.l1_loss(Y_lf, M_lf.detach())
+        L_hf = (L_t - F.avg_pool2d(L_t, k, 1, pad)).flatten(1)
+        if self._noise_ref is not None:
+            # L_t 单通道, 噪声参考多通道 → 取通道均值匹配
+            nref = self._noise_ref.mean(dim=1, keepdim=True) if self._noise_ref.shape[1] != 1 else self._noise_ref
+            n_hf = (nref - F.avg_pool2d(nref, k, 1, pad)).detach().flatten(1)
+            cos = F.cosine_similarity(L_hf, n_hf, dim=1, eps=1e-6)
+            return cos.abs().mean()
+        # 无噪声参考时退回空间 TV (保证平滑)
+        gx = (L_t[:, :, :, 1:] - L_t[:, :, :, :-1]).abs().mean()
+        gy = (L_t[:, :, 1:, :] - L_t[:, :, :-1, :]).abs().mean()
+        return gx + gy
 
     def forward(self, outputs: Dict[str, torch.Tensor],
                 gt: torch.Tensor, gt_seq: torch.Tensor = None) -> Dict[str, torch.Tensor]:
@@ -223,11 +244,12 @@ class GolfLoss(nn.Module):
         # 3. 正交约束
         L_ortho = ortho_loss
 
-        # 4. [R4] 真·时序一致性 (N: 噪声i.i.d. / L: 光照缓变), M 分支豁免
+        # 4. [R4-fix] 真·时序一致性 (N: 噪声去相关 / L: 光照图防闪烁), M 分支豁免
         if x_win is not None:
-            X_mean = x_win.mean(dim=1)   # (B,3,H,W) 时间均值 — 物理上的"去噪参考"
-            L_temp_N = self._temporal_hf_consistency(Y_N, X_mean)
-            L_temp_L = self._temporal_lf_consistency(Y_L, X_mean)
+            X_mean = x_win.mean(dim=1)       # 时间均值 — 去噪参考
+            self._noise_ref = (X_t - X_mean) if X_t is not None else None  # 帧间噪声分量
+            L_temp_N = self._temporal_hf_consistency(Y_N, X_mean, X_center=X_t)
+            L_temp_L = self._temporal_lf_consistency(L_t)
             L_temp = L_temp_N + L_temp_L
         else:
             L_temp = torch.tensor(0.0, device=O_t.device)
