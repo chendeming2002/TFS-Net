@@ -49,14 +49,22 @@ class UpsampleBlock(nn.Module):
         self.norm = LayerNorm2d(out_channels) if norm else nn.Identity()
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor = None) -> torch.Tensor:
-        # 1. 双线性上采样 (无棋盘格)
-        x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
-        # 2. 拼接高分辨率 skip (F1 提供原始分辨率细节)
-        if skip is not None:
-            if skip.shape[-2:] != x.shape[-2:]:
-                skip = F.interpolate(skip, size=x.shape[-2:], mode='bilinear', align_corners=False)
-            x = torch.cat([x, skip], dim=1)
-        # 3. 两次 3×3 卷积 (感受野混合, 消除子像素隔离)
-        x = self.act(self.conv1(x))
-        x = self.conv2(x)
-        return self.norm(x)
+        # R4-NaN-fix: Branch-M upsample 在全分辨率 (1080×1920) 下
+        # conv1 输出可达 ~2000，fp16 积累误差后触发 NaN（ep41+ 全量崩溃根因）
+        # 强制 fp32 计算，保证数值稳定；autocast 外层 context 无副作用
+        from torch.cuda.amp import autocast
+        with autocast(enabled=False):
+            # 显式转 fp32，防止 autocast 传入�� fp16 tensor
+            x = x.float()
+            # 1. 双线性上采样 (无棋盘格)
+            x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
+            # 2. 拼接高分辨率 skip (F1 提供原始分辨率细节)
+            if skip is not None:
+                skip = skip.float()
+                if skip.shape[-2:] != x.shape[-2:]:
+                    skip = F.interpolate(skip, size=x.shape[-2:], mode='bilinear', align_corners=False)
+                x = torch.cat([x, skip], dim=1)
+            # 3. 两次 3×3 卷积 (感受野混合, 消除子像素隔离)
+            x = self.act(self.conv1(x))
+            x = self.conv2(x)
+            return self.norm(x)
