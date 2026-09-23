@@ -1,8 +1,8 @@
 # Golf 系列统一文档（Foxtrot → R1/R2 → R3 → R4）
 
-> 整合原 `Golf-plan.md` / `Golf-R2-analysis.md` / `Golf-R3-plan.md` / `Golf-R3-implementation-summary.md` / `Golf-R3-Ltemp-analysis.md` 五份文档
-> 更新时间：2026-09-20
-> 当前状态：**Golf-R4 训练中**（outputs/golf_r4，keepalive pid 705332，60 epoch）
+> 整合原 `Golf-plan.md` / `Golf-R2-analysis.md` / `Golf-R3-plan.md` / `Golf-R3-implementation-summary.md` / `Golf-R3-Ltemp-analysis.md` / `Golf-R4-loss-audit.md` / `Golf-R4-NaN-diagnosis.md` 七份文档
+> 更新时间：2026-09-23
+> 当前状态：**Golf-R4 重启训练中**（outputs/golf_r4，从 ep30 恢复，已修复三项损失缺陷 + NaN 溢出，keepalive pid 37746）
 
 ---
 
@@ -15,7 +15,7 @@ Golf 是 **Foxtrot 的轻量化修复线**：主干从 Foxtrot 的 2.57M 三分�
 | Foxtrot ep70 | 2.57M | 19.72@60 | 14.37 | 有棋盘格伪影 |
 | **Golf-R2 ep60** | 3.50M | **20.14** | 12.80（ep60）| 突破 20 dB，但存在双零死锁 |
 | Golf-R3（ep6 停止）| 3.55M | — | — | 双零死锁未修复，归档 `golf_r3_deadlock_ep6` |
-| **Golf-R4** | 3.69M | 训练中 | 训练中 | 全部修复，重新训练 |
+| **Golf-R4** | 3.69M | 训练中（ep31+）| 训练中 | 全部修复 + NaN 修复，从 ep30 重启 |
 
 ---
 
@@ -274,7 +274,92 @@ GPU: 12.3GB / 65% / 63°C   速度 1.17 it/s
 
 ---
 
-## 八、关键工程资产
+## 八、R4 训练期损失空间修复（2026-09-21）
+
+### 8.1 问题触发
+
+ep1-4 训练期观察到 **`total_loss` 持续上升而 `final_loss` 持续下降**：
+```
+total: 1.21 → 6.24 → 8.94   (上升)
+final: 0.58 → 0.19          (下降)
+```
+
+### 8.2 三项独立缺陷
+
+| # | 缺陷 | 机制 | 修复 |
+|---|------|------|------|
+| D1 | **L_prior 平方发散**（主因）| `MSE(feat, src)` 随特征量级 k² 增长 → ep4 爆炸至 587 | 改为余弦/归一化 TV/归一化 L1（尺度不变 k⁰）|
+| D2 | **L_ortho 卡死鞍点** | `prior` scale=0 + TCA `scale=0` → 三路恒等 → ortho=3.0（理论最大）| `prior` scale 恢复非零初始化（0.1/0.1/0.5）|
+| D3 | **L_temp 语义倒挂** | 旧 `\|HF(Y)-HF(x̄)\|` 被亮度差异主导，**惩罚正确提亮**（理想 GT=0.41 > 不处理=0.00）| 改为余弦去相关 `\|cos(HF(Y), HF(x_c-x̄))\|`（亮度不变）|
+
+**验证**：
+- 修复前：ep4 `total=6.24, final=0.19, prior=587`
+- 修复后：ep1 `total=1.27, final=0.63, prior=1.92` → 300步后 `total=0.71, final=0.31, prior=0.62`，loss 与 final 同步下降 ✓
+
+---
+
+## 九、R4 NaN 崩溃修复（2026-09-23）
+
+### 9.1 NaN 时间线（关键证据）
+
+| Epoch | NaN 次数 | 占比 | 判读 |
+|:---:|:---:|:---:|------|
+| 1-40 | **0** | 0% | 完全健康（165,000 步）|
+| 41 | 181 | 4.4% | 首次爆发（step 1194）|
+| 42-43 | 1617-2039 | 39-49% | 密度上升 |
+| 44-55 | 3400-3900 | 92-94% | **接近全量失败** |
+
+**总 NaN：49,236 次**。ep40→41 边界突然爆发，**滞后触发非代码 bug**。
+
+### 9.2 根因：AMP fp16 下 Branch-M upsample 数值溢出
+
+**诊断路径**（推翻了两个假设）：
+1. ❌ **cosine_similarity 除零**：HF norm 在 28-30 量级健康，**norm 在增长而非趋零**
+2. ❌ **训练集特定样本**：fp32 推理全部正常，**AMP fp16 推理直接 NaN**
+3. ✓ **AMP fp16 溢出**：Hook 追踪定位到 `branch_m.upsample.conv2`
+
+**数值证据**：
+```
+upsample.conv1 输出: max=1941 (fp32, GELU 后)
+upsample.conv2 输出: NaN (fp16, 128ch × 3×3 = 1152 乘积累加)
+```
+
+**触发机制**：
+- ep1-40：特征量级小，fp16 安全
+- ep40+：训练推进，Branch-M 表示能力增强 → 特征量级增大
+- ep41 step 1194：首次触发 `conv1_out > 1500` → NaN
+- ep42+：**选择效应**（非权重污染）：NaN batch skip 不更新参数，存活 batch 继续训练推高量级 → 92-94% 全量崩溃
+
+**为何 R2/R3 没有这个问题**：
+- R4 的三项损失修复让训练更高效 → 特征表示能力更强 → 量级更大 → 触发 fp16 边界
+- R2/R3 可能在到达溢出阈值前就收敛（R2 最佳在 ep40）
+- **本质**：R4 训练得"太好"，突破了 fp16 数值限制
+
+### 9.3 修复与验证
+
+**修复**：`models/golf_r4/upsample.py` 强制 fp32 计算
+```python
+def forward(self, x, skip=None):
+    with autocast(enabled=False):
+        x = x.float()
+        # ... bilinear upsample + conv1 + conv2
+```
+
+**验证**：ep55 checkpoint，AMP fp16 推理，8/8 batch 全部正常，0 NaN ✓
+
+**性能代价**：预计 +4% 训练时间，+12.5% 内存，换取数值稳定。
+
+**额外修复**（2026-09-23）：
+- `_conv1_out` eval 残留清理：eval 时 `self._conv1_out = None`，避免引用 256² tensor (~33MB)
+- GradScaler 与 bf16 兼容：`GradScaler(enabled=use_amp and amp_dtype==torch.float16)`，bf16 时自动禁用
+- `tiled_forward` 签名增加 `amp_dtype` 参数，支持 bf16 切换
+- conv1_max 监控：每 `log_interval` 步记录，>1500 预警，>1800 建议切 bf16
+
+**重启训练**：从 ep30 (best.pth) 恢复，已运行至 ep31+，conv1_max=73 健康，无 NaN。
+
+---
+
+## 十、关键工程资产
 
 | 文件 | 说明 |
 |------|------|
@@ -289,9 +374,27 @@ GPU: 12.3GB / 65% / 63°C   速度 1.17 it/s
 | `utils/inference.py` | 余弦窗口 tiled_forward（G3，全局）|
 | `outputs/golf_r3_deadlock_ep6/` | R3 死锁证据归档 |
 
+## 十、关键工程资产
+
+| 文件 | 说明 |
+|------|------|
+| `models/golf_r4/upsample.py` | resize-conv 上采样（G1）+ NaN 修复（fp32 强制）|
+| `models/golf_r4/tca_rwkv.py` | TCA-RWKV（R4-P0/P1/P2/P3/P5）|
+| `models/golf_r4/branch_n/l/m.py` | 三分支（R3-A/B）|
+| `models/golf_r4/fusion.py` | 融合（G4/G5）|
+| `models/golf_r4/loss.py` | GolfLoss（R4-P4/P5 + 三项缺陷修复）|
+| `models/golf_r4/golfnet.py` | 主网络（F3 提取 + prior_loss 透传）|
+| `train_golf_r4.py` | 训练脚本（pair45 双验证 + amp_dtype 支持 + conv1_max 监控）|
+| `configs/golf_r4.yaml` | 配置（`amp_dtype: fp16`, bf16 备案已注释）|
+| `utils/inference.py` | 余弦窗口 tiled_forward（G3，全局）+ `amp_dtype` 参数 |
+| `scripts/monitor.sh` | 训练监控脚本（conv1_max 预警 + NaN 统计）|
+| `outputs/golf_r3_deadlock_ep6/` | R3 死锁证据归档 |
+| `outputs/golf_r4/best.pth` | ep30 健康 checkpoint（重启点）|
+| `outputs/golf_r4/latest_ep55_nan.pth` | ep55 NaN 污染归档 |
+
 ---
 
-## 九、教训总结
+## 十一、教训总结
 
 1. **两个零相乘 = 永久死锁**：LayerScale（门控零初始化）+ 内部投影零初始化 会互相锁死。标准做法是**只保留一个零初始化**（ConvNeXt 保留 LayerScale 零，内部 conv 不零）。本项目的 NAFBlock 正确（单零），TCA-RWKV 错误（双零）。
 
@@ -303,11 +406,23 @@ GPU: 12.3GB / 65% / 63°C   速度 1.17 it/s
 
 5. **审查的价值**：本次用户驱动的审查发现了 **6× 于原审计报告** 的问题（双零死锁根因 + prior_L no-op + K/V 偏离 + L_temp 语义错误）。
 
+6. **损失项必须有量级上界**（新）：任何无界的正则（MSE 平方、无界 L1）在长训练中都会被特征量级放大。设计时先做**尺度不变性测试**（feat×k → loss×?，应为 k⁰）。
+
+7. **零初始化要成对检查**（新）：`proj_out=0` + `scale=0` 是乘法双零死锁；`prior scale=0` + `scale=0` 是分支恒等鞍点。**只保留一个零初始化**。
+
+8. **用真实数据验证**（新）：合成数据（GT=x×3）导致多次误判；只有真实 SDSD 配对数据能暴露亮度主导问题。
+
+9. **AMP 的隐藏风险**（新）：fp16 不是简单的"开关"，而是**数值精度与性能的权衡**。全分辨率 (1080×1920) + 高维特征 (128 通道) + 多层卷积 → fp16 累积误差可能爆炸。**关键路径必须做 fp16 压力测试**（不仅测试 ep1，还要测试 ep40+）。
+
+10. **滞后触发的调试方法**（新）：ep1-40 健康 → 容易误判"代码没问题"。正确方法：对比 fp32 vs fp16 推理、Hook 追踪每个模块、检查激活值量级演化、长训练监控数值健康指标。
+
+11. **"训练太好"的代价**（新）：R4 的三项损失修复让训练更高效 → 特征表示能力更强 → 特征量级更大 → 触发 fp16 数值边界。**数值稳定 > 性能优化 > 语义正确性**（训练阶段）。
+
 ---
 
-## 十、后续路线
+## 十二、后续路线
 
-### R4 成功后
+### R4 完成后
 - 消融：FiLM 开关 / KV 共享 vs 聚合 / 真时序 vs 空间 的独立贡献
 - 外部测试：SMID、DRV
 - 部署：TensorRT int8
@@ -318,4 +433,4 @@ GPU: 12.3GB / 65% / 63°C   速度 1.17 it/s
 
 ---
 
-**文档整合完成**：原 5 份 Golf 文档（Golf-plan / R2-analysis / R3-plan / R3-implementation-summary / R3-Ltemp-analysis）合并为本文件。
+**文档整合完成**：原 7 份 Golf 文档（Golf-plan / R2-analysis / R3-plan / R3-implementation-summary / R3-Ltemp-analysis / R4-loss-audit / R4-NaN-diagnosis）合并为本文件。

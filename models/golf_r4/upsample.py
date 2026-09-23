@@ -74,5 +74,8 @@ class UpsampleBlock(nn.Module):
             # 训练时缓存 conv1 输出供监控
             if self.training:
                 self._conv1_out = conv1_out.detach()
+            else:
+                # eval 时清理缓存，避免引用 256² 域 tensor (~33MB)
+                self._conv1_out = None
             x = self.conv2(conv1_out)
             return self.norm(x)

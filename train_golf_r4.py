@@ -350,13 +350,15 @@ def main():
         else:
             return base * 0.125
 
-    scaler = GradScaler(enabled=cfg["train"]["amp"] and device.type == "cuda")
-    grad_clip = cfg["train"].get("grad_clip", 1.0)
-    grad_accum_steps = cfg["train"].get("grad_accum_steps", 1)
-    
     # R4-NaN-fix: 支持 bf16 作为 fp16 升级路径
     amp_dtype_str = cfg["train"].get("amp_dtype", "fp16")
     amp_dtype = torch.bfloat16 if amp_dtype_str == "bf16" else torch.float16
+    
+    # GradScaler 只在 fp16 时启用（bf16 无需 scale，官方建议 enabled=False）
+    use_amp = cfg["train"]["amp"] and device.type == "cuda"
+    scaler = GradScaler(enabled=use_amp and amp_dtype == torch.float16)
+    grad_clip = cfg["train"].get("grad_clip", 1.0)
+    grad_accum_steps = cfg["train"].get("grad_accum_steps", 1)
 
     best_psnr = -1.0
     start_epoch = 0

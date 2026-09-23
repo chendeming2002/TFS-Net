@@ -28,12 +28,33 @@ echo ""
 echo "══════════ 诊断指标 ══════════"
 # conf_map / FiLM / 时序损失 (若日志含 diag 行)
 DIAG=$(grep -a "diag:" "$LOG" | tail -1)
-if [ -n "$DIAG" ]; then echo "  $DIAG" | sed 's/.*diag:/diag:/'; fi
+if [ -n "$DIAG" ]; then
+  echo "  $DIAG" | sed 's/.*diag:/diag:/'
+  # R4-NaN-fix: conv1_max 预警 (>1500 危险, >1800 切 bf16)
+  C1MAX=$(echo "$DIAG" | grep -oE "conv1_max=[0-9.]+" | grep -oE "[0-9.]+")
+  if [ -n "$C1MAX" ]; then
+    python3 -c "
+v=float('$C1MAX')
+if v>1800: print(f'  ⚠️  conv1_max={v:.0f} 极危险! 立即切换 bf16')
+elif v>1500: print(f'  ⚠️  conv1_max={v:.0f} 危险, 接近 fp16 溢出阈值')
+elif v>800:  print(f'  ⚡  conv1_max={v:.0f} 偏高, 持续观察')
+else:        print(f'  ✓  conv1_max={v:.0f} 健康')
+" 2>/dev/null
+  fi
+fi
 LAST=$(grep -a "step" "$LOG" | tail -1)
 LTEMP=$(echo "$LAST" | grep -oE "temp=[0-9.]+" | head -1)
 if [ -n "$LTEMP" ]; then echo "  $LTEMP  (R4: 真时序一致性)"; fi
 LDIV=$(echo "$LAST" | grep -oE "div=-?[0-9.]+" | head -1)
 if [ -n "$LDIV" ]; then echo "  $LDIV"; fi
+
+# NaN 统计 (当前 epoch)
+NAN_CNT=$(grep -a "Skipping non-finite" "$LOG" | tail -100 | wc -l)
+if [ "$NAN_CNT" -gt 0 ]; then
+  echo "  ⚠️  近100条日志中 NaN skip: $NAN_CNT 次"
+else
+  echo "  ✓  近100条日志无 NaN"
+fi
 
 # 速度 (最近两条 step 的时间差)
 S1=$(grep -a "step" "$LOG" | tail -2 | head -1)
