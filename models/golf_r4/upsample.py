@@ -36,6 +36,11 @@ class UpsampleBlock(nn.Module):
         skip: (B, skip_channels, 2H, 2W) 可选 — 高分辨率细节锚点
 
     Output: (B, out_channels, 2H, 2W)
+    
+    R4-NaN-fix 说明:
+        ep55 测得 conv1 输出量级可达 ~1941 (全分辨率 1080×1920)，
+        fp16 累积误差后触发 NaN。强制 fp32 计算保证数值稳定。
+        训练监控项: conv1_out.max() — 若持续 >1500 需警觉。
     """
 
     def __init__(self, in_channels: int, out_channels: int,
@@ -47,14 +52,14 @@ class UpsampleBlock(nn.Module):
         self.act = nn.GELU()
         self.conv2 = nn.Conv2d(out_channels, out_channels, 3, 1, 1, bias=True)
         self.norm = LayerNorm2d(out_channels) if norm else nn.Identity()
+        
+        # R4-NaN-fix: 暴露 conv1 输出供训练监控
+        self._conv1_out = None
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor = None) -> torch.Tensor:
-        # R4-NaN-fix: Branch-M upsample 在全分辨率 (1080×1920) 下
-        # conv1 输出可达 ~2000，fp16 积累误差后触发 NaN（ep41+ 全量崩溃根因）
-        # 强制 fp32 计算，保证数值稳定；autocast 外层 context 无副作用
         from torch.cuda.amp import autocast
         with autocast(enabled=False):
-            # 显式转 fp32，防止 autocast 传入�� fp16 tensor
+            # 显式转 fp32，防止 autocast 传入的 fp16 tensor
             x = x.float()
             # 1. 双线性上采样 (无棋盘格)
             x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
@@ -65,6 +70,9 @@ class UpsampleBlock(nn.Module):
                     skip = F.interpolate(skip, size=x.shape[-2:], mode='bilinear', align_corners=False)
                 x = torch.cat([x, skip], dim=1)
             # 3. 两次 3×3 卷积 (感受野混合, 消除子像素隔离)
-            x = self.act(self.conv1(x))
-            x = self.conv2(x)
+            conv1_out = self.act(self.conv1(x))
+            # 训练时缓存 conv1 输出供监控
+            if self.training:
+                self._conv1_out = conv1_out.detach()
+            x = self.conv2(conv1_out)
             return self.norm(x)

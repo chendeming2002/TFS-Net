@@ -117,7 +117,7 @@ def build_loss(cfg, device):
     return GolfLoss(**loss_cfg).to(device)
 
 
-def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp,
+def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp, amp_dtype,
                     logger, log_interval, epoch=0, grad_clip=1.0, grad_accum_steps=1):
     model.train()
     meter_total = AverageMeter()
@@ -135,7 +135,7 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
         clip = clip.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
 
-        with autocast(enabled=use_amp):
+        with autocast(enabled=use_amp, dtype=amp_dtype if use_amp else torch.float32):
             outputs = model(clip)
         # 损失在 autocast 外计算 (与 train.py 模式一致, fp32 语义稳定)
         loss_dict = criterion(outputs, target)
@@ -191,7 +191,16 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
                 tempL = loss_dict.get("L_temp_L", 0.0)
                 warp_contrib = w[:, 2].mean().item() if w is not None and w.size(1) >= 3 else 0.0
                 
-                logger.info("diag: wstd=%.3f Lt=%.3f/%.3f conf=%.3f", w_std, lt_m, lt_s, cv_m)
+                # R4-NaN-fix: 监控 Branch-M upsample.conv1 输出量级
+                conv1_max = 0.0
+                if hasattr(model, 'module'):
+                    bm_upsample = model.module.branch_m.upsample
+                else:
+                    bm_upsample = model.branch_m.upsample
+                if bm_upsample._conv1_out is not None:
+                    conv1_max = bm_upsample._conv1_out.abs().max().item()
+                
+                logger.info("diag: wstd=%.3f Lt=%.3f/%.3f conf=%.3f conv1_max=%.1f", w_std, lt_m, lt_s, cv_m, conv1_max)
                 logger.info("  R3: tempN=%.4f tempL=%.4f warp_w=%.3f", tempN, tempL, warp_contrib)
 
         del outputs, loss, loss_dict, clip, target
@@ -211,7 +220,7 @@ def train_one_epoch(model, criterion, optimizer, scaler, loader, device, use_amp
 
 
 @torch.no_grad()
-def validate(model, loader, device, tile_size, tile_overlap, use_amp, val_crop_size=None):
+def validate(model, loader, device, tile_size, tile_overlap, use_amp, amp_dtype, val_crop_size=None):
     model.eval()
     psnr_meter = AverageMeter()
     ssim_meter = AverageMeter()
@@ -244,6 +253,7 @@ def validate(model, loader, device, tile_size, tile_overlap, use_amp, val_crop_s
             tile_size=tile_size,
             tile_overlap=tile_overlap,
             use_amp=use_amp,
+            amp_dtype=amp_dtype,
         )
         loss = torch.mean(torch.abs(pred - target))
         psnr_meter.update(tensor_psnr(pred, target), clip.size(0))
@@ -343,6 +353,10 @@ def main():
     scaler = GradScaler(enabled=cfg["train"]["amp"] and device.type == "cuda")
     grad_clip = cfg["train"].get("grad_clip", 1.0)
     grad_accum_steps = cfg["train"].get("grad_accum_steps", 1)
+    
+    # R4-NaN-fix: 支持 bf16 作为 fp16 升级路径
+    amp_dtype_str = cfg["train"].get("amp_dtype", "fp16")
+    amp_dtype = torch.bfloat16 if amp_dtype_str == "bf16" else torch.float16
 
     best_psnr = -1.0
     start_epoch = 0
@@ -381,6 +395,7 @@ def main():
             loader=train_loader,
             device=device,
             use_amp=cfg["train"]["amp"] and device.type == "cuda",
+            amp_dtype=amp_dtype,
             epoch=epoch,
             logger=logger,
             log_interval=cfg["train"]["log_interval"],
@@ -398,6 +413,7 @@ def main():
                 tile_size=cfg["eval"]["tile_size"],
                 tile_overlap=cfg["eval"]["tile_overlap"],
                 use_amp=cfg["eval"]["amp"] and device.type == "cuda",
+                amp_dtype=amp_dtype,
                 val_crop_size=cfg["dataset"].get("val_crop_size", None),
             )
             logger.info("Val stats: %s", val_stats)
