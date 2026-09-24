@@ -24,6 +24,29 @@ P45=$(grep -a "Pair45 stats:" "$LOG" | tail -1)
 if [ -n "$VAL" ]; then echo "$VAL" | sed 's/.*Val stats:/  val  :/'; else echo "  val  : (未到验证 epoch)"; fi
 if [ -n "$P45" ]; then echo "$P45" | sed 's/.*Pair45 stats:/  pair45:/'; else echo "  pair45: (未到验证 epoch)"; fi
 
+# R5: 双指标早停历史 (全部 val/pair45 记录)
+echo ""
+echo "── val/pair45 历史 ──"
+grep -a "Val stats:" "$LOG" | while read -r line; do
+  ep=$(echo "$line" | grep -oE "Epoch [0-9]+" | head -1)
+  psnr=$(echo "$line" | grep -oE "'psnr': [0-9.]+" | grep -oE "[0-9.]+$")
+  printf "  %-10s val=%-7s" "${ep:-?}" "${psnr:-?}"
+done
+echo ""
+grep -a "Pair45 stats:" "$LOG" | while read -r line; do
+  p45=$(echo "$line" | grep -oE "'pair45_psnr': [0-9.]+" | grep -oE "[0-9.]+$")
+  printf "  pair45=%-7s" "${p45:-?}"
+done
+echo ""
+
+# R5: best_pair45.pth 状态
+BEST_P45_PTH="$(dirname "$LOG")/best_pair45.pth"
+if [ -f "$BEST_P45_PTH" ]; then
+  echo "  best_pair45.pth: 存在 ($(stat -c%y "$BEST_P45_PTH" | cut -d. -f1))"
+else
+  echo "  best_pair45.pth: 未生成"
+fi
+
 echo ""
 echo "══════════ 诊断指标 ══════════"
 # conf_map / FiLM / 时序损失 (若日志含 diag 行)
@@ -42,9 +65,16 @@ else:        print(f'  ✓  conv1_max={v:.0f} 健康')
 " 2>/dev/null
   fi
 fi
+
+# R5: temporal_gate 诊断
+TGATE=$(grep -a "R5: tgate=" "$LOG" | tail -1)
+if [ -n "$TGATE" ]; then
+  echo "  $TGATE" | sed 's/.*R5:/R5:/'
+fi
+
 LAST=$(grep -a "step" "$LOG" | tail -1)
 LTEMP=$(echo "$LAST" | grep -oE "temp=[0-9.]+" | head -1)
-if [ -n "$LTEMP" ]; then echo "  $LTEMP  (R4: 真时序一致性)"; fi
+if [ -n "$LTEMP" ]; then echo "  $LTEMP  (R5: 空间 HF 上限)"; fi
 LDIV=$(echo "$LAST" | grep -oE "div=-?[0-9.]+" | head -1)
 if [ -n "$LDIV" ]; then echo "  $LDIV"; fi
 

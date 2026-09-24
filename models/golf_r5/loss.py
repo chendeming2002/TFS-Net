@@ -76,8 +76,8 @@ class GolfLoss(nn.Module):
                  lambda_M: float = 0.3, lambda_ortho: float = 0.01,
                  lambda_temp: float = 0.02,
                  lambda_div: float = 0.05,
-                 lambda_prior: float = 0.01,    # R4: TCA 结构化先验正则
-                 temp_threshold: float = 1.2,   # 保留兼容 (R4 不再使用)
+                 lambda_prior: float = 0.01,    # R5: TCA 轻量结构化先验正则
+                 temp_threshold: float = 1.2,   # R5: 空间 HF 上限阈值 (重新启用)
                  use_ssim: bool = True, ssim_weight: float = 0.3):
         super().__init__()
         self.lambda_N = lambda_N
