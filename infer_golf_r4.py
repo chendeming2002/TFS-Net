@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Golf-R4 推理脚本（pair45 全分辨率输出）
+"""Golf-R4/R5 推理脚本（pair45 全分辨率输出）
 
 用法:
     python infer_golf_r4.py --ckpt outputs/golf_r4/best.pth --output outputs/golf_r4_inference/pair45
+    python infer_golf_r4.py --ckpt outputs/golf_r5/best.pth --config configs/golf_r5.yaml --output outputs/golf_r5_infer/best
 """
 import torch
 import yaml
@@ -12,6 +13,7 @@ import numpy as np
 from pathlib import Path
 from PIL import Image
 from models.golf_r4 import GolfNet_R4
+from models.golf_r5 import GolfNet_R5
 from utils.inference import tiled_forward
 from tqdm import tqdm
 import torchvision.transforms.functional as TF
@@ -22,10 +24,19 @@ def load_model(config_path, ckpt_path, device='cuda'):
         cfg = yaml.safe_load(f)
     
     model_cfg = {k: v for k, v in cfg['model'].items() if k != 'type'}
-    model = GolfNet_R4(**model_cfg).to(device)
+    model_type = cfg['model'].get('type', 'GolfNet_R4')
+    
+    if 'R5' in model_type or 'r5' in model_type:
+        model = GolfNet_R5(**model_cfg).to(device)
+        print(f"Loading GolfNet_R5 model")
+    else:
+        model = GolfNet_R4(**model_cfg).to(device)
+        print(f"Loading GolfNet_R4 model")
     
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt['model'])
+    missing, unexpected = model.load_state_dict(ckpt['model'], strict=False)
+    if missing or unexpected:
+        print(f"  Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
     model.eval()
     print(f"Loaded from {ckpt_path}, epoch {ckpt.get('epoch', '?')}")
     return model, cfg
