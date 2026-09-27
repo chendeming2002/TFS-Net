@@ -1,0 +1,18 @@
+seed: 42
+output_dir: outputs/golf_v7
+
+dataset:
+  train_input_root: /home/a1005/yzy/dataset/SDSD/indoor/input
+  train_target_root: /home/a1005/yzy/dataset/SDSD/indoor/GT
+  val_input_root: /home/a1005/yzy/dataset/SDSD/test/low-light
+  val_target_root: /home/a1005/yzy/dataset/SDSD/test/GT
+  window_size: 5
+  crop_size: 256
+  num_workers: 0
+
+train:
+  batch_size: 1
+  epochs: 60
+  lr: 0.0006
+  log_interval: 100
+  val_interval: 10
