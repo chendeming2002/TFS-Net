@@ -19,12 +19,12 @@ import torch.nn.functional as F
 from typing import Dict
 
 from models.golf.encoder import SharedEncoder
-from models.golf.fusion import AdaptiveFusion
 from models.golf_v7.pixel_temporal import PixelTemporalAttentionSimple
 
 from models.golf_v7r.spatial_summary import SpatialSummary
 from models.golf_v7r.matrix_rwkv import MatrixRWKVBlock
 from models.golf_v7r.context_decomp import ContextDecomposition, BranchFiLM
+from models.golf_v7r.fusion_v7r import V7RFusion
 from models.golf_v7r.branch_n_simple import BranchNSimple
 from models.golf_v7r.branch_l_simple import BranchLSimple
 from models.golf_v7r.branch_m_simple import BranchMSimple
@@ -91,8 +91,9 @@ class GolfNet_v7r(nn.Module):
                                       num_frames=num_frames, num_blocks=2)
 
         # ========== Stage 5: Fusion ==========
-        self.fusion = AdaptiveFusion(in_channels=3, hidden_channels=64,
-                                     num_blocks=2)
+        # v7r 专用融合: 不在 RGB 上跑 NAFBlock (会毁图), 权重均匀初始化, gamma 从 0 起
+        self.fusion = V7RFusion(in_channels=3, hidden_channels=32,
+                                num_blocks=2)
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """

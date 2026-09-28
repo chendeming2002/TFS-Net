@@ -163,19 +163,30 @@ class MatrixRWKVBlock(nn.Module):
     """
     单个 Matrix RWKV Block = LN + TimeMix + LN + ChannelMix
     两个残差连接
+
+    LayerScale (来自 RWKV-5/6 与 DiT):
+      残差分支乘以可学习的小初始化缩放 ls (默认 0.1)。
+      没有它时, stacked 的 ReLU² MLP 会使激活逐 block 爆炸
+      (实测 ep10: block0 std=5.6 → block1 std=523),
+      继而导致反传梯度消失 (~1e-6), 整个 Matrix RWKV 无法学习。
     """
 
-    def __init__(self, dim: int = 192, num_heads: int = 6, head_size: int = 32):
+    def __init__(self, dim: int = 192, num_heads: int = 6, head_size: int = 32,
+                 layer_scale_init: float = 0.1):
         super().__init__()
         self.ln1 = nn.LayerNorm(dim)
         self.ln2 = nn.LayerNorm(dim)
         self.time_mix = MatrixRWKVTimeMix(dim, num_heads, head_size)
         self.channel_mix = ReLUSquaredMLP(dim)
 
+        # LayerScale: 稳定深层残差堆叠
+        self.ls_time = nn.Parameter(torch.full((dim,), layer_scale_init))
+        self.ls_channel = nn.Parameter(torch.full((dim,), layer_scale_init))
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: [B, T, D] → [B, T, D]"""
-        x = x + self.time_mix(self.ln1(x))
-        x = x + self.channel_mix(self.ln2(x))
+        x = x + self.ls_time * self.time_mix(self.ln1(x))
+        x = x + self.ls_channel * self.channel_mix(self.ln2(x))
         return x
 
 

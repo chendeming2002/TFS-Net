@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from datasets import SDSDDataset
 from models.golf_v7r import GolfNet_v7r, GolfV7RLoss
 from utils.io import save_checkpoint
-from utils.metrics import tensor_psnr, tensor_ssim
+from utils.metrics import tensor_psnr, tensor_ssim, LPIPSMetric
 import logging
 
 logging.basicConfig(level=logging.INFO,
@@ -84,8 +84,28 @@ def main():
     val_interval = cfg['train'].get('val_interval', 5)
     grad_clip = cfg['train'].get('grad_clip', 0.0)
 
+    # LPIPS 感知指标 (评估时使用)
+    lpips_metric = LPIPSMetric(net=cfg['train'].get('lpips_net', 'vgg'),
+                               device=device)
+    logger.info(f"LPIPS available: {lpips_metric.available}")
+
+    # 断点续训
+    start_epoch = 1
     best_psnr = 0.0
-    for epoch in range(1, num_epochs + 1):
+    resume = cfg['train'].get('resume')
+    if resume:
+        ck = torch.load(resume, map_location=device, weights_only=False)
+        model.load_state_dict(ck['model_state_dict'])
+        if 'optimizer_state_dict' in ck:
+            optimizer.load_state_dict(ck['optimizer_state_dict'])
+        if 'scheduler_state_dict' in ck:
+            scheduler.load_state_dict(ck['scheduler_state_dict'])
+        start_epoch = ck.get('epoch', 0) + 1
+        best_psnr = ck.get('metrics', {}).get('psnr', 0.0) or 0.0
+        logger.info(f"Resumed from {resume} (epoch {ck.get('epoch')}), "
+                    f"start at epoch {start_epoch}")
+
+    for epoch in range(start_epoch, num_epochs + 1):
         criterion.set_epoch(epoch - 1)
         logger.info("=" * 60)
         logger.info(f"Epoch {epoch}/{num_epochs} - lr={optimizer.param_groups[0]['lr']:.2e}")
@@ -132,7 +152,7 @@ def main():
         # Validate
         if epoch % val_interval == 0:
             model.eval()
-            psnr_list, ssim_list = [], []
+            psnr_list, ssim_list, lpips_list = [], [], []
             with torch.no_grad():
                 for batch in val_loader:
                     lq, gt, meta = batch
@@ -141,17 +161,24 @@ def main():
                     pred = model(lq)['final']
                     psnr_list.append(tensor_psnr(pred, gt))
                     ssim_list.append(tensor_ssim(pred, gt))
+                    lp = lpips_metric(pred, gt)
+                    if lp is not None:
+                        lpips_list.append(lp)
 
             avg_psnr = sum(psnr_list) / len(psnr_list)
             avg_ssim = sum(ssim_list) / len(ssim_list)
-            logger.info(f"Validation - PSNR: {avg_psnr:.2f} dB, SSIM: {avg_ssim:.4f}")
+            avg_lpips = (sum(lpips_list) / len(lpips_list)) if lpips_list else None
+            msg = f"Validation - PSNR: {avg_psnr:.2f} dB, SSIM: {avg_ssim:.4f}"
+            if avg_lpips is not None:
+                msg += f", LPIPS: {avg_lpips:.4f}"
+            logger.info(msg)
 
             state = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
-                'metrics': {'psnr': avg_psnr, 'ssim': avg_ssim},
+                'metrics': {'psnr': avg_psnr, 'ssim': avg_ssim, 'lpips': avg_lpips},
             }
             save_checkpoint(state, os.path.join(out_dir, f'epoch_{epoch:03d}.pth'))
             if avg_psnr > best_psnr:
