@@ -942,6 +942,8 @@ v7r-v2 用「单路 MatrixRWKV + 事后 ContextDecomposition 线性投影」解�
 
 - 三路 Query 从 `feat_aligned` (PixelTemporal 输出) 提取
 - 共享 KV 从 `[mean, smooth, diff]` 统计先验拼接、1×1 投影 (保留 H×W 空间结构)
+- **MatrixRWKV 注入 (方案 B)**: `ctx` 经 `MatrixRWKVInjector` 生成三路门控，
+  调制统计 KV (`s_k = ctx_k·(1+g_k)`)，恢复 MatrixRWKV 梯度路径，消除初版「死计算」
 - 三路 `RWKVSpatialHead` (BiWKV + 4 方向扫描) 共享 KV、差异化 Q
 - `F_k = out_norm_k(feat_aligned + attn_k · scale_k)`，scale 零初始化
 
@@ -955,11 +957,13 @@ v7r-v2 用「单路 MatrixRWKV + 事后 ContextDecomposition 线性投影」解�
 | KV 来源 | 聚合统计 | Concat 全时序 | 帧级 token | 统计先验拼接 |
 | KV 空间结构 | ✅ | ✅ | ❌ | ✅ |
 | 逐像素对齐 | ❌ | ❌ | ✅ | ✅ |
+| MatrixRWKV 梯度路径 | — | — | FiLM | 三路门控 |
 | 解耦时机 | 查询前 | 查询前 | 查询后 | 查询前 |
-| 参数量 | 3.50M | 3.69M | 3.46M | 3.67M |
+| 参数量 | 3.50M | 3.69M | 3.46M | 3.75M |
 
 ### 12.4 状态
 
-实现完成 (前向/反向/loss 全通过，参数量 3.67M)，待训练验证。
+实现完成 (前向/反向/loss 全通过，MatrixRWKV 梯度非零，参数量 3.75M)，训练中。
+方案 C (门控 + per-channel FiLM) 列入后续消融计划。
 文件: `models/golf_v7r/triple_query_tca.py`, `models/golf_v7r/golfnet_v7r_v3.py`,
-`configs/golf_v7r_v3.yaml`, `train_golf_v7r_v3.py`。
+`configs/golf_v7r_v3.yaml`, `train_golf_v7r_v3.py`, `scripts/monitor_golf_v7r_v3.sh`。

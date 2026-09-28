@@ -96,9 +96,10 @@ PixelTemporal → SpatialSummary(帧级token) → MatrixRWKV ×2
 |------|------|--------|
 | `query_N/L/M` | `LayerNorm2d + Conv2d(1×1)` | 3 × (128×128 + 256) ≈ 49.5K |
 | `kv_proj` | `Conv2d(3C→C, 1×1) + LayerNorm2d` | 3×128×128 + 256 ≈ 49.4K |
+| `rwkv_inject` | `MatrixRWKVInjector` (Linear 192→3C) | 192×384+384 ≈ 74.1K |
 | `attn_N/L/M` | `RWKVSpatialHead` (BiWKV×4方向) | 3 × 66.8K ≈ 200.4K |
 | `scale_N/L/M` | LayerScale (零初始化) | 3 × 128 |
-| **合计** | | **≈ 0.30M** |
+| **合计** | | **≈ 0.374M** |
 
 **KV 统计先验**（对齐 R2/R5）：
 
@@ -113,6 +114,53 @@ def _ctx_diff(feats_seq):     # 运动位移: 中心帧 vs 邻帧最大绝对差
     diffs = [(center - feats_seq[:,t]).abs() for t != center]
     return stack(diffs).max(dim=0).values
 ```
+
+### 3.1b MatrixRWKV 注入（方案 B：三路统计门控）
+
+> **背景（审查修正）**：v3 初版存在「死计算」缺陷——`SpatialSummary + 2×MatrixRWKVBlock`
+> 算出 `ctx` 却未接入 `TripleQueryTCA`，0.95M 参数每步空转，且使 "Matrix RWKV" 名不副实。
+> 本方案 B 将 `ctx` 作为共享统计 KV 的门控，恢复梯度路径。
+
+**注入点**：MatrixRWKV 的时序判断 → 调制统计 KV。二者信息形态互补：
+
+| 路径 | 空间结构 | 时序动力学 | 分辨率 |
+|------|----------|-----------|--------|
+| 统计 KV (`mean/smooth/diff`) | ✅ 完整 H×W | ❌ 对时间顺序不变 | H/2 |
+| MatrixRWKV `ctx` | ⚠️ 仅 2×2 | ✅ T 帧递推 | 帧级 |
+
+因此注入方向是**用时序态势选择退化假设**，而非补充空间细节。
+
+```python
+# MatrixRWKVInjector: to_gate 零初始化
+gate = to_gate(ctx_center)              # [B, 3C]
+gate = gate.view(B, 3, C, 1, 1)
+s_mean   = ctx_mean   * (1 + gate[:,0]) # 三路逐通道门控
+s_smooth = ctx_smooth * (1 + gate[:,1])
+s_diff   = ctx_diff   * (1 + gate[:,2])
+kv_shared = kv_proj(concat([s_mean, s_smooth, s_diff]))
+```
+
+**恒等性与梯度**：
+- `to_gate=0` → `gate=0` → `s_k = ctx_k`，初始不扰动既有表示（恒等）
+- 梯度 `∂L/∂W_gate ∝ ∂L/∂kv · ctx_k ≠ 0`（统计量非零）
+- 属**单零**（门控层零、被门控量非零），从 step1 起可达 MatrixRWKV，**避开 R4 双零死锁**
+
+**实测验证**（5 步 AdamW lr=4e-4）：
+
+| step | gate_grad | rwkv_block_grad | gate_val | ctx_drift |
+|------|-----------|-----------------|----------|-----------|
+| 0 | 0 | 0 | 0.000 | 0 |
+| 1 | 3.3e-7 | 0 | 0.000 | — |
+| 2 | 2.9e-7 | 8.5e-11 | 0.037 | — |
+| 5 | 1.5e-7 | 1.6e-10 | 0.096 | 0.277 |
+| 59 | 4.9e-8 | 2.0e-10 | 0.208 | 1.025 |
+
+- ✅ Injector 自 step1 解锁，`gate_val` 从 0 增至 0.21
+- ✅ MatrixRWKV 梯度非零（step2 起），`ctx_drift` 从 0 增至 1.025 → **真正在学习**
+- ℹ️ `rwkv_block_grad ≈ 1e-10` 看似极小，但被门控乘子 `(1+g)`（g≈0.1）衰减，与 LayerScale
+  初始 ~1e-10 同量级，Adam 可正常处理；关键是**非零**（对比 v3 初版的**精确 0**）
+
+**参数量**：3.67M → **3.75M**（+74.1K）
 
 ### 3.2 关键设计选择
 
@@ -145,9 +193,10 @@ def _ctx_diff(feats_seq):     # 运动位移: 中心帧 vs 邻帧最大绝对差
 | KV 来源 | 聚合统计 | Concat 全时序 | 帧级 token | **统计先验拼接** |
 | KV 空间结构 | ✅ | ✅ | ❌ | ✅ |
 | RWKV 状态 | 向量 | 向量 | 矩阵 (RWKV-6) | 矩阵 (RWKV-6) |
-| RWKV 位置 | 空间注意力内 | 空间注意力内 | 帧级（辅助） | 帧级（辅助） |
+| RWKV 位置 | 空间注意力内 | 空间注意力内 | 帧级（辅助） | **帧级（门控 KV）** |
+| MatrixRWKV 梯度路径 | — | — | ✅ FiLM 注入 | ✅ 三路门控注入 |
 | 解耦时机 | 查询前 | 查询前 | 查询后 | **查询前** |
-| 参数量 | 3.50M | 3.69M | 3.46M | **3.67M** |
+| 参数量 | 3.50M | 3.69M | 3.46M | **3.75M** |
 
 ---
 
@@ -169,13 +218,13 @@ encoder             0.4095M
 pixel_temporal      0.0243M
 spatial_summary     0.0989M
 matrix_rwkv         0.8529M
-triple_query_tca    0.2995M   ← 核心新增
+triple_query_tca    0.3740M   ← 含 rwkv_inject 0.0741M
 branch_N            0.5564M
 branch_L            0.6093M
 branch_M            0.8043M
 fusion              0.0129M
 ─────────────────────────────
-total               3.67M
+total               3.75M
 ```
 
 ### 5.3 梯度流验证
@@ -192,12 +241,42 @@ total               3.67M
 
 ---
 
+## 五甲、MatrixRWKV 注入方案矩阵（实验计划）
+
+审查发现 v3 初版的 MatrixRWKV 是「死计算」。本版实现**方案 B**（三路统计门控），
+并保留 **方案 C** 作为后续消融，构成一条完整的注入强度梯度：
+
+| 变体 | 机制 | 注入形式 | 参数 | 状态 |
+|------|------|----------|------|------|
+| **B**（当前） | 三路统计门控 | `s_k = ctx_k · (1 + g_k)`，`g = to_gate(ctx_center)` | +74.1K | ✅ **已实现** |
+| **B+C** | 门控 + per-channel FiLM | `kv = kv_proj(s) ; kv = kv·(1+γ) + β` | +123.5K | 📋 计划 |
+
+**方案 C 定义**（`to_film: Linear(rwkv_dim → 2C)`，零初始化）：
+
+```python
+gamma, beta = to_film(ctx_center).chunk(2, dim=-1)   # [B, C] each
+kv_shared = kv_shared * (1 + gamma[..., None, None]) + beta[..., None, None]
+```
+
+**对比设计要点**：
+- B 与 C 作用点不同（B 在统计量上、C 在投影后 KV 上），可叠加
+- 两者均零初始化 → 均从恒等起步，不冲突、不破坏训练稳定性
+- 消融时只看 `inject_stat['gate']` 与 `inject_stat['film']` 的幅度演化
+
+**判读标准**（训练后）：
+- 若 B 的 `gate` 幅度显著增长且指标优于"无注入" → MatrixRWKV 的时序门控有增益
+- 若 B+C 优于 B → per-channel FiLM 精化有额外增益
+- 若均收敛到 → 0 → 诚实结论：MatrixRWKV 对该 KV 无增益（考虑改为方案 A 或删除）
+
+---
+
 ## 六、待验证问题
 
 1. **正交约束是否有效解耦** —— 需观察训练后 `ortho_loss` 是否下降（v2 降到 0.00014）
 2. **统计先验 KV vs Concat KV** —— 若 v3 优于 R4，则验证「三路 Q + 统计 KV」组合假设
-3. **Pair45 泛化** —— R2/R4/R5 均存在的泛化分裂是否缓解
-4. **掩码可视化** —— 三路 Query 是否学到不同的退化响应区域
+3. **MatrixRWKV 门控增益** —— `gate` 幅度是否增长、是否带来指标提升（见 §五甲）
+4. **Pair45 泛化** —— R2/R4/R5 均存在的泛化分裂是否缓解
+5. **掩码可视化** —— 三路 Query 是否学到不同的退化响应区域
 
 ---
 
@@ -205,11 +284,12 @@ total               3.67M
 
 | 文件 | 说明 |
 |------|------|
-| `models/golf_v7r/triple_query_tca.py` | TripleQueryTCA 核心模块 |
-| `models/golf_v7r/golfnet_v7r_v3.py` | GolfNet_v7r_v3 主网络 |
+| `models/golf_v7r/triple_query_tca.py` | TripleQueryTCA + MatrixRWKVInjector (方案 B) |
+| `models/golf_v7r/golfnet_v7r_v3.py` | GolfNet_v7r_v3 主网络 (传入 ctx, 透出 inject_stat) |
 | `models/golf_v7r/__init__.py` | 导出更新 |
 | `configs/golf_v7r_v3.yaml` | 训练配置 |
-| `train_golf_v7r_v3.py` | 训练脚本 |
+| `train_golf_v7r_v3.py` | 训练脚本 (含 gate 诊断日志) |
+| `scripts/monitor_golf_v7r_v3.sh` | 监视终端脚本 (含门控诊断) |
 | `docs/v7/03-v7r-v3-design.md` | 本文档 |
 
 ---

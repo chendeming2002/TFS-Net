@@ -134,7 +134,14 @@ def main():
             n_steps += 1
 
             if (step + 1) % log_interval == 0:
-                logger.info(f"  Step {step+1}/{len(train_loader)} - Loss: {loss.item():.4f}")
+                msg = f"  Step {step+1}/{len(train_loader)} - Loss: {loss.item():.4f}"
+                # MatrixRWKV 门控诊断 (方案 B): 观察注入是否被使用
+                if 'inject_stat' in output_dict:
+                    gk = output_dict['inject_stat']['gate_k']
+                    msg += (f" | gate={output_dict['inject_stat']['gate'].item():.4f}"
+                            f" (N/L/M={gk[0].item():.3f}/"
+                            f"{gk[1].item():.3f}/{gk[2].item():.3f})")
+                logger.info(msg)
 
         scheduler.step()
         dt = time.time() - t0

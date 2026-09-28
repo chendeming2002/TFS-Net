@@ -15,8 +15,9 @@ Stage flow:
   1. SharedEncoder (逐帧)
   2. feature_proj + PixelTemporalAttentionSimple
   3. MatrixRWKV-TCA:
-       SpatialSummary → MatrixRWKVBlock ×2 → (帧级上下文, 仅作辅助)
-       TripleQueryTCA(feat_aligned, feats_seq) → F_N/L/M + ortho_loss
+       SpatialSummary → MatrixRWKVBlock ×2 → ctx [B,T,192]
+       TripleQueryTCA(feat_aligned, feats_proj, ctx) → F_N/L/M + ortho_loss
+         · ctx 经 MatrixRWKVInjector 生成三路门控, 调制共享统计 KV (方案 B)
   4. 简化三分支 BranchN/L/M
   5. V7RFusion
 """
@@ -133,8 +134,9 @@ class GolfNet_v7r_v3(nn.Module):
         ctx = self.rwkv_norm(ctx)               # [B, T, 192]
 
         # 3.3 三路查询 TCA (核心改进)
-        F_N, F_L, F_M, ortho = self.triple_query_tca(
-            feat_aligned, feats_proj
+        # MatrixRWKV 上下文 ctx 作为辅助三路门控注入共享 KV (方案 B)
+        F_N, F_L, F_M, ortho, inject_stat = self.triple_query_tca(
+            feat_aligned, feats_proj, ctx
         )  # 各 [B, 128, H/2, W/2]
 
         # ========== Stage 4: 三分支 ==========
@@ -154,6 +156,7 @@ class GolfNet_v7r_v3(nn.Module):
             'frame_ctx': ctx,
             'ortho_loss': ortho,
             'fusion_weights': fusion_out['weights'],
+            'inject_stat': inject_stat,
         }
 
 

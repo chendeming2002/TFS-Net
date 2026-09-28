@@ -18,6 +18,26 @@ echo "══════════ 训练进度 (最近 5 step) ════�
 grep -a "Step \|Epoch " "$LOG" 2>/dev/null | tail -5
 
 echo ""
+echo "══════════ MatrixRWKV 门控诊断 (方案 B) ══════════"
+GATE=$(grep -a "gate=" "$LOG" 2>/dev/null | tail -1)
+if [ -n "$GATE" ]; then
+  echo "  $GATE" | sed 's/.*| /  /'
+  # 提取 gate 值并判读
+  GV=$(echo "$GATE" | grep -oE "gate=[0-9.]+" | grep -oE "[0-9.]+")
+  if [ -n "$GV" ]; then
+    /home/a1005/anaconda3/envs/ptorch/bin/python -c "
+v=float('$GV')
+if v>0.5: print(f'  ✓ gate={v:.3f} MatrixRWKV 强参与 KV 调制')
+elif v>0.1: print(f'  ✓ gate={v:.3f} MatrixRWKV 已激活')
+elif v>0.01: print(f'  ⚡ gate={v:.3f} 弱激活, 持续观察')
+else: print(f'  ⚠️  gate={v:.3f} 近零, MatrixRWKV 参与度低')
+" 2>/dev/null
+  fi
+else
+  echo "  (暂无 gate 诊断, 等待首个 log_interval)"
+fi
+
+echo ""
 echo "══════════ 验证指标历史 ══════════"
 if grep -aq "Validation - PSNR" "$LOG" 2>/dev/null; then
   grep -a "Validation - PSNR" "$LOG" | tail -8 | sed 's/.*Validation - /  /'
