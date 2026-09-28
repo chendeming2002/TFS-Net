@@ -131,8 +131,8 @@ def main():
                     output_dict = model(lq)
                     pred = output_dict['final']
                     
-                    psnr = tensor_psnr(pred, gt).item()
-                    ssim = tensor_ssim(pred, gt).item()
+                    psnr = tensor_psnr(pred, gt)
+                    ssim = tensor_ssim(pred, gt)
                     
                     psnr_list.append(psnr)
                     ssim_list.append(ssim)

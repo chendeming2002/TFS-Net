@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""Golf v7r 训练脚本: Matrix RWKV + 多元噪声分割"""
+import argparse
+import os
+import sys
+import time
+import yaml
+import torch
+from torch.utils.data import DataLoader
+
+from datasets import SDSDDataset
+from models.golf_v7r import GolfNet_v7r, GolfV7RLoss
+from utils.io import save_checkpoint
+from utils.metrics import tensor_psnr, tensor_ssim
+import logging
+
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', required=True)
+    args = parser.parse_args()
+
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
+
+    # Seed
+    seed = cfg.get('seed', 42)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Using device: {device}")
+
+    # Dataset
+    train_ds = SDSDDataset(
+        input_root=cfg['dataset']['train_input_root'],
+        target_root=cfg['dataset']['train_target_root'],
+        window_size=cfg['dataset']['window_size'],
+        mode="train",
+        crop_size=cfg['dataset']['crop_size'],
+    )
+    train_loader = DataLoader(
+        train_ds, batch_size=cfg['train']['batch_size'], shuffle=True,
+        num_workers=cfg['dataset'].get('num_workers', 0),
+        pin_memory=False, drop_last=True,
+    )
+    logger.info(f"Train dataset: {len(train_ds)} samples, {len(train_loader)} batches")
+
+    val_ds = SDSDDataset(
+        input_root=cfg['dataset']['val_input_root'],
+        target_root=cfg['dataset']['val_target_root'],
+        window_size=cfg['dataset']['window_size'],
+        mode="val", crop_size=None,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=1, shuffle=False,
+        num_workers=cfg['dataset'].get('num_workers', 0), pin_memory=False,
+    )
+    logger.info(f"Val dataset: {len(val_ds)} samples")
+
+    # Model
+    model = GolfNet_v7r(**cfg['model']).to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    logger.info(f"GolfNet_v7r params: {n_params/1e6:.2f}M")
+
+    # Loss & Optimizer
+    criterion = GolfV7RLoss(**cfg.get('loss', {})).to(device)
+    lr = cfg['train']['lr']
+    wd = cfg['train'].get('weight_decay', 0.0)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+    num_epochs = cfg['train']['epochs']
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=num_epochs, eta_min=1e-6
+    )
+
+    out_dir = cfg['output_dir']
+    os.makedirs(out_dir, exist_ok=True)
+
+    log_interval = cfg['train'].get('log_interval', 100)
+    val_interval = cfg['train'].get('val_interval', 5)
+    grad_clip = cfg['train'].get('grad_clip', 0.0)
+
+    best_psnr = 0.0
+    for epoch in range(1, num_epochs + 1):
+        criterion.set_epoch(epoch - 1)
+        logger.info("=" * 60)
+        logger.info(f"Epoch {epoch}/{num_epochs} - lr={optimizer.param_groups[0]['lr']:.2e}")
+        logger.info("=" * 60)
+
+        model.train()
+        t0 = time.time()
+        epoch_loss = 0.0
+        n_steps = 0
+        for step, batch in enumerate(train_loader):
+            lq, gt, meta = batch
+            lq = lq.to(device, non_blocking=True)
+            gt = gt.to(device, non_blocking=True)
+
+            output_dict = model(lq)
+            loss_dict = criterion(output_dict, gt)
+            loss = loss_dict['loss']
+
+            optimizer.zero_grad()
+            loss.backward()
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+
+            epoch_loss += loss.item()
+            n_steps += 1
+
+            if (step + 1) % log_interval == 0:
+                logger.info(f"  Step {step+1}/{len(train_loader)} - Loss: {loss.item():.4f}")
+
+        scheduler.step()
+        dt = time.time() - t0
+        logger.info(f"Epoch {epoch} done in {dt/60:.1f} min, avg loss: {epoch_loss/max(n_steps,1):.4f}")
+
+        # Save latest
+        state = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+        }
+        save_checkpoint(state, os.path.join(out_dir, 'latest.pth'))
+
+        # Validate
+        if epoch % val_interval == 0:
+            model.eval()
+            psnr_list, ssim_list = [], []
+            with torch.no_grad():
+                for batch in val_loader:
+                    lq, gt, meta = batch
+                    lq = lq.to(device, non_blocking=True)
+                    gt = gt.to(device, non_blocking=True)
+                    pred = model(lq)['final']
+                    psnr_list.append(tensor_psnr(pred, gt))
+                    ssim_list.append(tensor_ssim(pred, gt))
+
+            avg_psnr = sum(psnr_list) / len(psnr_list)
+            avg_ssim = sum(ssim_list) / len(ssim_list)
+            logger.info(f"Validation - PSNR: {avg_psnr:.2f} dB, SSIM: {avg_ssim:.4f}")
+
+            state = {
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'metrics': {'psnr': avg_psnr, 'ssim': avg_ssim},
+            }
+            save_checkpoint(state, os.path.join(out_dir, f'epoch_{epoch:03d}.pth'))
+            if avg_psnr > best_psnr:
+                best_psnr = avg_psnr
+                save_checkpoint(state, os.path.join(out_dir, 'best.pth'))
+                logger.info(f"  New best PSNR: {best_psnr:.2f} dB")
+
+    logger.info("Training completed!")
+
+
+if __name__ == "__main__":
+    main()
