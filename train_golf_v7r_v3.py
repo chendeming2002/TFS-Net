@@ -102,8 +102,11 @@ def main():
             scheduler.load_state_dict(ck['scheduler_state_dict'])
         start_epoch = ck.get('epoch', 0) + 1
         best_psnr = ck.get('metrics', {}).get('psnr', 0.0) or 0.0
+        # latest.pth 无 metrics 字段: 允许从 config 显式传入历史 best, 避免误覆盖
+        if best_psnr == 0.0:
+            best_psnr = cfg['train'].get('resume_best_psnr', 0.0) or 0.0
         logger.info(f"Resumed from {resume} (epoch {ck.get('epoch')}), "
-                    f"start at epoch {start_epoch}")
+                    f"start at epoch {start_epoch}, best_psnr={best_psnr:.2f}")
 
     for epoch in range(start_epoch, num_epochs + 1):
         criterion.set_epoch(epoch - 1)
@@ -135,7 +138,6 @@ def main():
 
             if (step + 1) % log_interval == 0:
                 msg = f"  Step {step+1}/{len(train_loader)} - Loss: {loss.item():.4f}"
-                # MatrixRWKV 门控诊断 (方案 B): 观察注入是否被使用
                 if 'inject_stat' in output_dict:
                     gk = output_dict['inject_stat']['gate_k']
                     msg += (f" | gate={output_dict['inject_stat']['gate'].item():.4f}"

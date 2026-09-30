@@ -30,6 +30,8 @@ train:
   val_interval: 5
   grad_clip: 1.0
   lpips_net: vgg
+  resume: outputs/golf_v7r_v3/latest.pth
+  resume_best_psnr: 19.71   # ep5 历史 best
 
 loss:
   w_branch_N: 0.1
