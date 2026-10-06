@@ -35,17 +35,25 @@ def build_model(name):
     elif name == 'v7r':
         from models.golf_v7r import GolfNet_v7r as M
         return M()
+    elif name == 'v7r_v3':
+        from models.golf_v7r import GolfNet_v7r_v3 as M
+        return M()
+    elif name == 'r2':
+        from models.golf import GolfNet as M
+        return M()
     raise ValueError(name)
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--ckpt', required=True)
-    p.add_argument('--model', choices=['v7', 'v7r'], required=True)
+    p.add_argument('--model', choices=['v7', 'v7r', 'v7r_v3', 'r2'], required=True)
     p.add_argument('--tag', default=None, help='结果标签, 默认用 model+epoch')
     p.add_argument('--lpips_net', default='vgg', choices=['vgg', 'alex', 'squeeze'])
     p.add_argument('--out_json', default='outputs/eval_metrics.json',
                    help='结果追加写入的 JSON 文件 (方便综合比较)')
+    p.add_argument('--pairing', default='name', choices=['name', 'position'],
+                   help='LQ/GT 配对方式: name=文件名交集(历史), position=sorted 位置(官方约定)')
     args = p.parse_args()
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -53,13 +61,15 @@ def main():
     # ---- dataset ----
     ds = SDSDDataset(input_root='/home/a1005/yzy/dataset/SDSD/test/low-light',
                      target_root='/home/a1005/yzy/dataset/SDSD/test/GT',
-                     window_size=5, mode='val', crop_size=None)
+                     window_size=5, mode='val', crop_size=None,
+                     pairing=args.pairing)
     loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=0)
 
     # ---- model ----
     model = build_model(args.model).to(device).eval()
     ck = torch.load(args.ckpt, map_location=device, weights_only=False)
-    model.load_state_dict(ck['model_state_dict'])
+    state = ck.get('model_state_dict', ck.get('model'))
+    model.load_state_dict(state)
     epoch = ck.get('epoch', -1)
     n_params = sum(p.numel() for p in model.parameters())
     tag = args.tag or f'{args.model}-ep{epoch}'
@@ -80,7 +90,8 @@ def main():
         for i, (lq, gt, meta) in enumerate(loader):
             lq = lq.to(device)
             gt = gt.to(device)
-            pred = model(lq)['final']
+            out = model(lq)
+            pred = out['final'] if 'final' in out else out['res_t']
 
             seq = meta['sequence'][0] if isinstance(meta['sequence'], (list, tuple)) else meta['sequence']
             psnr_i = tensor_psnr(pred, gt)
@@ -128,6 +139,7 @@ def main():
         'model': args.model,
         'epoch': epoch,
         'params_M': round(n_params / 1e6, 3),
+        'pairing': args.pairing,
         'n_samples': len(ps),
         'n_sequences': len(seq_metrics),
         # 微平均 (每帧等权)

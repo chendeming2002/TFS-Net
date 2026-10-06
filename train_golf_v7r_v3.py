@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader
 from datasets import SDSDDataset
 from models.golf_v7r import GolfNet_v7r_v3, GolfV7RLoss
 from utils.io import save_checkpoint
+from utils.misc import seed_everything
 from utils.metrics import tensor_psnr, tensor_ssim, LPIPSMetric
 import logging
 
@@ -22,26 +23,31 @@ logger = logging.getLogger(__name__)
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', required=True)
+    parser.add_argument('--stop_epoch', type=int, default=None,
+                        help='仅用于快速验证: 训练到该 epoch 即停, 不改变 cosine 调度 (T_max 仍为配置值)')
+    parser.add_argument('--resume', default=None, help='覆盖 config 中的 resume 路径')
     args = parser.parse_args()
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
-    # Seed
+    # Seed (含 Python random / numpy: 数据增强用 random 模块, 必须一起播种才能复现)
     seed = cfg.get('seed', 42)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    seed_everything(seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
 
     # Dataset
+    pairing = cfg['dataset'].get('pairing', 'name')
+    logger.info(f"Dataset pairing mode: {pairing}")
     train_ds = SDSDDataset(
         input_root=cfg['dataset']['train_input_root'],
         target_root=cfg['dataset']['train_target_root'],
         window_size=cfg['dataset']['window_size'],
         mode="train",
         crop_size=cfg['dataset']['crop_size'],
+        pairing=pairing,
     )
     train_loader = DataLoader(
         train_ds, batch_size=cfg['train']['batch_size'], shuffle=True,
@@ -55,6 +61,7 @@ def main():
         target_root=cfg['dataset']['val_target_root'],
         window_size=cfg['dataset']['window_size'],
         mode="val", crop_size=None,
+        pairing=pairing,
     )
     val_loader = DataLoader(
         val_ds, batch_size=1, shuffle=False,
@@ -92,7 +99,7 @@ def main():
     # 断点续训
     start_epoch = 1
     best_psnr = 0.0
-    resume = cfg['train'].get('resume')
+    resume = args.resume if args.resume is not None else cfg['train'].get('resume')
     if resume:
         ck = torch.load(resume, map_location=device, weights_only=False)
         model.load_state_dict(ck['model_state_dict'])
@@ -109,6 +116,9 @@ def main():
                     f"start at epoch {start_epoch}, best_psnr={best_psnr:.2f}")
 
     for epoch in range(start_epoch, num_epochs + 1):
+        if args.stop_epoch is not None and epoch > args.stop_epoch:
+            logger.info(f"Reached --stop_epoch {args.stop_epoch}, stopping early.")
+            break
         criterion.set_epoch(epoch - 1)
         logger.info("=" * 60)
         logger.info(f"Epoch {epoch}/{num_epochs} - lr={optimizer.param_groups[0]['lr']:.2e}")

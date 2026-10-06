@@ -59,7 +59,16 @@ def read_image(path):
 
 
 class SDSDDataset(Dataset):
-    def __init__(self, input_root, target_root, window_size=5, mode="train", crop_size=256, max_seqs=None):
+    def __init__(self, input_root, target_root, window_size=5, mode="train", crop_size=256,
+                 max_seqs=None, pairing="name"):
+        """SDSD 数据集。
+
+        pairing:
+          - "name"(默认, 历史行为): 按 LQ/GT 同名文件的交集配对。
+          - "position": 按 sorted 位置配对 (官方 SDSD/LLVE_STCD 约定)。SDSD 每序列
+            LQ/GT 帧数相等但文件名区间可能整体偏移 (如 pair45 偏移 60), 此时按位置
+            配对才是时间对齐的; 按文件名配对会错位。
+        """
         super().__init__()
         self.input_root = input_root
         self.target_root = target_root
@@ -68,6 +77,9 @@ class SDSDDataset(Dataset):
         self.mode = mode
         self.crop_size = crop_size
         self.max_seqs = max_seqs
+        if pairing not in ("name", "position"):
+            raise ValueError("pairing must be 'name' or 'position', got {!r}".format(pairing))
+        self.pairing = pairing
         self.samples = self._build_samples()
         self._frame_cache = _FrameLRU(capacity=24)
 
@@ -79,13 +91,20 @@ class SDSDDataset(Dataset):
         for seq_name in seq_names:
             lq_paths = sorted(glob(os.path.join(self.input_root, seq_name, "*")))
             gt_paths = sorted(glob(os.path.join(self.target_root, seq_name, "*")))
-            lq_map = {os.path.basename(path): path for path in lq_paths}
-            gt_map = {os.path.basename(path): path for path in gt_paths}
-            common_names = sorted(set(lq_map.keys()) & set(gt_map.keys()))
-            if not common_names:
-                raise RuntimeError("Sequence {} has no overlapping input/gt frames.".format(seq_name))
-            lq_paths = [lq_map[name] for name in common_names]
-            gt_paths = [gt_map[name] for name in common_names]
+            if self.pairing == "position":
+                n = min(len(lq_paths), len(gt_paths))
+                if n == 0:
+                    raise RuntimeError("Sequence {} has no frames.".format(seq_name))
+                lq_paths = lq_paths[:n]
+                gt_paths = gt_paths[:n]
+            else:
+                lq_map = {os.path.basename(path): path for path in lq_paths}
+                gt_map = {os.path.basename(path): path for path in gt_paths}
+                common_names = sorted(set(lq_map.keys()) & set(gt_map.keys()))
+                if not common_names:
+                    raise RuntimeError("Sequence {} has no overlapping input/gt frames.".format(seq_name))
+                lq_paths = [lq_map[name] for name in common_names]
+                gt_paths = [gt_map[name] for name in common_names]
             for idx in range(len(lq_paths)):
                 samples.append(
                     {

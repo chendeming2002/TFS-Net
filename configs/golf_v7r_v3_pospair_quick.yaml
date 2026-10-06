@@ -1,0 +1,41 @@
+seed: 42
+output_dir: outputs/golf_v7r_v3_pospair_quick
+
+dataset:
+  train_input_root: /home/a1005/yzy/dataset/SDSD/indoor/input
+  train_target_root: /home/a1005/yzy/dataset/SDSD/indoor/GT
+  val_input_root: /home/a1005/yzy/dataset/SDSD/test/low-light
+  val_target_root: /home/a1005/yzy/dataset/SDSD/test/GT
+  window_size: 5
+  crop_size: 256
+  num_workers: 0
+  pairing: position   # 官方 SDSD 约定: 按 sorted 位置配对 (修复文件名交集错位)
+
+model:
+  num_frames: 5
+  encoder_channels: [32, 64, 128]
+  feature_dim: 128
+  rwkv_dim: 192
+  rwkv_heads: 6
+  rwkv_head_size: 32
+  rwkv_blocks: 2
+  spatial_size: 2
+  branch_channels: 128
+
+train:
+  batch_size: 1
+  epochs: 60          # 保持 T_max=60, 使前 5 epoch 的 LR 与原 v7r-v3 运行一致
+  lr: 0.0004
+  weight_decay: 0.01
+  log_interval: 100
+  val_interval: 5
+  grad_clip: 1.0
+  lpips_net: vgg
+
+loss:
+  w_branch_N: 0.1
+  w_branch_L: 0.1
+  w_branch_M: 0.1
+  lambda_ortho: 0.01
+  w_ssim: 0.0
+  branch_warmup_epochs: 5
