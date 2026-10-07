@@ -52,6 +52,8 @@ def main():
     p.add_argument('--max_frames', type=int, default=None)
     p.add_argument('--pairing', default='name', choices=['name', 'position'],
                    help='LQ/GT 配对方式: name=文件名交集(历史), position=sorted 位置(官方约定)')
+    p.add_argument('--amp', action='store_true',
+                   help='fp16 autocast 推理 (全 1080p 显存 ~7.5GB, 可与训练进程共存)')
     args = p.parse_args()
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -103,7 +105,8 @@ def main():
             for i, (lq_name, gt_name) in enumerate(paired):
                 idxs = [min(max(i + o, 0), len(names) - 1) for o in range(-half, half + 1)]
                 clip = torch.stack([lq_map[names[j]] for j in idxs], dim=0).unsqueeze(0).to(device)  # [1,T,3,H,W]
-                pred = model(clip)['final'][0].clamp(0, 1)
+                with torch.cuda.amp.autocast(dtype=torch.float16, enabled=args.amp):
+                    pred = model(clip)['final'][0].float().clamp(0, 1)
 
                 TF.to_pil_image(pred.cpu()).save(os.path.join(out_seq, lq_name))
 
