@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""DID 跨数据集评测 (GolfNet_v7r_v3)。
+"""DID 跨数据集评测 (GolfNet v7r-v3 / v7 / v7r / r2)。
 
-在 SDSD 上训练的 v7r-v3 模型直接跑 DID test (跨数据集泛化/阶段测试)。
+在 SDSD 上训练的模型直接跑 DID test (跨数据集泛化/阶段测试)。
 - 帧配对: 按 sorted 位置 (DID 的 LQ/GT 文件名一致, 001.jpg <-> 001.jpg)
 - 全分辨率 1080p 计算 PSNR / SSIM / LPIPS(VGG)
 - fp16 autocast: 峰值显存 ~7.5GB, 可与训练进程共存
@@ -10,6 +10,9 @@
 用法:
     python eval_did_v7r.py --ckpt outputs/golf_v7r_v3_pospair/epoch_045.pth \
         --tag v7r_v3_pospair-ep45-DID --out_json outputs/did_metrics.json
+    # 同口径基线 (R2):
+    python eval_did_v7r.py --model r2 --ckpt outputs/golf_r2/best.pth \
+        --tag r2-ep60-DID-frac33 --frac 0.33 --out_json outputs/did_metrics.json
 """
 import argparse
 import glob
@@ -21,8 +24,23 @@ import numpy as np
 import torch
 from PIL import Image
 
-from models.golf_v7r import GolfNet_v7r_v3
 from utils.metrics import tensor_psnr, tensor_ssim, LPIPSMetric
+
+
+def build_model(name):
+    if name == 'v7':
+        from models.golf_v7 import GolfNet_v7 as M
+        return M()
+    elif name == 'v7r':
+        from models.golf_v7r import GolfNet_v7r as M
+        return M()
+    elif name == 'v7r_v3':
+        from models.golf_v7r import GolfNet_v7r_v3 as M
+        return M()
+    elif name == 'r2':
+        from models.golf import GolfNet as M
+        return M()
+    raise ValueError(name)
 
 
 def read_image(path):
@@ -34,6 +52,9 @@ def read_image(path):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--ckpt', required=True)
+    p.add_argument('--model', default='v7r_v3',
+                   choices=['v7', 'v7r', 'v7r_v3', 'r2'],
+                   help='模型类型 (与 eval_checkpoint.py 同口径)')
     p.add_argument('--tag', default=None)
     p.add_argument('--did_root', default='/home/a1005/yzy/dataset/DID/test')
     p.add_argument('--out_json', default='outputs/did_metrics.json')
@@ -46,13 +67,14 @@ def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     half = 2  # window = 5
 
-    model = GolfNet_v7r_v3().to(device).eval()
+    model = build_model(args.model).to(device).eval()
     ck = torch.load(args.ckpt, map_location=device, weights_only=False)
     state = ck.get('model_state_dict', ck.get('model'))
     model.load_state_dict(state)
     epoch = ck.get('epoch', -1)
-    tag = args.tag or 'v7r_v3-ep{}-DID'.format(epoch)
-    print('Loaded {} | epoch {} | tag={}'.format(args.ckpt, epoch, tag), flush=True)
+    tag = args.tag or '{}-ep{}-DID'.format(args.model, epoch)
+    print('Loaded {} | model {} | epoch {} | tag={}'.format(
+        args.ckpt, args.model, epoch, tag), flush=True)
 
     lpips_fn = LPIPSMetric(net=args.lpips_net, device=device)
     print('LPIPS available: {}'.format(lpips_fn.available), flush=True)
@@ -97,7 +119,9 @@ def main():
                 inds = [min(max(idx + o, 0), mx) for o in range(-half, half + 1)]
                 clip = torch.stack([_frame(j) for j in inds], 0).unsqueeze(0).to(device)
                 with torch.cuda.amp.autocast(dtype=torch.float16):
-                    pred = model(clip)['final'][0].float().clamp(0, 1)
+                    out = model(clip)
+                pred = out['final'] if 'final' in out else out['res_t']
+                pred = pred[0].float().clamp(0, 1)
                 gt = read_image(gt_frames[idx]).to(device)
                 ps.append(tensor_psnr(pred.unsqueeze(0), gt.unsqueeze(0)))
                 ss.append(tensor_ssim(pred.unsqueeze(0), gt.unsqueeze(0)))
@@ -128,7 +152,7 @@ def main():
 
     result = {
         'tag': tag,
-        'model': 'v7r_v3',
+        'model': args.model,
         'epoch': epoch,
         'dataset': 'DID/test',
         'protocol': ('frac={:.2f}'.format(args.frac) if args.frac > 0

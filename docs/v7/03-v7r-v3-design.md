@@ -28,19 +28,23 @@
 
 ### 0.2 跨数据集泛化（DID test，唯一可信的外部指标）
 
-| 指标 | v7r-v3 ep55 (`best.pth`) | 协议 |
-|------|--------------------------|------|
-| DID PSNR (Micro) | **20.17** | frac=0.33 → 358 帧 / 10 视频 / VGG-LPIPS |
-| DID SSIM | 0.7075 | 同上 |
-| DID LPIPS | 0.5220 | 同上 |
+| 指标 | v7r-v3 ep55 (`best.pth`) | R2 ep60（同口径基线） | 协议 |
+|------|--------------------------|------------------------|------|
+| DID PSNR (Micro) | **20.17** | 18.62 | frac=0.33 → 358 帧 / 10 视频 / VGG-LPIPS |
+| DID PSNR (Macro) | **20.32** | 18.50 | 同上 |
+| DID SSIM | **0.7075** | 0.6714 | 同上 |
+| DID LPIPS | **0.5220** | 0.6186 | 同上 |
 
 DID 上 **ep55 同样是峰值**（ep40 19.81 → ep45 20.02 → **ep55 20.17** → ep60 20.02），
 与训练内 Val 的最优点一致。详见 §5.5 趋势表。
+**同口径对比**（§6.10）：v7r-v3 比 R2 高 **+1.55/+1.82 dB**（Micro/Macro），SSIM/LPIPS 同向，
+证明 v3 架构改进相对 R2 的 Concat-KV 有效。
 
 **成功判据（修正后口径）**:
 - SDSD Val（拟合）≥ 26.0 ✅（ep55 26.23）—— 但仅证明收敛，不证明泛化
 - DID 跨域 PSNR ≥ 20.0 ✅（ep55 20.17）—— 跨域/跨相机的真实指标
 - DID 上 ep55 > ep60 ✅ —— 60 epoch 出现轻微过拟合回撤，早停 (ep55) 正确
+- DID 上 v7r-v3 > R2 同口径 ✅ —— +1.55 dB（§6.10）
 
 > **仍未解决的问题 → 见 §六**（分支输出未分化 §6.2、数据泄漏 §6.4、极暗序列瓶颈 §6.6 等 13 项，
 > 含证据、根因与解决思路）。核心实验发现：三路特征已正交 (ortho≈0.003) 但三路 RGB 输出余弦
@@ -747,16 +751,40 @@ DID 上 LPIPS≈0.52 偏高（感知质量欠佳）。
 
 ---
 
-### 6.10 🟡 P2：评估协议未与其他方法同口径对比
+### 6.10 🟡 P2：评估协议未与其他方法同口径对比 → ✅ 基线已建立
 
-**现象/证据**：DID 当前只有 v7r-v3 自身 4 个 epoch，`eval_did_v7r.py` 的 `build_model`
-仅支持 v7/v7r/v7r_v3/r2；未在 DID 上跑 R2/其它 SOTA 同口径。
+**现象/证据**：DID 原只有 v7r-v3 自身 4 个 epoch，未在 DID 上跑基线同口径对比。
 
-**解决思路**：
-- 用 `eval_did_v7r.py`（或扩展 `build_model`）在 DID 上跑 R2 等基线，建立**同口径**排名；
-- `--frac 0.33` 改为全帧（10 视频共 1084 帧）复核抽样无偏。
+**✅ 已完成（2026-10-08）**：扩展 `eval_did_v7r.py` 支持 `--model r2`（与 `eval_checkpoint.py`
+同一 `build_model`），在 **完全相同的 `--frac 0.33`、358 帧、VGG-LPIPS、fp16** 协议下跑
+R2 best（ep60，`outputs/golf_r2/best.pth`）。**同口径排名**（`outputs/did_metrics.json`）：
 
-**工作量**：纯推理，约数小时（R2 ckpt 在 `outputs/golf_r2/`）。
+| 方法 | Micro PSNR | Macro PSNR | SSIM | LPIPS |
+|------|:--:|:--:|:--:|:--:|
+| **v7r-v3 (ep55)** | **20.171** | **20.322** | **0.7075** | **0.5220** |
+| R2 (ep60) | 18.619 | 18.498 | 0.6714 | 0.6186 |
+| **Δ (v7r-v3 − R2)** | **+1.55** | **+1.82** | **+0.036** | **−0.097** |
+
+**逐序列**（PSNR, v7r-v3 vs R2）：
+
+| 序列 | R2 | v7r-v3 | Δ | 序列 | R2 | v7r-v3 | Δ |
+|------|:--:|:--:|:--:|------|:--:|:--:|:--:|
+| video90 | 24.42 | 29.36 | **+4.94** | video2 | 18.22 | 20.97 | +2.76 |
+| video10 | 21.62 | 25.66 | **+4.04** | video116 | 18.35 | 21.12 | +2.77 |
+| video114 | 20.25 | 22.61 | +2.37 | video180 | 18.89 | 20.75 | +1.87 |
+| video203 | 20.52 | 21.96 | +1.44 | **video30** | 20.65 | 17.53 | **−3.13** |
+| video20 | 10.40 | 12.05 | +1.65 | **video19** | 11.67 | 11.21 | **−0.46** |
+
+**判读**：
+- v7r-v3 **整体明确优于 R2**（+1.55/+1.82 dB，SSIM/LPIPS 同向），证明 v3 的架构改进
+  （统计先验 KV + 三路 Query + MatrixRWKV）相对 R2 的 Concat-KV 是有效提升；
+- **两个例外**：video30（R2 反而高 3.13 dB）与 video19（高 0.46）——R2 的**逐帧差分/流对齐**
+  在这两段上更稳；video19/20 两者都停在 ~11–12，再次指向 §6.6 的信息/分布上限；
+- ⚠️ 口径说明：R2 的 ep60 也是**在泄漏的 SDSD val 上选的 best**，故两者起点同为「拟合」，
+  该对比只说明「同训练/评估协议下架构优劣」，不构成跨论文 SOTA 对比。
+
+**剩余**：`--frac 0.33` 改全帧（10 视频共 1084 帧）复核抽样无偏性（可选）。
+**工作量**：基线 ✅ 完成（约 27 min / 1632 s）。
 
 ---
 
@@ -773,7 +801,7 @@ DID 上 LPIPS≈0.52 偏高（感知质量欠佳）。
 | 6.12 | Pair45/长 offset 序列泛化 | 🟠 P1 | 中 | 6.4 |
 | 6.7 | 输入利用率不足 | 🟡 P2 | 中 | 无 |
 | 6.8 | KV 先验纯度 | 🟡 P2 | 低 | 配合重训 |
-| 6.10 | 评估口径对比 | 🟡 P2 | 低 | 无 |
+| 6.10 | 评估口径对比 | 🟡 P2 | ✅ R2 基线完成 | — |
 | 6.13 | 统计 KV vs Concat KV 未直接对照 | 🟡 P2 | 中 | 无 |
 | 6.1 | 门控增益消融 | 🟡 P2 | 低 | 无 |
 
@@ -825,6 +853,7 @@ position 配对修复了训练对齐，但 **pair45 的绝对难度（可能是�
 | `eval_checkpoint.py` | 统一协议全量评估 (SDSD, `--pairing`) |
 | `eval_did_v7r.py` | **DID 跨域评估 (frac 抽样, VGG-LPIPS)** |
 | `scripts/diag_v7r_v3_branches.py` | **分支解耦诊断 (§5.5.6)** |
+| `scripts/diag_v7r_v3_query_semantics.py` | **三路 Query 语义诊断 (§6.3)** |
 | `scripts/dataset_luminance.py` | **数据集亮度分布统计 (§6.6)** |
 | `scripts/monitor_golf_v7r_v3.sh` | 监视终端脚本 (含门控诊断) |
 | `docs/v7/03-v7r-v3-design.md` | 本文档 |
@@ -847,6 +876,10 @@ python eval_checkpoint.py --ckpt outputs/golf_v7r_v3_pospair/best.pth \
 # DID 跨域评估 (frac 抽样)
 python eval_did_v7r.py --ckpt outputs/golf_v7r_v3_pospair/best.pth \
     --tag v7r_v3_pospair-ep55-DID-frac33 --frac 0.33 --out_json outputs/did_metrics.json
+
+# DID 同口径基线 (R2, §6.10)
+python eval_did_v7r.py --model r2 --ckpt outputs/golf_r2/best.pth \
+    --tag r2-ep60-DID-frac33 --frac 0.33 --out_json outputs/did_metrics.json
 
 # 诊断 (无需重训)
 PYTHONPATH=. python scripts/diag_v7r_v3_branches.py --ckpt outputs/golf_v7r_v3_pospair/best.pth
