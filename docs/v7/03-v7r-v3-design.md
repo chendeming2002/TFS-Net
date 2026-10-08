@@ -879,61 +879,100 @@ position 配对修复了训练对齐，但 **pair45 的绝对难度（可能是�
 
 **验证方式**：三种 KV 的 DID + 留出集指标对照。
 
-### 6.14 📋 Phase A 预注册评估协议 (2026-10-08)
+### 6.14 📋 Phase A 预注册评估协议 (2026-10-08, 修订 v2)
 
 **目的**: 在训练开始前锁定判据, 防止事后选择性解读.
 
-#### 变体说明
+#### 变体说明与参照系
 
-| 配置 | 唯一变量 | 对应问题 |
-|------|----------|---------|
-| `phaseA` (base) | 无 (等同 pospair) | 复现基线 |
-| `phaseA_m` | `motion_aware_diff=true`, k=5 | §6.8: ctx_diff 噪声主导 |
-| `phaseA_l` | `use_lowfreq_L=true`, k=16 | §6.2-B: Branch-L 监督分工 |
-| `phaseA_holdout` | `exclude_seqs=10 test seqs`, holdout val | §6.4: 数据泄漏 |
+| 配置 | 唯一变量 | 训练集 | val 口径 | 对应问题 |
+|------|----------|--------|----------|---------|
+| `pospair_quick` (参照) | 无 | 70 seq (含 test) | test/low-light 1244帧 (泄漏) | 已运行基线 |
+| `phaseA_m` | `motion_aware_diff=true`, k=5 | 70 seq | 同上 (泄漏) | §6.8: ctx_diff 噪声主导 |
+| `phaseA_l` | `use_lowfreq_L=true`, k=16 | 70 seq | 同上 (泄漏) | §6.2-B: Branch-L 监督分工 |
+| `phaseA_holdout` | `exclude_seqs=10`, holdout val | **60 seq** | holdout 10 seq (无泄漏) | §6.4: 数据泄漏量化 |
 
-#### 主指标
+**数据归因说明**:
+- `phaseA_m` / `phaseA_l` 与 `pospair_quick` **同口径** (70 seq, 同 val, 同种子), PSNR 可直接比较.
+- `phaseA_holdout` 训练集缩小 (~14%), val 口径完全不同 → PSNR **不可**与前三者比较. 它是独立轨道.
+- 所有 SDSD val 数值均应标注"泄漏集相对参照, 不可对外报告"; 论文数字须来自 holdout 协议的 60ep 收敛模型.
 
-- **PSNR** (test/low-light, position 配对): 主要排名指标
-- **Y_M ↔ Y_N / Y_L ↔ Y_N 输出余弦相似度**: 分支分化诊断 (越低越好)
-  - 用 `scripts/diag_v7r_v3_branches.py --ckpt <best.pth>` 在 val 上计算
+#### 参照基线 (pospair_quick ep5, 泄漏集)
 
-#### 预注册判据 (DID: Decision If Different)
+| 指标 | 值 | 来源 |
+|------|----|------|
+| PSNR | **21.92 dB** | eval_checkpoint.py (position, 1244帧) |
+| Y_M↔Y_N cosine (pair50/45/19 avg) | **0.9967** | (0.9976+0.9974+0.9951)/3 |
+| Y_L↔Y_N cosine (pair50/45/19 avg) | **0.9975** | (0.9984+0.9964+0.9978)/3 |
+| motion absAttn_M ratio (shift4) | **1.000** | diag_query_semantics, 三序列均值 |
+| dark absAttn_L ratio (gamma2) | **0.916** | (0.879+1.009+0.859)/3 |
 
-**H-m** (`phaseA_m` vs `phaseA` base):
-- ✅ 通过: PSNR ≥ base − 0.05 dB **且** Y_M↔Y_N 余弦下降 ≥ 0.02
-- ❌ 无效: 否则 (motion_aware_diff 开关无用, 不采用)
+#### 预注册判据 (DID: Decision If Different, 修订后自洽版)
 
-**H-l** (`phaseA_l` vs `phaseA` base):
-- ✅ 通过: PSNR ≥ base − 0.05 dB **且** Y_L↔Y_N 余弦下降 ≥ 0.02
-- ❌ 无效: 否则 (低频监督无效, 不采用)
+> **⚠️ 注意**: 5ep 时 LayerScale 级联期仍处于线性增长阶段 (scale_N/L/M ≈ 0.026–0.033),
+> 余弦若未达标不应立即否决 — 见"三段式假阴性保护"。
 
-**H-holdout** (`phaseA_holdout`):
-- 不与 base 比较 PSNR (训练/评估口径不同)
-- 记录: holdout PSNR vs 泄漏口径 PSNR 的差值 (量化泄漏幅度)
-- 用途: 为后续所有变体提供无泄漏口径
+**H-m** (`phaseA_m` ep5 vs 参照):
+- **机制判据** (主判据): `motion` 条件下 absAttn_M 为三路最大 **且** absAttn_M/base ratio ≥ **1.5**
+  - 测量: `diag_v7r_v3_query_semantics.py` motion 行, 三序列均值
+  - 基线当前: 1.000 → 目标: ≥ 1.5 (表明 M 路感知到位移)
+- **性能判据**: PSNR ep5 ≥ **21.87 dB** (= 21.92 − 0.05)
+- **分化判据**: Y_M↔Y_N cosine ≤ **0.9767** (= 0.9967 − 0.02)
+  - 分化判据在 5ep 有假阴性风险; 见三段式保护
 
-#### 训练策略
+**H-l** (`phaseA_l` ep5 vs 参照):
+- **机制判据** (主判据): `dark` 条件下 absAttn_L 为三路最大 **且** absAttn_L/base ratio ≥ **2.0**
+  - 基线当前: 0.916 → 目标: ≥ 2.0 (表明 L 路感知到亮度变化)
+- **性能判据**: PSNR ep5 ≥ **21.87 dB**
+- **分化判据**: Y_L↔Y_N cosine ≤ **0.9775** (= 0.9975 − 0.02)
 
-§6.11 建议**一次综合改造重训** (减少总训练次数). 但 6.6 (极暗增广) 和 6.9 (感知损失) 尚未实现.
-当前已实现 A.1 (holdout) / A.2 (motion) / A.3 (lowfreq-L).
+**H-holdout** (`phaseA_holdout` ep5):
+- 不判通过/失败, 只记录:
+  - ep5 holdout PSNR (无泄漏口径)
+  - 泄漏幅度 = pospair_quick ep5 PSNR − holdout ep5 PSNR (预期 0.3–1.0 dB)
+- 用途: 为后续所有变体提供无泄漏 PSNR 参照
 
-**推荐路线 (两选一, 需用户确认)**:
+#### 三段式假阴性保护
 
-> **Option 1 — 单变量 5ep 快速探索** (低风险, 约 40h 总计):
->   ```
->   phaseA_m --stop_epoch 5   (≈8h)
->   phaseA_l --stop_epoch 5   (≈8h)
->   ```
->   目的: 确认 5ep 时余弦是否已开始分化, 决定是否值得 60ep;
->   缺点: 5ep 结论不等于 60ep 收敛结论.
->
-> **Option 2 — 一次 combined 60ep** (§6.11 路线, 约 76h):
->   需新建 `phaseA_combined.yaml`, 同时开启 `motion_aware_diff=true` +
->   `use_lowfreq_L=true` + `exclude_seqs` (holdout 协议);
->   优: 一次得到收敛结论; 缺: 两开关同时开, 无法单独归因.
->
-> **当前磁盘余量**: ~27 GB; 单次 60ep ≈ 575 MB checkpoints, 可支撑 4 次以上.
+| 状态 | 机制判据 | 分化余弦 | 处置 |
+|------|:--:|:--:|------|
+| 强通过 | ✅ 达标 | ✅ 达标 | 该 toggle 进 60ep 合并 run |
+| 机制活化 / 余弦未达 | ✅ 达标 | ❌ 未达 | 续训 10–15ep 再判 (防 LayerScale 期假阴性, 约 16–24h) |
+| 机制未活化 | ❌ 未达 | 任意 | 判为失败, 不续训, 转 §6.6 / §6.9 路线 |
+
+> "续训 10–15ep"判定: 若机制判据仍达标且余弦达标 → 通过; 否则失败.
+
+> **机制判据的局限 (诚实声明)**: `kv_shared` 被三路共享, `motion_aware_diff` 改的是 KV 里的
+> `s_diff`, 因此信号会同时进入三路; 「M 路 ratio 最大」实际检验的是 **query_M 是否把该信号
+> 转成自己的输出** (即分化), 而非"信号只到 M". 该判据是 proxy, 故与 cosine 判据**并列**而非替代.
+
+#### 完整探针读出命令 (三点矩阵)
+
+```bash
+# 运行每个探针后执行以下三条 (X = m / l / holdout)
+OUT=outputs/golf_v7r_v3_phaseA_X
+
+# 1. PSNR (泄漏集相对参照)
+python eval_checkpoint.py --ckpt $OUT/best.pth \
+    --model v7r_v3 --pairing position --tag phaseA_X-ep5
+
+# 2. 分支余弦 + 融合权重
+PYTHONPATH=. python scripts/diag_v7r_v3_branches.py \
+    --ckpt $OUT/best.pth
+
+# 3. 机制判据 (absAttn_M motion / absAttn_L dark)
+PYTHONPATH=. python scripts/diag_v7r_v3_query_semantics.py \
+    --ckpt $OUT/best.pth \
+    --out_dir $OUT/query_semantics_ep5
+```
+
+#### 60ep 合并 run 条件与轨道
+
+- 若 H-m 或 H-l 通过 (或续训后通过):
+  - 新建 `phaseA_combined.yaml`: 开启通过的开关 + **70 seq + 泄漏集 val** (与 pospair 同条件)
+  - 参照: pospair ep55 PSNR (DID 20.17, SDSD 24.30); 判据 PSNR ≥ pospair − 0.1 dB
+  - holdout 是**正交独立轨道**: 终局"论文模型" = 通过的开关全开 + holdout 协议 60ep
+- 若两者都失败: 进入 §6.6 (极暗增广) + §6.9 (感知损失) 实现阶段
 
 ---
 
