@@ -54,19 +54,33 @@ Stage 4: feat_aligned + feat_center_rwkv → 2×NAFBlock → Upsample3x3 → to_
 1. **RWKV 用对地方**: 帧级语义建模（非像素级对齐）— 延续 v7 已验证的正确方向
 2. **矩阵状态是必需品**: 升级到 RWKV-5/6 的 $S \in \mathbb{R}^{d \times d}$ 矩阵状态
 3. **恢复三分支结构**: N/L/M 退化分解是 Golf 家族的核心物理先验
-4. **RWKV 多头 = 退化分量分离**: 多头自然对应 N/L/M，不需要独立的 TCA 解耦模块
+4. ~~**RWKV 多头 = 退化分量分离**: 多头自然对应 N/L/M，不需要独立的 TCA 解耦模块~~
+   > ⚠️ **本原则未落地，且最终被放弃**（详见 §2.2 勘误与 §十三）：
+   > ①「多头按 N/L/M 分工」从未实现——6 头共享同一 `base_decay` 初始化与共享 LoRA，
+   > 无角色归纳偏置，实测训练后头间无分化；
+   > ② v7r-v3 最终**反而**重新引入了独立的解耦模块 `TripleQueryTCA`（三路查询）。
 5. **参数预算 ≤ 3.5M**: 与 Golf R2 可比，RTX 4090 可训练
+   > ⚠️ v7r-v2 = 3.51M，v7r-v3 = 3.75M，**均已突破 3.5M**。
 
 ### 2.2 架构总览: **Golf v7-R (RWKV-Redesigned)**
+
+> ⚠️ **本节描述的是 v7r-v2 的原始设计蓝图，与实际落地代码存在若干偏差**。
+> v7r-v2 与 v7r-v3 的**真实** Stage 3/5 已分叉：
+> - **v7r-v2**：Stage 3 = `SpatialSummary → MatrixRWKV×2 → ContextDecomposition → BranchFiLM`；Stage 5 = `AdaptiveFusion`（复用 R2）
+> - **v7r-v3**：Stage 3 = `TripleQueryTCA`（三路 Q × 统计先验 KV，含 `MatrixRWKVInjector` 门控）；
+>   Stage 5 = `V7RFusion`（替代 AdaptiveFusion，修 §11.2 毁图缺陷）
+>
+> **v7r-v3 的精确结构图与逐条数据流审查见 §十三**（`golfnet_v7r_v3.py` 实码）。
+> 下方 ASCII 图保留作 v2 设计存档；其中已知与代码不符处已就地标注。
 
 ```
 Input [B, T=5, 3, H, W]
   │
   ├── Stage 1: SharedEncoder (逐帧独立, 0.41M, 复用 Golf R2)
-  │   → F1 [B,T,32,H,W]
+  │   → F1 [B,T,32,H,W]        ⚠️ 计算后丢弃 (v2/v3 均只用 F2)
   │   → F2 [B,T,64,H/2,W/2]
   │
-  ├── Stage 2: PixelTemporalAttention (像素级对齐, ~0.01M)
+  ├── Stage 2: PixelTemporalAttention (像素级对齐, 实测 ~0.024M)
   │   Feature Proj: 1×1 conv 64→128
   │   3D Conv (窗口=3): 捕捉局部运动
   │   → feat_aligned [B, 128, H/2, W/2]
@@ -74,13 +88,16 @@ Input [B, T=5, 3, H, W]
   ├── Stage 3: MatrixRWKV-TCA ⭐ (帧级多头, 矩阵状态, ~0.55M)
   │   │
   │   │  3.1 Spatial Summary (替代 Global Pool)
-  │   │      AdaptiveAvgPool2d(4) → [B, T, C, 4, 4]
-  │   │      Flatten → [B, T, C×16] → Linear → [B, T, D=192]
+  │   │      ⚠️ 文档原写 AvgPool2d(4)→C×16；实际所有 config 用 spatial_size=2
+  │   │      AdaptiveAvgPool2d(2) → [B, T, C, 2, 2]
+  │   │      Flatten → [B, T, C×4] → Linear(512→192) (实测 0.099M, 非 0.39M)
   │   │
   │   │  3.2 Multi-Head Matrix RWKV (h=6, d=32, 矩阵状态 32×32)
-  │   │      ┌─ Head 1-2: Noise-aware (衰减快, 捕捉 i.i.d. 噪声模式)
-  │   │      ├─ Head 3-4: Illumination-aware (衰减慢, 捕捉光照趋势)
-  │   │      └─ Head 5-6: Motion-aware (动态衰减, 运动自适应)
+  │   │      【展望·未实现】以下 Head 角色分工仅为设计愿景，代码无支撑：
+  │   │      ┌─ Head 1-2: Noise-aware (衰减快, 捕捉 i.i.d. 噪声模式)   ❌ 无代码
+  │   │      ├─ Head 3-4: Illumination-aware (衰减慢, 捕捉光照趋势)     ❌ 无代码
+  │   │      └─ Head 5-6: Motion-aware (动态衰减, 运动自适应)           ❌ 无代码
+  │   │      实际: 6 头共享统一 base_decay=0.5 初始化 + 共享 LoRA，无角色偏置
   │   │      每头: s_t = s_{t-1} · diag(w_t) + v_t^T · k_t
   │   │      w_t 数据相关 (RWKV-6 风格)
   │   │      → frame_ctx [B, T, D=192]
@@ -88,11 +105,13 @@ Input [B, T=5, 3, H, W]
   │   │  3.3 Context Decomposition (替代 TCA 解耦)
   │   │      Linear 192 → {ctx_N(64), ctx_L(64), ctx_M(64)}
   │   │      Ortho regularization on {ctx_N, ctx_L, ctx_M}
+  │   │      ⚠️ v3 中此模块被 TripleQueryTCA 取代 (见 §十二/§十三)
   │   │
   │   │  3.4 Spatial Injection (FiLM per branch)
   │   │      ctx_X → scale_X, shift_X (1×1 conv)
   │   │      F_X = feat_aligned * (1 + scale_X) + shift_X
   │   │      → F_N, F_L, F_M [B, 128, H/2, W/2]
+  │   │      ⚠️ v3 中 FiLM 被 TCA 的 LayerScale 残差 (F=feat+attn·scale) 取代
   │
   ├── Stage 4: 三分支处理 (~1.85M, 复用/简化 Golf R2)
   │   ├── BranchN (去噪, ~0.60M): 简化版, 2×NAFBlock + Upsample3x3
@@ -102,13 +121,18 @@ Input [B, T=5, 3, H, W]
   │
   └── Stage 5: AdaptiveFusion (~0.06M, 复用 Golf R2)
       → O [B, 3, H, W]
+      ⚠️ v3 替换为 V7RFusion (12.9K, 不在 RGB 上跑 NAFBlock)
 ```
 
-**总参数预算: ~2.9M** (SharedEncoder 0.41 + PixelTemp 0.01 + MatrixRWKV-TCA 0.55 + 三分支 1.85 + Fusion 0.06)
+**总参数预算（历史值，已被实测取代）**: 原文写 ~2.9M；§2.5 明细表为 ~3.6M；
+实测 **v7r-v2 = 3.51M / v7r-v3 = 3.75M**。原文 2.9M 系漏算 §2.5 明细项所致，以实测为准。
 
 ### 2.3 Stage 3 详细设计: MatrixRWKV-TCA
 
 这是本次重新设计的核心创新——用矩阵状态 RWKV 替代原有 TCA-RWKV 的解耦机制。
+> ⚠️ 本节描述的 `SpatialSummary → MatrixRWKV → ContextDecomposition → BranchFiLM`
+> 是 **v7r-v2** 的 Stage 3。v7r-v3 已将解耦改由 `TripleQueryTCA`（三路查询 × 统计先验 KV）
+> 承担，MatrixRWKV 降级为门控注入（见 §十二/§十三）。
 
 #### 2.3.1 Spatial Summary (替代 Global Pool)
 
@@ -218,9 +242,10 @@ class MatrixRWKVTimeMix(nn.Module):
             w_t = w[:, t]           # [B, H, d]
             
             # 状态更新: S = S · diag(w) + v^T · k (外积)
-            state = state * w_t.unsqueeze(-2) + torch.einsum('bhd,bhe->bhde', v_t, k_t)
-            # 读取: o = r · S → [B, H, d]
-            o_t = torch.einsum('bhd,bhde->bhe', r_t, state)
+            # state[b,h,i,j]: i=value 通道, j=key 通道
+            state = state * w_t.unsqueeze(-2) + torch.einsum('bhi,bhj->bhij', v_t, k_t)
+            # 读取: r 与 key 维 (j) 收缩, 输出在 value 维 (i) → [B, H, d]
+            o_t = torch.einsum('bhj,bhij->bhi', r_t, state)
             outputs.append(o_t)
         
         out = torch.stack(outputs, dim=1)  # [B, T, H, d]
@@ -233,6 +258,12 @@ class MatrixRWKVTimeMix(nn.Module):
         
         return out
 ```
+
+> ⚠️ **勘误 (2026-10-08)**：上面代码块的读出索引已按 §8.7 修正为
+> `einsum('bhj,bhij->bhi')`（r 与 **key 维** 收缩，输出在 value 维）。
+> 本文档 09-28 首版原文曾误写为 `einsum('bhd,bhde->bhe')`（r 与 value 维收缩），
+> 该错误已在 §8.7 于实现中修正，但 §2.3.2 原文直到本次才回改。**代码一直是正确版**。
+> 另：`ReLUSquaredMLP` 与 `MatrixRWKVBlock` 实际实现补加了 LayerScale(0.1)，见 §11.1。
 
 **与当前 RWKV-4 对比**:
 
@@ -289,6 +320,11 @@ class MatrixRWKVBlock(nn.Module):
 #### 2.3.5 Context Decomposition (替代 TCA 解耦)
 
 **核心思想**: RWKV 多头输出自然包含不同退化分量的信息，通过线性投影 + 正交正则化，显式解耦为 N/L/M 三个上下文向量。
+
+> ⚠️ **前提修正（2026-10-08）**：「RWKV 多头输出自然包含不同退化分量的信息」是**未经验证的假设**——
+> 6 头共享统一初始化与共享 LoRA，无任何迫使头间分化的机制（见 §2.6 #2）。
+> 本模块（`ContextDecomposition`）仅适用于 **v7r-v2**；v7r-v3 已用 `TripleQueryTCA`
+> 的显式三路查询替代，不再依赖多头分工（见 §十二/§十三）。
 
 ```python
 class ContextDecomposition(nn.Module):
@@ -365,20 +401,50 @@ class BranchFiLM(nn.Module):
 
 ### 2.5 完整参数预算
 
-| 模块 | 参数量 | 说明 |
-|------|--------|------|
-| SharedEncoder | 0.41M | 复用 Golf R2，不修改 |
-| feature_proj | 0.01M | 1×1 conv 64→128 |
-| PixelTemporalAttention | 0.01M | 3D conv 窗口=3 |
-| SpatialSummary | 0.39M | AvgPool(4) + Linear |
-| MatrixRWKVBlock ×2 | 0.77M | V6 矩阵状态, 6 头 |
-| ContextDecomposition | 0.04M | 线性解耦 N/L/M |
-| BranchFiLM ×3 | 0.05M | 上下文注入 |
-| BranchN (简化) | 0.60M | 2×NAFBlock + Upsample |
-| BranchL (简化) | 0.55M | Retinex + 2×NAFBlock |
-| BranchM (简化) | 0.70M | Flow + Conf + 2×NAFBlock |
-| AdaptiveFusion | 0.06M | 复用 Golf R2 |
-| **总计** | **~3.6M** | 与 Golf R2 (3.50M) 可比 |
+| 模块 | 设计预估 | 实测 (v2) | 说明 |
+|------|--------|--------|------|
+| SharedEncoder | 0.41M | 0.410M | 复用 Golf R2，不修改 |
+| feature_proj | 0.01M | 0.008M | 1×1 conv 64→128 |
+| PixelTemporalAttention | 0.01M | 0.024M | 3D conv 窗口=3 (文档低估 2.4×) |
+| SpatialSummary | 0.39M | **0.099M** | ⚠️ 文档按 AvgPool(4)；实际 config 用 `spatial_size=2` |
+| MatrixRWKVBlock ×2 | 0.77M | 0.853M | V6 矩阵状态, 6 头 (+LayerScale) |
+| ContextDecomposition | 0.04M | 0.037M | 线性解耦 N/L/M (v3 被 TripleQueryTCA 取代 0.374M) |
+| BranchFiLM ×3 | 0.05M | 0.050M | 上下文注入 (v3 被 TCA LayerScale 取代) |
+| BranchN (简化) | 0.60M | 0.556M | 2×NAFBlock + Upsample |
+| BranchL (简化) | 0.55M | 0.609M | Retinex + 2×NAFBlock |
+| BranchM (简化) | 0.70M | **0.804M** | Flow + Conf + 2×NAFBlock (超预估 15%) |
+| AdaptiveFusion | 0.06M | 0.063M | 复用 Golf R2 (v3 换 V7RFusion 0.0129M) |
+| **总计** | **~3.6M** | **3.51M** | v2 实测；v3 = **3.75M**，突破 §2.1 的 ≤3.5M 原则 |
+
+> 注：§2.2 overview 曾写 ~2.9M，与本表 ~3.6M 及实测 3.51/3.75M 均不一致；
+> 以实测为准，overview 已就地标注。
+
+### 2.6 设计 vs 实现偏差审计 (2026-10-08)
+
+> 本节对照 §2.2/§2.3 的设计声明与 `models/golf_v7r/` 实码逐条核实，
+> 列出**所有**已知偏差及其类型，供后续论文/复用参考。
+
+| # | 声明处 | 设计声称 | 代码事实 | 判定 | 记录 |
+|:--:|--------|----------|----------|:--:|:--:|
+| 1 | §2.2 3.1 / §2.3.1 | `AdaptiveAvgPool2d(4)`，C×16→Linear，0.39M | 代码类默认 `spatial_size=4`，但**4 个 config 全设 2** → C×4，Linear(512→192)，0.099M | ⚠️ 静默简化 | 本次 ✅ |
+| 2 | §2.2 3.2 / §2.1-4 | Head 1-2 噪声(快) / 3-4 光照(慢) / 5-6 运动(动态) | **未实现**：6 头共享 `base_decay=0.5` 统一初始化 + 共享 LoRA，无角色分组。实测初始每头 w=exp(−exp(0.5))≈0.1923、std=0；**60-epoch 末 (ep55) ckpt `base_decay` 头间均值**：block0 spread=0.038、block1 spread=0.010（对应 w 仅差 0.014/0.004），**仍无 1-2/3-4/5-6 分组分化** | ❌ **纯愿景，零实现** | 本次 ✅ |
+| 3 | §2.3.2 伪代码 | `o = einsum('bhd,bhde->bhe')`（r×value 维） | 实码为 `('bhj,bhij->bhi')`（r×**key** 维），§8.7 已勘误 | 📄 文档错、代码对 | §8.7 + 本次回改 §2.3.2 |
+| 4 | §2.3.4 | `MatrixRWKVBlock` = LN+TimeMix+LN+ChannelMix | 实码额外加 LayerScale(0.1)（修激活爆炸 std 5.6→523） | ✅ 良性复杂化 | §11.1 |
+| 5 | §2.2 3.3/3.4 & Stage5 | `ContextDecomposition` + `BranchFiLM` + `AdaptiveFusion` | v3 替换为 `TripleQueryTCA` + `MatrixRWKVInjector` + `V7RFusion` | 🔄 v3 重构 | 03 文档 + §十二/§十三 |
+| 6 | §2.1-5 | 参数预算 ≤3.5M | v2=3.51M / v3=3.75M | ⚠️ 已突破 | 本次 ✅ |
+| 7 | §2.2 3.2 | 多头 = 退化分量分离（§2.1-4） | v3 解耦实际由 `TripleQueryTCA` 三路查询承担，与 RWKV 头无关；MatrixRWKV 降级为「时序态势→统计 KV 门控」 | ❌ 设计意图被绕开 | §十二/§十三 |
+
+**结论**：骨架（Stage 1/2/3.3/3.4/4、v2 的 Stage 5）落地率高（≈85% 按条目），
+文档明示的简化（去 var_map、±1 两帧、去 F1 skip）均如实执行。
+两处「实现优于文档」（#3 读出索引、#4 LayerScale）属先实现后补文档的良性偏差，有数值留痕。
+**唯一「高调宣称却零实现」的核心卖点是 #2（Head 1-6 快/慢/动态衰减分工）**——
+既无分组初始化，也无结构约束，实际靠「统一初始化 + 共享 LoRA + 训练自由分化」运行。
+
+> **处置决定 (2026-10-08)**：#2 **降级为「展望 (Future Work)」**。
+> 即日起 02 文档中所有 Head 1-2/3-4/5-6 角色分工的表述一律标注为**设计愿景、未实现**，
+> 不再作为已落地的架构特性引用；论文/复用需引用时按「未来工作」处理。
+> 若后续要转回实现，需补齐：分组 `base_decay` 初始化（快/慢/动态三档）+ 独立衰减分支
+> + 控制变量的头分工消融。其余 #1/#5/#6/#7 均为有据演进或已知简化，影响可控。
 
 ---
 
@@ -388,7 +454,7 @@ class BranchFiLM(nn.Module):
 |------|-------------------|-----------------------------|
 | **RWKV 版本** | RWKV-4 向量状态, 单头 | RWKV-6 矩阵状态, 6 多头 |
 | **RWKV 操作层级** | 像素级 (逐像素时序) | 帧级 (全局语义) |
-| **退化解耦** | 独立 TCA 模块 (三查询解耦) | RWKV 多头 + 线性投影 + 正交约束 |
+| **退化解耦** | 独立 TCA 模块 (三查询解耦) | v2: RWKV 多头 + 线性投影 + 正交约束（多头分工未实现，见 §2.6 #2）<br>v3: `TripleQueryTCA` 显式三路查询 |
 | **帧间对齐** | TCA 隐式对齐 | 显式 PixelTemporalAttention + BranchM flow |
 | **衰减机制** | 固定 | 数据相关 (RWKV-6 LoRA) |
 | **状态容量** | ~128 标量 | ~6,144 标量 (48×) |
@@ -633,6 +699,10 @@ o_t = r_t · S_t
 **处置**: 首轮 (buggy) 训练产物移至 `outputs/golf_v7r_buggy_v1/`，
 修正后于 12:34 重启训练 (PID 2411612)。为便于复现，`recurrence()`
 被抽为 `@staticmethod`，可直接单元测试。
+
+> **补记 (2026-10-08)**：`outputs/golf_v7r_buggy_v1/` 已于本次清理中删除
+> （属未对齐训练的实验产物），其训练日志备份保留在
+> `outputs/_archive_v7r_namepaired/golf_v7r_v3/`。
 
 ---
 
@@ -967,3 +1037,179 @@ v7r-v2 用「单路 MatrixRWKV + 事后 ContextDecomposition 线性投影」解�
 方案 C (门控 + per-channel FiLM) 列入后续消融计划。
 文件: `models/golf_v7r/triple_query_tca.py`, `models/golf_v7r/golfnet_v7r_v3.py`,
 `configs/golf_v7r_v3.yaml`, `train_golf_v7r_v3.py`, `scripts/monitor_golf_v7r_v3.sh`。
+
+---
+
+## 十三、Golf v7-R 结构图与数据流审查 (v7r-v3, 2026-10-08)
+
+> 本节针对**当前在训/已训的 v7r-v3**（§12, `golfnet_v7r_v3.py`）绘制真实结构图，
+> 并逐条审查每个数据流的**动机**与**作用**是否合理。§2.2 的 ASCII 图描述的是更早的
+> v7r-v2 设计，二者在 Stage 3 已分叉（v2 = `ContextDecomposition`+FiLM；v3 = `TripleQueryTCA`）。
+> 图中形状以 `B=1, T=5, H=W=256`、`encoder_channels=[32,64,128]`、`spatial_size=2` 为例。
+
+### 13.1 主结构 (Stage 级)
+
+```mermaid
+graph TD
+    X["Input X<br/>[B, T=5, 3, H, W]"] --> ENC
+
+    subgraph STAGE1["Stage 1 · SharedEncoder (逐帧独立, 权重共享)"]
+        ENC["SharedEncoder<br/>(每帧 x[:,t] 独立前向)"]
+        ENC --> F1["F1 [B,32,H,W]<br/>❌ 未使用"]
+        ENC --> F2["F2 [B,64,H/2,W/2]"]
+        ENC --> F3["F3 [B,128,H/4,W/4]<br/>❌ 未使用"]
+    end
+
+    F2 --> F2SEQ["堆叠 → F2_seq<br/>[B, T, 64, H/2, W/2]"]
+    F2SEQ --> PROJ["feature_proj<br/>Conv2d 1×1, 64→128"]
+    PROJ --> FPROJ["feats_proj<br/>[B, T, 128, H/2, W/2]"]
+
+    subgraph STAGE2["Stage 2 · 像素级时序对齐"]
+        FPROJ --> PTA["PixelTemporalAttentionSimple<br/>window=3 (仅 center±1)<br/>3DConv + 3 路时序软权"]
+        PTA --> FALIGN["feat_aligned<br/>[B, 128, H/2, W/2]<br/>(中心帧对齐特征)"]
+    end
+
+    subgraph STAGE3["Stage 3 · Matrix RWKV + Triple Query TCA ⭐"]
+        FPROJ --> SS["SpatialSummary<br/>AvgPool(2×2) → Linear<br/>[B,T,128,H/2,W/2]→[B,T,192]"]
+        SS --> TOK["frame_tokens<br/>[B, T, 192]"]
+        TOK --> MRK["MatrixRWKVBlock ×2<br/>+ rwkv_norm<br/>(矩阵状态 6头×32×32)"]
+        MRK --> CTX["ctx [B, T, 192]<br/>(仅 center 帧被下游使用)"]
+
+        FALIGN --> TCA["TripleQueryTCA"]
+        FPROJ --> TCA
+        CTX --> TCA
+        TCA --> FNLM["F_N / F_L / F_M<br/>各 [B, 128, H/2, W/2]"]
+        TCA --> ORTHO["ortho_loss (scalar)"]
+    end
+
+    subgraph STAGE4["Stage 4 · 三分支解码"]
+        FNLM --> BN["BranchN<br/>(F_N) → Y_N [B,3,H,W]"]
+        FNLM --> BL["BranchL<br/>(F_L, X_center) → Y_L<br/>Retinex: R·L^γ"]
+        FNLM --> BM["BranchM<br/>(F_M, F2_seq) → Y_M<br/>flow + conf 对齐 center±1"]
+    end
+
+    XC["X_center = X[:,2]<br/>[B, 3, H, W]"] --> BL
+    XC --> FUSE
+    BN --> FUSE["V7RFusion<br/>softmax 逐像素权重<br/>(Y_N,Y_L,Y_M,X_c)"]
+    BL --> FUSE
+    BM --> FUSE
+    FUSE --> OT["final O_t<br/>[B, 3, H, W]"]
+
+    OT --> LOSS["GolfV7RLoss<br/>L1(final,GT)<br/>+0.1·Σ L1(Y_k,GT)<br/>+0.01·ortho"]
+    BN --> LOSS
+    BL --> LOSS
+    BM --> LOSS
+    ORTHO --> LOSS
+    GT["GT [B,3,H,W]"] --> LOSS
+```
+
+### 13.2 Stage 3 内部 (TripleQueryTCA + MatrixRWKVInjector)
+
+```mermaid
+graph TD
+    subgraph QPATH["三路 Query (退化先验)"]
+        FA["feat_aligned<br/>[B,128,H/2,W/2]"] --> QN["query_N<br/>LN2d+1×1 → Q_N"]
+        FA --> QL["query_L → Q_L"]
+        FA --> QM["query_M → Q_M"]
+    end
+
+    subgraph KVPATH["共享 KV (统计先验 + MatrixRWKV 门控)"]
+        FS["feats_proj<br/>[B,T,128,h,w]"] --> CM["ctx_mean<br/>mean_t (含 center)"]
+        FS --> CS["ctx_smooth<br/>avg_pool2d(mean, k=7)<br/>(空间低通)"]
+        FS --> CD["ctx_diff<br/>max_t |center − F_t|<br/>(运动差分)"]
+
+        CTXC["ctx_center = ctx[:,2]<br/>[B, 192]"] --> INJ["MatrixRWKVInjector<br/>to_gate: Linear 192→3C<br/>(零初始化, 单零)"]
+        INJ --> GATE["gate [B, 3C]<br/>→ view [B,3,C,1,1]"]
+        CM --> SM["s_mean = ctx_mean·(1+g_0)"]
+        CS --> SSM["s_smooth = ctx_smooth·(1+g_1)"]
+        CD --> SD["s_diff = ctx_diff·(1+g_2)"]
+        GATE --> SM
+        GATE --> SSM
+        GATE --> SD
+        SM --> KVP["kv_proj<br/>Conv 3C→C 1×1 + LN2d"]
+        SSM --> KVP
+        SD --> KVP
+        KVP --> KV["kv_shared<br/>[B,128,H/2,W/2]"]
+    end
+
+    QN --> AN["attn_N = RWKVSpatialHead(Q_N, kv_shared)<br/>(BiWKV × 4 方向)"]
+    QL --> AL["attn_L = RWKVSpatialHead(Q_L, kv_shared)"]
+    QM --> AM["attn_M = RWKVSpatialHead(Q_M, kv_shared)"]
+    KV --> AN
+    KV --> AL
+    KV --> AM
+
+    FA --> RSN["raw_N = feat_aligned + attn_N·scale_N<br/>(scale_N 零初始化)"]
+    AN --> RSN
+    FA --> RSL["raw_L = feat_aligned + attn_L·scale_L"]
+    AL --> RSL
+    FA --> RSM["raw_M = feat_aligned + attn_M·scale_M"]
+    AM --> RSM
+
+    RSN --> ON["out_norm_N → F_N"]
+    RSL --> OL["out_norm_L → F_L"]
+    RSM --> OM["out_norm_M → F_M"]
+    ON --> OR["_ortho_loss(F_N,F_L,F_M)<br/>= mean |cos| 两两"]
+    OL --> OR
+    OM --> OR
+```
+
+### 13.3 张量形状与消费者对照
+
+| 张量 | 形状 (B=1) | 生产者 | 消费者 | 用途 |
+|------|-----------|--------|--------|------|
+| `X` | [1,5,3,256,256] | 数据加载 | Encoder, X_center | 输入 |
+| `F2_seq` | [1,5,64,128,128] | SharedEncoder | feature_proj, BranchM | 逐帧 1/2 特征 |
+| `feats_proj` | [1,5,128,128,128] | feature_proj | PixelTemporal, SpatialSummary, TCA(KV) | 共享中间特征 |
+| `feat_aligned` | [1,128,128,128] | PixelTemporal | TCA(Q + 残差基) | 中心帧像素对齐 |
+| `frame_tokens`/`ctx` | [1,5,192] | SpatialSummary→MatrixRWKV | TCA(Injector, 仅 center) | 帧级时序态势 |
+| `Q_N/L/M` | [1,128,128,128] | query_* | attn_* | 三路差异化查询 |
+| `kv_shared` | [1,128,128,128] | kv_proj | attn_* (共享) | 统计先验 KV |
+| `F_N/L/M` | [1,128,128,128] | TCA | BranchN/L/M | 三分支输入特征 |
+| `Y_N/L/M` | [1,3,256,256] | Branch* | Fusion, Loss | 三支 RGB 输出 |
+| `O_t`/`final` | [1,3,256,256] | V7RFusion | Loss, 评估 | 最终输出 |
+
+### 13.4 逐条数据流审查
+
+**✅ 动机与作用均合理的连线**
+
+| # | 数据流 | 动机 | 作用 | 判读 |
+|---|--------|------|------|------|
+| 1 | 每帧独立过 Encoder → `F2_seq` | 避免过早耦合时序 | 空间特征与时序建模解耦 | ✅ 合理，延续 v7 正确方向 |
+| 2 | `feats_proj` 一处生产、三处消费 | 统一 128 维工作宽度 | 供对齐/帧级摘要/空间统计复用 | ✅ 合理 |
+| 3 | 三路 `Q` 从 `feat_aligned` 提取 | 显式 N/L/M 退化先验 | 从像素对齐特征生成差异化查询 | ✅ 继承 R4 有效设计 |
+| 4 | 共享 KV 保留 H×W 空间结构 | R4 教训：全时序 KV 放大噪声 | 运动/静态区域可用不同 KV 响应 | ✅ 合理，优于 v2 帧级 token |
+| 5 | `ctx_mean/smooth/diff` 三统计先验 | 物理对应 噪声/光照/运动 | 天然去噪 + 物理语义 | ✅ 合理（命名见 ⚠️3/⚠️5） |
+| 6 | MatrixRWKV `ctx` 门控 KV（方案 B） | 时序态势选择退化假设 | 单零注入，梯度自 step1 可达 | ✅ 合理，已消除「死计算」 |
+| 7 | `F_k = out_norm(feat_aligned + attn·scale)` | 残差保留对齐特征 | scale=0 恒等起步，防破坏 | ✅ 合理（⾒ ⚠️6 关于正交） |
+| 8 | BranchL 接收 `X_center` 做 Retinex | 光照需要原图亮度 | `R=X/L`, `Y=R·L^γ`，物理先验 | ✅ 合理 |
+| 9 | BranchM 接收 `F2_seq` 做对齐 | 运动需要邻帧特征 | flow + conf 门控（center±1） | ✅ 合理（见 ⚠️1） |
+| 10 | Fusion 零初始化 + 恒等 refine + γ=0 | 起点为三分支均值 | 不破坏分支输出 | ✅ 合理（修正 §11.2 缺陷） |
+
+**⚠️ 值得质疑 / 低效 / 语义偏差的连线**
+
+| # | 位置 | 观察 | 风险 | 建议 |
+|---|------|------|------|------|
+| ⚠️1 | Stage 2 + BranchM | **T=5 但两条像素时序路径只吃 center±1 三帧**，首尾帧 t=0/4 在像素级完全未参与 | 5 帧输入被当 3 帧用，信息浪费 | 放宽 window 到全 5 帧，或明确论证首尾帧无益 |
+| ⚠️2 | `ctx` [B,T,192] | MatrixRWKV **递推跑满 T，但输出只用 center 一帧**给 Injector | 输出侧利用率 1/5；其余帧只影响状态递推 | 考虑对全序列做 mean/attention 池化后再注入 |
+| ⚠️3 | `_ctx_diff` | `max_t |center−F_t|` 在极暗场景可能**由噪声主导而非位移** | 运动先验被噪点污染 | 加 conf/方差加权，或对 diff 先做空间平滑 |
+| ⚠️4 | `_ctx_mean` | 均值**含 center 帧本身**，而 Q 也来自 center | KV 与 Q 同源信息回环，削弱「先验」独立性 | 改为 leave-one-out 均值（排除 center） |
+| ⚠️5 | `_ctx_smooth` | 实为对时间均值的**空间**低通 (avg_pool2d)，非时序慢变 | 命名易被误解；光照的时序趋势未显式建模 | 更名或补时序低通 |
+| ⚠️6 | `_ortho_loss` | 三路 `scale=0` 时输出相同，ortho 初始≈1.0，靠 out_norm 独立仿射打破；且正交与「三路都回归同一 GT」的 L1 分支监督可能冲突 | 解耦目标与保真目标互相拉扯 | 消融 λ_ortho；观察收敛后 ortho 是否真下降（文档 §六.1 已列） |
+| ⚠️7 | Encoder 输出 | **F1、F3 计算后完全丢弃** | 0.41M encoder 只用了 F2 一路 | 去掉多余尺度或引入 F1 skip（R2 曾有） |
+| ⚠️8 | SpatialSummary | `spatial_size=2`（4 位置），而非 §2.3.1 设计的 4×4=16 | 帧级 token 空间信息受限 | 已知裁剪（§8.2），按需消融 |
+
+### 13.5 结论
+
+- **主干数据流的动机与作用总体自洽**：编码/时序解耦 → 先验 KV → 三路解耦 → 物理分支 → 稳定融合，
+  每一跳都有明确设计依据，且关键模块（Injector、LayerScale、Fusion）均以零初始化保证「恒等起步」。
+- **主要待改进点集中在「输入利用率」与「统计先验纯度」**：⚠️1/⚠️2（T=5 被局部降为 3）、
+  ⚠️3/⚠️4（KV 先验被噪声或 center 污染）、⚠️7（encoder 仅用 1/3 输出）。
+  这些不改变主干正确性，但直接决定 T=5 与三分支容量能否被充分利用，建议列为下一轮消融项。
+- 本审查基于源码逐行核对（`golfnet_v7r_v3.py` / `triple_query_tca.py` / `matrix_rwkv.py` /
+  `spatial_summary.py` / `fusion_v7r.py` / `pixel_temporal.py` / `encoder.py`），
+  未改变任何代码；如需，可将 ⚠️1–⚠️8 转为带基线的受控消融实验。
+- **后续进展（2026-10-08）**：position 配对全量训练完成后的**未解决问题汇总与解决思路**
+  见 `docs/v7/03-v7r-v3-design.md` §六；其中实验证明**分支特征已正交 (ortho≈0.003) 但三路
+  RGB 输出余弦 0.99–0.9995（未分化）**（03 §5.5.6 / §6.2），是当前最关键的架构层问题。
+  ⚠️1/⚠️2/⚠️7 归入 03 §6.7，⚠️3/⚠️4/⚠️5 归入 03 §6.8。

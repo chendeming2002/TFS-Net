@@ -1,5 +1,8 @@
 seed: 42
 output_dir: outputs/golf_v7r_v3
+# ⚠️ 历史 name 配对配置 (已被 position 配对取代, 见 golf_v7r_v3_pospair.yaml)
+# outputs/golf_v7r_v3/ 目录已清理, 原 resume 路径失效, 故移除 resume。
+# dataset 缺少 pairing 字段 → 默认 "name" (错位协议), 仅作历史参考, 勿用于新训练。
 
 dataset:
   train_input_root: /home/a1005/yzy/dataset/SDSD/indoor/input
@@ -30,8 +33,6 @@ train:
   val_interval: 5
   grad_clip: 1.0
   lpips_net: vgg
-  resume: outputs/golf_v7r_v3/latest.pth
-  resume_best_psnr: 19.71   # ep5 历史 best
 
 loss:
   w_branch_N: 0.1

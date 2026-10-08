@@ -3,8 +3,8 @@
 # 用法: watch -n 5 bash scripts/monitor_golf_v7r_v3.sh   或直接 bash scripts/monitor_golf_v7r_v3.sh
 # 参照 R4/monitor.sh 的一体化监视风格, 适配 v7r 日志格式
 
-LOG=/home/a1005/25/TFS-Net/outputs/golf_v7r_v3/train.log
-OUT_DIR=/home/a1005/25/TFS-Net/outputs/golf_v7r_v3
+LOG=/home/a1005/25/TFS-Net/outputs/golf_v7r_v3_pospair/train.log
+OUT_DIR=/home/a1005/25/TFS-Net/outputs/golf_v7r_v3_pospair
 
 if [ ! -f "$LOG" ]; then
   echo "══════════ 等待日志 [$LOG] ══════════"

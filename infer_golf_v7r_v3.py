@@ -5,7 +5,7 @@
 (Pred | GT | Low-light 横向拼接), 用于定性评估。
 
 用法:
-    python infer_golf_v7r_v3.py --ckpt outputs/golf_v7r_v3/best.pth \
+    python infer_golf_v7r_v3.py --ckpt outputs/golf_v7r_v3_pospair/best.pth \
         --seqs pair19 pair45 --out_dir outputs/golf_v7r_v3_inference
 """
 import argparse

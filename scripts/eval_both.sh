@@ -14,11 +14,13 @@ $PY -u eval_checkpoint.py \
     --tag "v7-ep10"
 
 echo ""
-echo "===== [2/2] Golf v7r ep5 ====="
+echo "===== [2/2] Golf v7r-v3 (pospair) best=ep55 ====="
+# 注: 原 v7r (outputs/golf_v7r/) 目录已清理; 当前对照改用 v7r-v3 pospair best。
 $PY -u eval_checkpoint.py \
-    --ckpt outputs/golf_v7r/epoch_005.pth \
-    --model v7r \
-    --tag "v7r-ep5"
+    --ckpt outputs/golf_v7r_v3_pospair/best.pth \
+    --model v7r_v3 \
+    --pairing position \
+    --tag "v7r_v3-pospair-ep55"
 
 echo ""
 echo "===== 汇总 (微平均 / 宏平均) ====="
