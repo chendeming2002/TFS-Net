@@ -938,9 +938,16 @@ position 配对修复了训练对齐，但 **pair45 的绝对难度（可能是�
 |------|:--:|:--:|------|
 | 强通过 | ✅ 达标 | ✅ 达标 | 该 toggle 进 60ep 合并 run |
 | 机制活化 / 余弦未达 | ✅ 达标 | ❌ 未达 | 续训 10–15ep 再判 (防 LayerScale 期假阴性, 约 16–24h) |
-| 机制未活化 | ❌ 未达 | 任意 | 判为失败, 不续训, 转 §6.6 / §6.9 路线 |
+| 机制显著改善但未达 | ⚠️ H-l: dark ≥ 1.3 且 L 最大 | 任意 | 同"续训 10–15ep 再判"(边界规则, 见下) |
+| 机制未活化 | ❌ 未达 (H-l: dark < 1.3) | 任意 | 判为失败, 不续训, 转 §6.6 / §6.9 路线 |
 
 > "续训 10–15ep"判定: 若机制判据仍达标且余弦达标 → 通过; 否则失败.
+
+> **边界规则动机 (H-l 专属)**: `use_lowfreq_L` 是**监督侧**改动, 靠训练塑形, 比 H-m 的
+> **输入侧**信号慢一拍; 要求 5ep 从 0.916 跳到 ≥2.0 (≈2.2×) 偏激进。故对 H-l 增设边界:
+> 若 `dark` 的 absAttn_L ∈ [1.3, 2.0) 且为三路最大 → 并入"续训"分支而非直接判失败。
+> H-m 阈值维持 ≥1.5 不变 (输入侧信号在 step1 即生效, 无慢拍问题)。
+> **此边界规则已于 2026-10-08 在训练启动前锁入预注册。**
 
 > **机制判据的局限 (诚实声明)**: `kv_shared` 被三路共享, `motion_aware_diff` 改的是 KV 里的
 > `s_diff`, 因此信号会同时进入三路; 「M 路 ratio 最大」实际检验的是 **query_M 是否把该信号
@@ -973,6 +980,32 @@ PYTHONPATH=. python scripts/diag_v7r_v3_query_semantics.py \
   - 参照: pospair ep55 PSNR (DID 20.17, SDSD 24.30); 判据 PSNR ≥ pospair − 0.1 dB
   - holdout 是**正交独立轨道**: 终局"论文模型" = 通过的开关全开 + holdout 协议 60ep
 - 若两者都失败: 进入 §6.6 (极暗增广) + §6.9 (感知损失) 实现阶段
+
+#### 探针启动命令 (串行, 单卡)
+
+> ⚠️ 单卡 (RTX 4090) 必须**串行**; 且 `mkdir -p` 须先于 nohup 重定向
+> (重定向在 shell 层先于 python 的 `os.makedirs` 执行, 目录不存在则当场失败)。
+
+```bash
+cd /home/a1005/25/TFS-Net
+PY=/home/a1005/anaconda3/envs/ptorch/bin/python
+
+# 目录预建 (重定向目标)
+mkdir -p outputs/golf_v7r_v3_phaseA_m \
+         outputs/golf_v7r_v3_phaseA_l \
+         outputs/golf_v7r_v3_phaseA_holdout
+
+# 串行封装: m → l → holdout (m/l 是关键路径, 先出裁决数据)
+nohup bash -c "
+  $PY train_golf_v7r_v3.py --config configs/golf_v7r_v3_phaseA_m.yaml --stop_epoch 5 \
+      > outputs/golf_v7r_v3_phaseA_m/train.log 2>&1 &&
+  $PY train_golf_v7r_v3.py --config configs/golf_v7r_v3_phaseA_l.yaml --stop_epoch 5 \
+      > outputs/golf_v7r_v3_phaseA_l/train.log 2>&1 &&
+  $PY train_golf_v7r_v3.py --config configs/golf_v7r_v3_phaseA_holdout.yaml --stop_epoch 5 \
+      > outputs/golf_v7r_v3_phaseA_holdout/train.log 2>&1
+" > outputs/probe_all.log 2>&1 &
+echo "serial probe chain pid=$!"
+```
 
 ---
 
