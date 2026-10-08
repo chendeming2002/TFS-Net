@@ -1,0 +1,78 @@
+## Phase A 变体 _holdout: 干净留出集协议 (§6.4)
+##
+## 唯一变量 vs golf_v7r_v3_phaseA.yaml:
+##   dataset.exclude_seqs  = 官方 test 10 序列 (从 train 中剔除)
+##   dataset.val_holdout_seqs = 被剔除的序列 (作为【帧级不相交】的干净验证集)
+##
+## 目的: 消除 §6.4 指出的数据泄漏 (train 与 test/low-light 帧级重叠).
+## 注意: 本变体同时改了 train 集合与 val 集合, 故其 PSNR **不可**与 base 直接比较;
+##   它用于给后续所有 Phase A 变体提供「无泄漏」的评估口径 (见 §6.14 的评估协议).
+## 预期: holdout PSNR 会比泄漏口径低 0.3~1.0 dB (这才是真实泛化).
+
+seed: 42
+output_dir: outputs/golf_v7r_v3_phaseA_holdout
+
+dataset:
+  train_input_root: /home/a1005/yzy/dataset/SDSD/indoor/input
+  train_target_root: /home/a1005/yzy/dataset/SDSD/indoor/GT
+  val_input_root:   /home/a1005/yzy/dataset/SDSD/test/low-light
+  val_target_root:  /home/a1005/yzy/dataset/SDSD/test/GT
+  window_size: 5
+  crop_size: 256
+  num_workers: 0
+  pairing: position
+  exclude_seqs:
+    - pair19
+    - pair20
+    - pair24
+    - pair40
+    - pair45
+    - pair50
+    - pair55
+    - pair60
+    - pair64
+    - pair70
+  val_holdout_seqs:
+    - pair19
+    - pair20
+    - pair24
+    - pair40
+    - pair45
+    - pair50
+    - pair55
+    - pair60
+    - pair64
+    - pair70
+
+model:
+  num_frames: 5
+  encoder_channels: [32, 64, 128]
+  feature_dim: 128
+  rwkv_dim: 192
+  rwkv_heads: 6
+  rwkv_head_size: 32
+  rwkv_blocks: 2
+  spatial_size: 2
+  branch_channels: 128
+  motion_aware_diff: false
+  diff_smooth_kernel: 5
+
+train:
+  batch_size: 1
+  epochs: 60
+  lr: 0.0004
+  weight_decay: 0.01
+  log_interval: 100
+  val_interval: 5
+  grad_clip: 1.0
+  lpips_net: vgg
+
+loss:
+  w_branch_N: 0.1
+  w_branch_L: 0.1
+  w_branch_M: 0.1
+  lambda_ortho: 0.01
+  w_ssim: 0.0
+  branch_warmup_epochs: 5
+  use_lowfreq_L: false
+  lowfreq_kernel: 16

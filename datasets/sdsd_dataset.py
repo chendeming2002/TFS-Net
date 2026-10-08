@@ -60,7 +60,7 @@ def read_image(path):
 
 class SDSDDataset(Dataset):
     def __init__(self, input_root, target_root, window_size=5, mode="train", crop_size=256,
-                 max_seqs=None, pairing="name"):
+                 max_seqs=None, pairing="name", exclude_seqs=None):
         """SDSD 数据集。
 
         pairing:
@@ -68,6 +68,12 @@ class SDSDDataset(Dataset):
           - "position": 按 sorted 位置配对 (官方 SDSD/LLVE_STCD 约定)。SDSD 每序列
             LQ/GT 帧数相等但文件名区间可能整体偏移 (如 pair45 偏移 60), 此时按位置
             配对才是时间对齐的; 按文件名配对会错位。
+
+        exclude_seqs:
+          - 需从训练集中剔除的序列名列表 (留出集协议, §6.4)。用于把官方 test 的 10 个
+            序列 (pair19/20/24/40/45/50/55/60/64/70) 从 indoor/input 中排除, 使
+            train 与 val (test/low-light) 帧级不相交, 消除数据泄漏。
+          - None 或 [] → 不排除 (历史行为)。
         """
         super().__init__()
         self.input_root = input_root
@@ -80,12 +86,23 @@ class SDSDDataset(Dataset):
         if pairing not in ("name", "position"):
             raise ValueError("pairing must be 'name' or 'position', got {!r}".format(pairing))
         self.pairing = pairing
+        self.exclude_seqs = set(exclude_seqs) if exclude_seqs else set()
         self.samples = self._build_samples()
         self._frame_cache = _FrameLRU(capacity=24)
 
     def _build_samples(self):
         samples = []
         seq_names = sorted([name for name in os.listdir(self.input_root) if os.path.isdir(os.path.join(self.input_root, name))])
+        removed = [name for name in seq_names if name in self.exclude_seqs]
+        if removed:
+            seq_names = [name for name in seq_names if name not in self.exclude_seqs]
+        missing = self.exclude_seqs - set(removed)
+        if missing:
+            raise RuntimeError(
+                "exclude_seqs contains names absent from {}: {}".format(
+                    self.input_root, sorted(missing)))
+        if not seq_names:
+            raise RuntimeError("No sequences left after exclude_seqs in {}".format(self.input_root))
         if self.max_seqs is not None:
             seq_names = seq_names[: self.max_seqs]
         for seq_name in seq_names:

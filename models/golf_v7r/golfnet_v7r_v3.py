@@ -50,13 +50,15 @@ class GolfNet_v7r_v3(nn.Module):
                  rwkv_head_size: int = 32,
                  rwkv_blocks: int = 2,
                  spatial_size: int = 2,
-                 branch_channels: int = 128):
+                 branch_channels: int = 128,
+                 motion_aware_diff: bool = False,
+                 diff_smooth_kernel: int = 5):
         super().__init__()
         self.num_frames = num_frames
         self.C1, self.C2, self.C3 = encoder_channels
         self.feature_dim = feature_dim
         self.rwkv_dim = rwkv_dim
-
+        self.motion_aware_diff = motion_aware_diff
         # ========== Stage 1: Encoder (逐帧独立) ==========
         self.encoder = SharedEncoder(
             in_channels=3,
@@ -84,7 +86,9 @@ class GolfNet_v7r_v3(nn.Module):
 
         # 3.3 Triple Query TCA (三路查询 × 共享统计先验 KV)
         self.triple_query_tca = TripleQueryTCA(
-            feat_dim=feature_dim, rwkv_dim=rwkv_dim, num_frames=num_frames
+            feat_dim=feature_dim, rwkv_dim=rwkv_dim, num_frames=num_frames,
+            motion_aware_diff=motion_aware_diff,
+            diff_smooth_kernel=diff_smooth_kernel,
         )
 
         # ========== Stage 4: 三分支 ==========

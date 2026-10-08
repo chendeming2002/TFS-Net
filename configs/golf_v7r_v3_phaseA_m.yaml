@@ -1,0 +1,55 @@
+## Phase A 变体 _m: motion_aware_diff=ON (§6.8)
+##
+## 唯一变量 vs golf_v7r_v3_phaseA.yaml: model.motion_aware_diff = true
+## 预注册假设 (H-m): 对邻帧先空间低通再求差, 提升 ctx_diff 的「位移/噪声敏感度比」,
+##   使 M 路输出与 N/L 的余弦相似度下降 (脱离「另一个 N 路」).
+## 判据 (DID, 见 docs/v7/03 §6.14):
+##   holdout val PSNR ≥ base - 0.05 dB (不显著劣化)
+##   AND M-vs-N 输出余弦 下降 ≥ 0.02 (相对 base)
+##   否则记为 null.
+
+seed: 42
+output_dir: outputs/golf_v7r_v3_phaseA_m
+
+dataset:
+  train_input_root: /home/a1005/yzy/dataset/SDSD/indoor/input
+  train_target_root: /home/a1005/yzy/dataset/SDSD/indoor/GT
+  val_input_root:   /home/a1005/yzy/dataset/SDSD/test/low-light
+  val_target_root:  /home/a1005/yzy/dataset/SDSD/test/GT
+  window_size: 5
+  crop_size: 256
+  num_workers: 0
+  pairing: position
+
+model:
+  num_frames: 5
+  encoder_channels: [32, 64, 128]
+  feature_dim: 128
+  rwkv_dim: 192
+  rwkv_heads: 6
+  rwkv_head_size: 32
+  rwkv_blocks: 2
+  spatial_size: 2
+  branch_channels: 128
+  motion_aware_diff: true
+  diff_smooth_kernel: 5
+
+train:
+  batch_size: 1
+  epochs: 60
+  lr: 0.0004
+  weight_decay: 0.01
+  log_interval: 100
+  val_interval: 5
+  grad_clip: 1.0
+  lpips_net: vgg
+
+loss:
+  w_branch_N: 0.1
+  w_branch_L: 0.1
+  w_branch_M: 0.1
+  lambda_ortho: 0.01
+  w_ssim: 0.0
+  branch_warmup_epochs: 5
+  use_lowfreq_L: false
+  lowfreq_kernel: 16

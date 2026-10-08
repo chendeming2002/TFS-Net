@@ -866,6 +866,62 @@ position 配对修复了训练对齐，但 **pair45 的绝对难度（可能是�
 
 **验证方式**：三种 KV 的 DID + 留出集指标对照。
 
+### 6.14 📋 Phase A 预注册评估协议 (2026-10-08)
+
+**目的**: 在训练开始前锁定判据, 防止事后选择性解读.
+
+#### 变体说明
+
+| 配置 | 唯一变量 | 对应问题 |
+|------|----------|---------|
+| `phaseA` (base) | 无 (等同 pospair) | 复现基线 |
+| `phaseA_m` | `motion_aware_diff=true`, k=5 | §6.8: ctx_diff 噪声主导 |
+| `phaseA_l` | `use_lowfreq_L=true`, k=16 | §6.2-B: Branch-L 监督分工 |
+| `phaseA_holdout` | `exclude_seqs=10 test seqs`, holdout val | §6.4: 数据泄漏 |
+
+#### 主指标
+
+- **PSNR** (test/low-light, position 配对): 主要排名指标
+- **Y_M ↔ Y_N / Y_L ↔ Y_N 输出余弦相似度**: 分支分化诊断 (越低越好)
+  - 用 `scripts/diag_v7r_v3_branches.py --ckpt <best.pth>` 在 val 上计算
+
+#### 预注册判据 (DID: Decision If Different)
+
+**H-m** (`phaseA_m` vs `phaseA` base):
+- ✅ 通过: PSNR ≥ base − 0.05 dB **且** Y_M↔Y_N 余弦下降 ≥ 0.02
+- ❌ 无效: 否则 (motion_aware_diff 开关无用, 不采用)
+
+**H-l** (`phaseA_l` vs `phaseA` base):
+- ✅ 通过: PSNR ≥ base − 0.05 dB **且** Y_L↔Y_N 余弦下降 ≥ 0.02
+- ❌ 无效: 否则 (低频监督无效, 不采用)
+
+**H-holdout** (`phaseA_holdout`):
+- 不与 base 比较 PSNR (训练/评估口径不同)
+- 记录: holdout PSNR vs 泄漏口径 PSNR 的差值 (量化泄漏幅度)
+- 用途: 为后续所有变体提供无泄漏口径
+
+#### 训练策略
+
+§6.11 建议**一次综合改造重训** (减少总训练次数). 但 6.6 (极暗增广) 和 6.9 (感知损失) 尚未实现.
+当前已实现 A.1 (holdout) / A.2 (motion) / A.3 (lowfreq-L).
+
+**推荐路线 (两选一, 需用户确认)**:
+
+> **Option 1 — 单变量 5ep 快速探索** (低风险, 约 40h 总计):
+>   ```
+>   phaseA_m --stop_epoch 5   (≈8h)
+>   phaseA_l --stop_epoch 5   (≈8h)
+>   ```
+>   目的: 确认 5ep 时余弦是否已开始分化, 决定是否值得 60ep;
+>   缺点: 5ep 结论不等于 60ep 收敛结论.
+>
+> **Option 2 — 一次 combined 60ep** (§6.11 路线, 约 76h):
+>   需新建 `phaseA_combined.yaml`, 同时开启 `motion_aware_diff=true` +
+>   `use_lowfreq_L=true` + `exclude_seqs` (holdout 协议);
+>   优: 一次得到收敛结论; 缺: 两开关同时开, 无法单独归因.
+>
+> **当前磁盘余量**: ~27 GB; 单次 60ep ≈ 575 MB checkpoints, 可支撑 4 次以上.
+
 ---
 
 ## 七、文件清单

@@ -31,7 +31,6 @@ import torch.nn.functional as F
 from typing import Tuple, Dict
 
 from models.modules.blocks import LayerNorm2d
-# 复用 R4 已验证的线性复杂度 RWKV 空间注意力头 (BiWKV + 4 方向扫描)
 from models.golf_r4.tca_rwkv import RWKVSpatialHead
 
 
@@ -80,12 +79,19 @@ class TripleQueryTCA(nn.Module):
     """
 
     def __init__(self, feat_dim: int = 128, rwkv_dim: int = 192,
-                 num_frames: int = 5):
+                 num_frames: int = 5, motion_aware_diff: bool = False,
+                 diff_smooth_kernel: int = 5):
         super().__init__()
         self.feat_dim = feat_dim
         self.rwkv_dim = rwkv_dim
         self.num_frames = num_frames
         self.center_idx = num_frames // 2
+
+        # Phase A.2 开关: 运动感知差分 (§6.8).
+        # False → 历史行为 (max|center - F_t|, 被噪声主导, §6.3 实测 3.19× vs 1.53×)。
+        # True  → 对 center / 邻帧先做空间低通再求差, 抑制高频噪声、保留结构位移。
+        self.motion_aware_diff = motion_aware_diff
+        self.diff_smooth_kernel = int(diff_smooth_kernel) if diff_smooth_kernel else 0
 
         # ========== 1. 三路查询生成 (从 PixelTemporal 空间特征) ==========
         self.query_N = nn.Sequential(
@@ -140,10 +146,31 @@ class TripleQueryTCA(nn.Module):
         return F.avg_pool2d(mean_feat, kernel_size=7, stride=1, padding=3)
 
     def _ctx_diff(self, feats_seq: torch.Tensor) -> torch.Tensor:
-        """运动差分: 中心帧 vs 邻帧的最大绝对差 (位移区域响应最强)"""
-        center = feats_seq[:, self.center_idx]
-        diffs = [ (center - feats_seq[:, t]).abs()
-                  for t in range(feats_seq.shape[1]) if t != self.center_idx ]
+        """运动差分: 中心帧 vs 邻帧最大绝对差.
+
+        motion_aware_diff=False (默认/历史行为):
+            直接对原始特征求差 → 高频噪声主导 (§6.3 实测 noise 3.19× vs shift16 1.53×)
+
+        motion_aware_diff=True (Phase A.2 开关):
+            先对 center 和每个邻帧各自做空间低通 (avg_pool, kernel=diff_smooth_kernel),
+            再求差 → 抑制 i.i.d. 高频噪声, 保留低频结构位移信号.
+        """
+        if self.motion_aware_diff and self.diff_smooth_kernel > 1:
+            k = self.diff_smooth_kernel
+            pad = k // 2
+            center_s = F.avg_pool2d(feats_seq[:, self.center_idx],
+                                    kernel_size=k, stride=1, padding=pad)
+            diffs = []
+            for t in range(feats_seq.shape[1]):
+                if t == self.center_idx:
+                    continue
+                neigh_s = F.avg_pool2d(feats_seq[:, t],
+                                       kernel_size=k, stride=1, padding=pad)
+                diffs.append((center_s - neigh_s).abs())
+        else:
+            center = feats_seq[:, self.center_idx]
+            diffs = [(center - feats_seq[:, t]).abs()
+                     for t in range(feats_seq.shape[1]) if t != self.center_idx]
         return torch.stack(diffs, dim=0).max(dim=0).values
 
     def forward(self, feat_spatial: torch.Tensor,

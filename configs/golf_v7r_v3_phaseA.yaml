@@ -1,0 +1,60 @@
+## Phase A 基线配置 (预注册, 2026-10-08)
+##
+## 变量矩阵 (所有开关默认 off, 等同 pospair 历史行为):
+##
+##   开关                   | 对应 §  | 本文件 | _m | _l | _holdout
+##   ---------------------- | ------- | ------ | -- | -- | --------
+##   motion_aware_diff      | §6.8    |  off   | on | -- |  off
+##   use_lowfreq_L          | §6.2-B  |  off   | -- | on |  off
+##   exclude_seqs (holdout) | §6.4    |  off   | -- | -- |  on
+##
+## 本文件 = 纯 position-paired baseline (无任何新开关), 用于验证 pospair 可复现.
+## 各变体分别在 _m / _l / _holdout 后缀配置中打开对应开关.
+
+seed: 42
+output_dir: outputs/golf_v7r_v3_phaseA_base
+
+dataset:
+  train_input_root: /home/a1005/yzy/dataset/SDSD/indoor/input
+  train_target_root: /home/a1005/yzy/dataset/SDSD/indoor/GT
+  val_input_root:   /home/a1005/yzy/dataset/SDSD/test/low-light
+  val_target_root:  /home/a1005/yzy/dataset/SDSD/test/GT
+  window_size: 5
+  crop_size: 256
+  num_workers: 0
+  pairing: position
+  # exclude_seqs: null    # off → 历史行为 (train 含官方 test 10 序列 → 泄漏)
+  # val_holdout_seqs: null
+
+model:
+  num_frames: 5
+  encoder_channels: [32, 64, 128]
+  feature_dim: 128
+  rwkv_dim: 192
+  rwkv_heads: 6
+  rwkv_head_size: 32
+  rwkv_blocks: 2
+  spatial_size: 2
+  branch_channels: 128
+  motion_aware_diff: false    # Phase A.2 off
+  diff_smooth_kernel: 5
+
+train:
+  batch_size: 1
+  epochs: 60
+  lr: 0.0004
+  weight_decay: 0.01
+  log_interval: 100
+  val_interval: 5
+  grad_clip: 1.0
+  lpips_net: vgg
+
+loss:
+  w_branch_N: 0.1
+  w_branch_L: 0.1
+  w_branch_M: 0.1
+  lambda_ortho: 0.01
+  w_ssim: 0.0
+  branch_warmup_epochs: 5
+  use_lowfreq_L: false        # Phase A.3 off
+  lowfreq_kernel: 16

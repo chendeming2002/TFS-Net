@@ -40,7 +40,11 @@ def main():
 
     # Dataset
     pairing = cfg['dataset'].get('pairing', 'name')
+    exclude_seqs = cfg['dataset'].get('exclude_seqs') or None
+    val_holdout_seqs = cfg['dataset'].get('val_holdout_seqs')
     logger.info(f"Dataset pairing mode: {pairing}")
+    if exclude_seqs:
+        logger.info(f"Train exclude_seqs (hold-out protocol): {exclude_seqs}")
     train_ds = SDSDDataset(
         input_root=cfg['dataset']['train_input_root'],
         target_root=cfg['dataset']['train_target_root'],
@@ -48,6 +52,7 @@ def main():
         mode="train",
         crop_size=cfg['dataset']['crop_size'],
         pairing=pairing,
+        exclude_seqs=exclude_seqs,
     )
     train_loader = DataLoader(
         train_ds, batch_size=cfg['train']['batch_size'], shuffle=True,
@@ -56,13 +61,32 @@ def main():
     )
     logger.info(f"Train dataset: {len(train_ds)} samples, {len(train_loader)} batches")
 
-    val_ds = SDSDDataset(
-        input_root=cfg['dataset']['val_input_root'],
-        target_root=cfg['dataset']['val_target_root'],
-        window_size=cfg['dataset']['window_size'],
-        mode="val", crop_size=None,
-        pairing=pairing,
-    )
+    # 验证集: 默认用 test/low-light (与训练帧级重叠 -> 泄漏, §6.4);
+    # 若配置 val_holdout_seqs, 则改用被排除的序列作为【干净留出集】(帧级不相交)。
+    if val_holdout_seqs:
+        logger.info(f"Val = hold-out sequences from train_root: {val_holdout_seqs}")
+        val_ds = SDSDDataset(
+            input_root=cfg['dataset']['train_input_root'],
+            target_root=cfg['dataset']['train_target_root'],
+            window_size=cfg['dataset']['window_size'],
+            mode="val", crop_size=None,
+            pairing=pairing,
+            max_seqs=None,
+        )
+        # 仅保留留出序列的样本 (帧级与训练不相交)
+        val_ds.samples = [s for s in val_ds.samples if s['sequence'] in set(val_holdout_seqs)]
+        if not val_ds.samples:
+            raise RuntimeError(f"val_holdout_seqs {val_holdout_seqs} matched no samples")
+        logger.info(f"Val(hold-out) samples: {len(val_ds.samples)} "
+                    f"(seqs: {sorted(set(s['sequence'] for s in val_ds.samples))})")
+    else:
+        val_ds = SDSDDataset(
+            input_root=cfg['dataset']['val_input_root'],
+            target_root=cfg['dataset']['val_target_root'],
+            window_size=cfg['dataset']['window_size'],
+            mode="val", crop_size=None,
+            pairing=pairing,
+        )
     val_loader = DataLoader(
         val_ds, batch_size=1, shuffle=False,
         num_workers=cfg['dataset'].get('num_workers', 0), pin_memory=False,
