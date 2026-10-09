@@ -196,14 +196,28 @@ def main():
     p.add_argument("--seq_root", default="/home/a1005/yzy/dataset/SDSD/indoor/input")
     p.add_argument("--seqs", nargs="+", default=["pair50", "pair45", "pair19"])
     p.add_argument("--out_dir", default="outputs/golf_v7r_v3_query_semantics")
+    p.add_argument("--config", default=None,
+                   help="训练配置文件; 用于按训练时的 model 段重建模型。"
+                        "⚠️ 必须传: motion_aware_diff 等开关【无参数】, 默认构造会静默跑基线前向路径。")
     args = p.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    model = GolfNet_v7r_v3().to(dev).eval()
+    model_kwargs = {}
+    if args.config:
+        import yaml
+        with open(args.config) as f:
+            model_kwargs = (yaml.safe_load(f) or {}).get("model", {}) or {}
+        build_note = (f"model built from {args.config}"
+                      f" (motion_aware_diff={model_kwargs.get('motion_aware_diff', False)},"
+                      f" diff_smooth_kernel={model_kwargs.get('diff_smooth_kernel', 5)})")
+    else:
+        build_note = "model built with DEFAULTS (motion_aware_diff=False) — 若 ckpt 来自开启该开关的探针, 结论无效"
+    model = GolfNet_v7r_v3(**model_kwargs).to(dev).eval()
     ck = torch.load(args.ckpt, map_location=dev, weights_only=False)
     model.load_state_dict(ck["model_state_dict"])
     print(f"RESULT loaded epoch {ck.get('epoch')} from {args.ckpt}")
+    print(f"RESULT {build_note}")
 
     capture = Capture(model.triple_query_tca)
     summary = {}

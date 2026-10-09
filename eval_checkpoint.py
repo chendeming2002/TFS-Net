@@ -28,19 +28,20 @@ except ImportError:
     _HAS_LPIPS = False
 
 
-def build_model(name):
+def build_model(name, model_kwargs=None):
+    model_kwargs = model_kwargs or {}
     if name == 'v7':
         from models.golf_v7 import GolfNet_v7 as M
-        return M()
+        return M(**model_kwargs)
     elif name == 'v7r':
         from models.golf_v7r import GolfNet_v7r as M
-        return M()
+        return M(**model_kwargs)
     elif name == 'v7r_v3':
         from models.golf_v7r import GolfNet_v7r_v3 as M
-        return M()
+        return M(**model_kwargs)
     elif name == 'r2':
         from models.golf import GolfNet as M
-        return M()
+        return M(**model_kwargs)
     raise ValueError(name)
 
 
@@ -54,7 +55,23 @@ def main():
                    help='结果追加写入的 JSON 文件 (方便综合比较)')
     p.add_argument('--pairing', default='name', choices=['name', 'position'],
                    help='LQ/GT 配对方式: name=文件名交集(历史), position=sorted 位置(官方约定)')
+    p.add_argument('--config', default=None,
+                   help='训练配置文件; 用于按训练时的 model 段重建模型。'
+                        '⚠️ 不传则用默认构造: motion_aware_diff 等无参数前向开关会静默失效, '
+                        '对开启该开关的探针会评到基线路径 (影响 |Δfinal| 量级, 通常可忽略, 但非严格口径)。')
     args = p.parse_args()
+
+    model_kwargs = {}
+    if args.config:
+        import yaml
+        with open(args.config) as f:
+            model_kwargs = (yaml.safe_load(f) or {}).get('model', {}) or {}
+        print(f'Model kwargs from {args.config}: '
+              f'motion_aware_diff={model_kwargs.get("motion_aware_diff", False)}, '
+              f'diff_smooth_kernel={model_kwargs.get("diff_smooth_kernel", 5)}', flush=True)
+    elif args.model == 'v7r_v3':
+        print('WARNING: 未传 --config, 以默认 model kwargs 构建 (motion_aware_diff=False); '
+              '若 ckpt 来自开启该开关的探针, 评估路径与训练路径不一致', flush=True)
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -66,7 +83,7 @@ def main():
     loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=0)
 
     # ---- model ----
-    model = build_model(args.model).to(device).eval()
+    model = build_model(args.model, model_kwargs).to(device).eval()
     ck = torch.load(args.ckpt, map_location=device, weights_only=False)
     state = ck.get('model_state_dict', ck.get('model'))
     model.load_state_dict(state)

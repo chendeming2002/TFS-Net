@@ -53,7 +53,12 @@ def main():
         crop_size=cfg['dataset']['crop_size'],
         pairing=pairing,
         exclude_seqs=exclude_seqs,
+        dark_aug_prob=cfg['dataset'].get('dark_aug_prob', 0.0),
+        dark_aug_gamma_range=cfg['dataset'].get('dark_aug_gamma_range', (1.5, 3.0)),
     )
+    if train_ds.dark_aug_prob > 0:
+        logger.info(f"Dark aug ON (§6.6-A): prob={train_ds.dark_aug_prob}, "
+                    f"gamma_range={train_ds.dark_aug_gamma_range} (只压暗 LQ, GT 不变)")
     train_loader = DataLoader(
         train_ds, batch_size=cfg['train']['batch_size'], shuffle=True,
         num_workers=cfg['dataset'].get('num_workers', 0),
@@ -114,6 +119,9 @@ def main():
     log_interval = cfg['train'].get('log_interval', 100)
     val_interval = cfg['train'].get('val_interval', 5)
     grad_clip = cfg['train'].get('grad_clip', 0.0)
+    # 断电保护 (2026-10-09 事故): epoch 中途周期性落盘, 避免整 epoch 进度全丢。
+    # 默认 0 = 关闭 (保持历史行为); 设为 1000 即每 1000 step 覆盖写 latest.pth。
+    ckpt_interval = int(cfg['train'].get('ckpt_interval', 0) or 0)
 
     # LPIPS 感知指标 (评估时使用)
     lpips_metric = LPIPSMetric(net=cfg['train'].get('lpips_net', 'vgg'),
@@ -178,6 +186,16 @@ def main():
                             f" (N/L/M={gk[0].item():.3f}/"
                             f"{gk[1].item():.3f}/{gk[2].item():.3f})")
                 logger.info(msg)
+
+            # 断电保护: epoch 中途落盘 (默认关闭)
+            if ckpt_interval and (step + 1) % ckpt_interval == 0:
+                save_checkpoint({
+                    'epoch': epoch - 1,   # 记上一个完整 epoch → --resume 时本 epoch 从头重跑
+                    'step': step + 1,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                }, os.path.join(out_dir, 'latest.pth'))
 
         scheduler.step()
         dt = time.time() - t0

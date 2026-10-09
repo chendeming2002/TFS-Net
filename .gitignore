@@ -5,3 +5,8 @@ __pycache__/
 reference_repos/
 node_modules/
 package-lock.json
+# 温度/功耗监控数据 (体积大, 无需版本控制)
+scripts/monitor_data/temp_log.csv
+scripts/monitor_data/temp_chart.png
+outputs/gpu_power.csv
+outputs/gpu_power_watch.log

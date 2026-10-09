@@ -6,7 +6,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-from .transforms import random_flip_pair, random_time_reverse
+from .transforms import random_dark_gamma, random_flip_pair, random_time_reverse
 
 try:
     import cv2
@@ -60,7 +60,8 @@ def read_image(path):
 
 class SDSDDataset(Dataset):
     def __init__(self, input_root, target_root, window_size=5, mode="train", crop_size=256,
-                 max_seqs=None, pairing="name", exclude_seqs=None):
+                 max_seqs=None, pairing="name", exclude_seqs=None,
+                 dark_aug_prob=0.0, dark_aug_gamma_range=(1.5, 3.0)):
         """SDSD 数据集。
 
         pairing:
@@ -74,6 +75,10 @@ class SDSDDataset(Dataset):
             序列 (pair19/20/24/40/45/50/55/60/64/70) 从 indoor/input 中排除, 使
             train 与 val (test/low-light) 帧级不相交, 消除数据泄漏。
           - None 或 [] → 不排除 (历史行为)。
+
+        dark_aug_prob / dark_aug_gamma_range:
+          - §6.6-A 极暗增广。仅 train 模式生效, 仅作用于 LQ (GT 不动)。
+          - 0.0 (默认) → 关闭, 保持历史行为。
         """
         super().__init__()
         self.input_root = input_root
@@ -87,6 +92,8 @@ class SDSDDataset(Dataset):
             raise ValueError("pairing must be 'name' or 'position', got {!r}".format(pairing))
         self.pairing = pairing
         self.exclude_seqs = set(exclude_seqs) if exclude_seqs else set()
+        self.dark_aug_prob = float(dark_aug_prob or 0.0)
+        self.dark_aug_gamma_range = tuple(dark_aug_gamma_range)
         self.samples = self._build_samples()
         self._frame_cache = _FrameLRU(capacity=24)
 
@@ -180,6 +187,9 @@ class SDSDDataset(Dataset):
 
             clip, target = random_flip_pair(clip, target)
             clip = random_time_reverse(clip)
+            # §6.6-A 极暗增广: 只压暗 LQ, GT 不变 (默认 prob=0 → 不生效)
+            clip = random_dark_gamma(clip, prob=self.dark_aug_prob,
+                                     gamma_range=self.dark_aug_gamma_range)
         else:
             clip = self._gather_window(sample["lq_paths"], center_idx)
             target = _u8_to_tensor(cache.get(sample["gt_paths"][center_idx]))

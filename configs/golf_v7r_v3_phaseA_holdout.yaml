@@ -65,6 +65,7 @@ train:
   log_interval: 100
   val_interval: 5
   grad_clip: 1.0
+  ckpt_interval: 500   # 断电保护: 每 500 step(=~4min) 覆盖写 latest.pth
   lpips_net: vgg
 
 loss:

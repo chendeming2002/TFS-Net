@@ -5,7 +5,14 @@ Golf v7r Loss: 多分支监督 + 正交约束
 Loss = L1(final, GT)
      + w_N * L1(Y_N, GT) + w_L * L1(Y_L, GT) + w_M * L1(Y_M, GT)
      + lambda_ortho * ortho_loss(ctx_N, ctx_L, ctx_M)
+
+Phase B 追加项 (§6.6-B / §6.9, 全部默认 0 即关闭):
+     + dark_weight_alpha * 加权L1(final, GT)   (§6.6-B 暗区加权)
+     + w_perceptual * VGG 多层感知损失          (§6.9)
+     + w_freq * FFT 幅值(+相位) L1              (§6.9)
 """
+import warnings
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -31,7 +38,22 @@ class GolfV7RLoss(nn.Module):
                  w_ssim: float = 0.0,
                  branch_warmup_epochs: int = 5,
                  use_lowfreq_L: bool = False,
-                 lowfreq_kernel: int = 16):
+                 lowfreq_kernel: int = 16,
+                 w_perceptual: float = 0.0,
+                 perceptual_multilayer: bool = True,
+                 w_freq: float = 0.0,
+                 freq_phase_weight: float = 1.0,
+                 dark_weight_alpha: float = 0.0,
+                 dark_weight_gamma: float = 1.0):
+        """Phase B 开关 (§6.6-B 暗区加权 + §6.9 感知/频率损失)。
+
+        w_perceptual / w_freq / dark_weight_alpha:
+          - 默认全 0.0 → 历史行为完全不变 (可逐项消融)。
+        dark_weight_alpha (§6.6-B):
+          - >0 时对 L1 做亮度倒数加权: w(x) = (1/(lum(x)+eps))^gamma 归一化到均值 1。
+            动机: L1 在亮区数值大, 暗区梯度被亮区主导 → 极暗序列学不动。
+            归一化保证总 loss 尺度不变, 不因加权而实质改变有效学习率。
+        """
         super().__init__()
         self.w_branch_N = w_branch_N
         self.w_branch_L = w_branch_L
@@ -50,6 +72,45 @@ class GolfV7RLoss(nn.Module):
                 self._ms_ssim = ms_ssim
             except ImportError:
                 self._use_ssim = False
+
+        # §6.9 感知/频率项 (默认关闭)
+        self.w_perceptual = float(w_perceptual or 0.0)
+        self.w_freq = float(w_freq or 0.0)
+        self.freq_phase_weight = float(freq_phase_weight)
+        self._perceptual = None
+        if self.w_perceptual > 0:
+            try:
+                from losses.losses import PerceptualLoss
+                self._perceptual = PerceptualLoss(multilayer=perceptual_multilayer)
+            except Exception as exc:  # torchvision 缺失等
+                warnings.warn(f"PerceptualLoss unavailable, w_perceptual ignored: {exc}")
+                self.w_perceptual = 0.0
+
+        # §6.6-B 暗区加权 (默认关闭)
+        self.dark_weight_alpha = float(dark_weight_alpha or 0.0)
+        self.dark_weight_gamma = float(dark_weight_gamma or 1.0)
+
+    def _dark_weight_map(self, gt: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+        """§6.6-B 亮度倒数权重图, 缩放使加权 L1 的期望量级与裸 L1 一致。
+
+        权重主体 w = (1/(lum+eps))^gamma 做均值归一; 再整体乘 `ref` (= 裸 L1 的标量值),
+        使 Σ w*|pred-gt| 的均值与裸 L1 同量级 —— 即本项只做【误差在空间上的重分配】
+        (暗区权重 >1, 亮区 <1), 而非额外叠加一份 L1。由此不改变有效学习率, alpha 可直接
+        作为"混合比例"解读 (0=纯 L1, 1=完全按暗度重新加权)。
+        """
+        lum = gt.mean(dim=1, keepdim=True)                     # [B,1,H,W]
+        w = (1.0 / (lum + 1e-2)) ** self.dark_weight_gamma
+        w = w / (w.mean() + 1e-8)
+        return self.dark_weight_alpha * w * ref
+
+    def _freq_loss(self, pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+        """§6.9 FFT 幅值 (+相位) L1。"""
+        fft_pred = torch.fft.rfft2(pred.float(), norm='ortho')
+        fft_gt = torch.fft.rfft2(gt.float(), norm='ortho')
+        loss = F.l1_loss(fft_pred.abs(), fft_gt.abs())
+        if self.freq_phase_weight > 0:
+            loss = loss + self.freq_phase_weight * F.l1_loss(fft_pred.angle(), fft_gt.angle())
+        return loss
 
     def _lowfreq(self, x: torch.Tensor) -> torch.Tensor:
         """低通: avg_pool 下采样 → 上采样回原分辨率 (保留低频亮度结构)"""
@@ -110,6 +171,25 @@ class GolfV7RLoss(nn.Module):
                                      data_range=1.0, size_average=True)
             loss = loss + self.w_ssim * (1 - ssim_val)
             loss_dict['ms_ssim'] = ssim_val
+
+        # §6.6-B 暗区加权 L1 (与裸 L1 同量级, 只重分配空间权重, 不改变有效学习率)
+        if self.dark_weight_alpha > 0:
+            wmap = self._dark_weight_map(gt, loss_l1.detach())
+            l_dark = (wmap * (pred - gt).abs()).mean()
+            loss = loss + l_dark
+            loss_dict['dark_l1'] = l_dark.detach()
+
+        # §6.9 VGG 多层感知损失
+        if self.w_perceptual > 0 and self._perceptual is not None:
+            l_perc = self._perceptual(pred.clamp(0, 1), gt.clamp(0, 1))
+            loss = loss + self.w_perceptual * l_perc
+            loss_dict['perceptual'] = l_perc.detach()
+
+        # §6.9 FFT 频率损失
+        if self.w_freq > 0:
+            l_freq = self._freq_loss(pred, gt)
+            loss = loss + self.w_freq * l_freq
+            loss_dict['freq'] = l_freq.detach()
 
         loss_dict['loss'] = loss
         return loss_dict
