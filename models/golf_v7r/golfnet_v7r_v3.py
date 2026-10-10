@@ -52,7 +52,9 @@ class GolfNet_v7r_v3(nn.Module):
                  spatial_size: int = 2,
                  branch_channels: int = 128,
                  motion_aware_diff: bool = False,
-                 diff_smooth_kernel: int = 5):
+                 diff_smooth_kernel: int = 5,
+                 fusion_mode: str = "softmax",
+                 fusion_weight_floor: float = 0.1):
         super().__init__()
         self.num_frames = num_frames
         self.C1, self.C2, self.C3 = encoder_channels
@@ -99,8 +101,10 @@ class GolfNet_v7r_v3(nn.Module):
                                       num_frames=num_frames, num_blocks=2)
 
         # ========== Stage 5: Fusion ==========
+        # fusion_mode: "softmax" (历史) / "floored" (§6.16 修复 —— 权重下限防梯度自锁死)
         self.fusion = V7RFusion(in_channels=3, hidden_channels=32,
-                                num_blocks=2)
+                                num_blocks=2, mode=fusion_mode,
+                                weight_floor=fusion_weight_floor)
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
