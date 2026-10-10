@@ -53,9 +53,12 @@ model:
   diff_smooth_kernel: 5
 
 train:
-  batch_size: 1
+  # 2026-10-10: batch_size 1→2, lr 4e-4→5.657e-4 (√2 缩放)。
+  #   实测 bs=2: 10.8GB 显存, 0.213 s/sample (vs bs1 0.348, 1.63x 加速)。
+  #   模型无 BatchNorm (仅 LayerNorm/GroupNorm) → 改 batch 不改变归一化统计, A/B 仍干净。
+  batch_size: 2
   epochs: 60
-  lr: 0.0004
+  lr: 0.0005657   # bs=2: 4e-4 × √2 (平方根缩放)
   weight_decay: 0.01
   log_interval: 100
   val_interval: 5
