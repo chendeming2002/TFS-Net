@@ -19,6 +19,7 @@ RWKV 后端 (注意力机制的 RWKV 实现):
 
 from __future__ import annotations
 
+import os
 import math
 import torch
 import torch.nn as nn
@@ -52,8 +53,15 @@ class FastBiWKV(BiWKV):
             e = min(s + CHUNK, L)
             cs = e - s
             ek_c, ekv_c = ek[:, s:e], ekv[:, s:e]
-            S_loc = (ekv_c / ew_pow[:, :cs].clamp(min=1e-12)).cumsum(dim=1) * ew_pow[:, :cs]
-            D_loc = (ek_c  / ew_pow[:, :cs].clamp(min=1e-12)).cumsum(dim=1) * ew_pow[:, :cs]
+            # 可选的确定性 cumsum: CUDA 的 cumsum 无确定性实现 (硬件层限制),
+            # 设 WKV_DETERMINISTIC_CUMSUM=1 时走 CPU (慢 2.5x + 同步) 换取可复现。
+            # 仅用于诊断/复现实验, 默认关闭 (性能优先)。
+            if os.environ.get("WKV_DETERMINISTIC_CUMSUM") == "1":
+                S_loc = (ekv_c / ew_pow[:, :cs].clamp(min=1e-12)).cpu().cumsum(dim=1).to(ek.device) * ew_pow[:, :cs]
+                D_loc = (ek_c  / ew_pow[:, :cs].clamp(min=1e-12)).cpu().cumsum(dim=1).to(ek.device) * ew_pow[:, :cs]
+            else:
+                S_loc = (ekv_c / ew_pow[:, :cs].clamp(min=1e-12)).cumsum(dim=1) * ew_pow[:, :cs]
+                D_loc = (ek_c  / ew_pow[:, :cs].clamp(min=1e-12)).cumsum(dim=1) * ew_pow[:, :cs]
             decay_state = ew_pow_ext[:, 1:cs+1]   # 用 ext 避免越界
             S = S_loc + state_num * decay_state
             D = D_loc + state_den * decay_state

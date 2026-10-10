@@ -1465,7 +1465,45 @@ Branch-L 学出了**与 N 不同的解**, 但该解**不产生亮度响应**, �
 **⑤ 剔除异常 run 后方差也显著收窄**: 五个 run 极差 2.45 dB → 去掉 `quick` 后
 (23.48~24.51) 极差降至 **1.03 dB**。说明该 2.45 dB 里约 1.4 dB 由 `quick` 单一异常贡献。
 
-#### 最终协议结论 (三轮迭代后的定稿)
+#### 逐位复现的尝试与放弃 (2026-10-10)
+
+针对 2.13 dB 方差, 曾尝试根治"同 seed 不可复现"。**逐层排查结果**:
+
+| 层级 | 措施 | 结果 |
+|------|------|:--:|
+| cuDNN | `cudnn.deterministic=True`, `benchmark=False` | ❌ 未解决 (但**零速度代价**: 0.461→0.462 s/step) |
+| cuBLAS | `CUBLAS_WORKSPACE_CONFIG=:4096:8` | ❌ 未解决 |
+| CUDA cumsum | `WKV_DETERMINISTIC_CUMSUM=1` 走 CPU (`models/golf_r4/tca_rwkv.py::_scan_cumsum`) | ❌ 仍未解决 |
+| 残余 | 相对量级 **~1e-5** (参数 3e-7 / 输出 1e-4) | 指向更底层 (atomicAdd 归约) |
+
+**关键判断: 放弃追逐位复现。** 理由:
+
+1. **逐位复现并不能解决真正的需求**。需求是"单 run 结论是否可信", 而逐位复现只回答
+   "同 seed 是否重复"。后者是前者的**既不充分也不必要**条件。
+2. **多 seed 重复不依赖逐位复现** —— 它直接量化随机性, 更直接也更稳健。
+3. 残余差异量级 (1e-5) 虽小, 但经 5ep 累积后放大到 **2.1 dB**, 说明该系统的
+   **Lyapunov 指数很高** → 任何"消除小扰动"的路线都注定脆弱;
+   唯有**统计化 (多 seed)** 才稳健。
+
+**保留的改动** (零成本或有条件启用, 不影响既有行为):
+- `utils/misc.py::seed_everything(seed, deterministic=True)`: 默认开启 cuDNN 确定性 (无速度代价);
+- `WKV_DETERMINISTIC_CUMSUM=1`: 环境变量开启 CPU cumsum, 供极端需要逐位复现时使用, **默认关闭**。
+
+#### 多 seed 基线工具 (2026-10-10 新增)
+
+`scripts/multiseed_baseline.py` —— 对**参照配置**跑 N 个 seed, 输出均值±σ 与 2σ 判据门槛:
+
+```bash
+PYTHONPATH=. python scripts/multiseed_baseline.py \
+    --config configs/golf_v7r_v3_phaseB_softmax_ctl.yaml \
+    --seeds 0 1 2 --stop_epoch 5 --out outputs/multiseed_ref.json
+```
+
+产物 JSON 含每 seed 的 PSNR/SSIM/LPIPS + `psnr.mean/std/min/max`, 并直接打印
+**"两配置差异 > 2σ 才视为真实效应"** 的门槛值, 供后续 A/B 判据引用。
+成本: 单 run ≈ 6h (5ep 训练 4.5h + 验证 1.5h), 3 seed ≈ 18h, 可串行无人值守。
+
+#### 最终协议结论 (三轮迭代后的定稿)#### 最终协议结论 (三轮迭代后的定稿)
 
 1. **性能判据在本任务上不可用于 5ep 探针**: 实测训练随机性 ~2.1 dB, 远超任何 toggle 效应
    (≤0.3 dB)。§6.14 原定 0.05 dB 容差没有意义。
