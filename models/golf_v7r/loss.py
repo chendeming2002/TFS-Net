@@ -39,6 +39,8 @@ class GolfV7RLoss(nn.Module):
                  branch_warmup_epochs: int = 5,
                  use_lowfreq_L: bool = False,
                  lowfreq_kernel: int = 16,
+                 w_output_decorr: float = 0.0,
+                 decorr_per_image: bool = True,
                  w_perceptual: float = 0.0,
                  perceptual_multilayer: bool = True,
                  w_freq: float = 0.0,
@@ -72,6 +74,10 @@ class GolfV7RLoss(nn.Module):
                 self._ms_ssim = ms_ssim
             except ImportError:
                 self._use_ssim = False
+
+        # §6.14 复核: 输出层去相关 (默认关闭)
+        self.w_output_decorr = float(w_output_decorr or 0.0)
+        self.decorr_per_image = bool(decorr_per_image)
 
         # §6.9 感知/频率项 (默认关闭)
         self.w_perceptual = float(w_perceptual or 0.0)
@@ -111,6 +117,47 @@ class GolfV7RLoss(nn.Module):
         if self.freq_phase_weight > 0:
             loss = loss + self.freq_phase_weight * F.l1_loss(fft_pred.angle(), fft_gt.angle())
         return loss
+
+    @staticmethod
+    def _decorr_loss(y_a: torch.Tensor, y_b: torch.Tensor,
+                     per_image: bool = True) -> torch.Tensor:
+        """输出层去相关: |cos(Y_a, Y_b)| 的均值 (逐图计算后平均)。
+
+        与 `TripleQueryTCA._ortho_loss` 的区别 —— 后者作用在**特征层** `F_*`,
+        而本项作用在**输出层** `Y_*` (最终 RGB)。
+
+        动机 (§6.14 复核, 2026-10-10): 实测发现三路特征 `attn_*` 内部已近正交 (−0.34~+0.33),
+        但**输出**余弦高达 0.98; 补测 `mult=0` 表明曲线非单调、`mult=1` 是局部最高点
+        ⇒ **训练主动选择了高余弦** —— 因为主 L1 让三路各自回归同一 GT, 最优解本就是同一张图。
+        即: **特征层正交约束无法阻止输出层同质化**, 必须在输出层加激励。
+
+        去均值后再算余弦: 三路输出的共同 DC 分量 (均值≈0.30) 会人为抬高余弦,
+        而分支差异体现在**结构/纹理**而非整体亮度, 故减均值后更能反映真实分化程度。
+        """
+        a = y_a.flatten(2).float()   # [B, 3, H*W]
+        b = y_b.flatten(2).float()
+        if per_image:
+            a = a - a.mean(dim=2, keepdim=True)
+            b = b - b.mean(dim=2, keepdim=True)
+            cos = (a * b).sum(dim=2) / (a.norm(dim=2) * b.norm(dim=2) + 1e-8)  # [B]
+            return cos.abs().mean()
+        a = a - a.mean()
+        b = b - b.mean()
+        return (a * b).sum().abs() / (a.norm() * b.norm() + 1e-8)
+
+    def _output_decorr(self, output_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """三路输出两两去相关 (NL/NM/LM 平均)。缺失的键自动跳过。"""
+        keys = [k for k in ('branch_N', 'branch_L', 'branch_M')
+                if output_dict.get(k) is not None]
+        if len(keys) < 2:
+            return output_dict['final'].new_tensor(0.0)
+        vals = []
+        for i in range(len(keys)):
+            for j in range(i + 1, len(keys)):
+                vals.append(self._decorr_loss(output_dict[keys[i]],
+                                              output_dict[keys[j]],
+                                              per_image=self.decorr_per_image))
+        return torch.stack(vals).mean()
 
     def _lowfreq(self, x: torch.Tensor) -> torch.Tensor:
         """低通: avg_pool 下采样 → 上采样回原分辨率 (保留低频亮度结构)"""
@@ -159,11 +206,19 @@ class GolfV7RLoss(nn.Module):
                     loss = loss + w * bl
                     loss_dict[key] = bl
 
-        # 正交约束 (由网络内部计算并传出)
+        # 正交约束 (作用在【特征层】F_*)
         if 'ortho_loss' in output_dict and self.lambda_ortho > 0:
             ol = output_dict['ortho_loss']
             loss = loss + self.lambda_ortho * ol
             loss_dict['ortho'] = ol
+
+        # §6.14 复核: 输出层去相关 (作用在【输出层】Y_*)
+        # 动机: 特征层正交无法阻止输出层同质化 —— 主 L1 让三路各自回归同一 GT,
+        #       最优解本身就是同一张图。必须在输出层直接激励分化。
+        if self.w_output_decorr > 0:
+            dc = self._output_decorr(output_dict)
+            loss = loss + self.w_output_decorr * dc
+            loss_dict['out_decorr'] = dc.detach()
 
         # MS-SSIM
         if self._use_ssim:

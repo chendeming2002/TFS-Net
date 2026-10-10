@@ -81,6 +81,31 @@ def test_terms_independent_and_backprop():
         print(f"  [ok] {kw} → Δloss={d['loss'].item() - base:+.6f}, 反传正常")
 
 
+def test_output_decorr():
+    """§6.14 复核新增: 输出层去相关项 (w_output_decorr)。"""
+    torch.manual_seed(0)
+    base = torch.rand(2, 3, 32, 32)
+    out = {'final': torch.rand(2, 3, 32, 32),
+           'branch_N': base, 'branch_L': torch.rand(2, 3, 32, 32),
+           'branch_M': torch.rand(2, 3, 32, 32),
+           'ortho_loss': torch.tensor(0.1)}
+    gt = torch.rand(2, 3, 32, 32)
+    crit = GolfV7RLoss(w_output_decorr=1.0)
+
+    # 三路完全相同 → cos=1
+    same = dict(out, branch_L=base.clone(), branch_M=base.clone())
+    v_same = crit(same, gt)['out_decorr'].item()
+    assert abs(v_same - 1.0) < 1e-4, v_same
+    # 三路随机 (近正交) → 接近 0
+    v_rand = crit(out, gt)['out_decorr'].item()
+    assert v_rand < 0.15, v_rand
+    print(f"  [ok] 输出去相关: 三路相同={v_same:.4f}, 近正交={v_rand:.4f}")
+
+    # 默认关闭时不得出现在 loss_dict
+    assert 'out_decorr' not in GolfV7RLoss()(out, gt), "默认关闭时不应引入该项"
+    print("  [ok] 默认关闭时不引入 out_decorr 项")
+
+
 def test_dark_gamma_aug():
     torch.manual_seed(0)
     clip = torch.rand(5, 3, 32, 32)
@@ -101,6 +126,7 @@ def main():
     test_dark_weight_scale()
     test_dark_weight_orientation()
     test_terms_independent_and_backprop()
+    test_output_decorr()
     test_dark_gamma_aug()
     print("\n全部通过 ✅")
 
