@@ -1,0 +1,66 @@
+## Phase C: 输出层去相关损失 (§6.14 复核结论的直接验证)
+##
+## 唯一变量 vs golf_v7r_v3_phaseB_softmax_ctl.yaml:
+##   loss.w_output_decorr = 0.5   (其余全同: bs=2, lr=5.657e-4, seed 42, 70 seq, position)
+##
+## 动机: 复核"因果验证"发现曲线【非单调】, mult=1(训练真值)是局部最高点
+##   ⇒ 训练【主动】选择高输出余弦 ⇒ 主损失本身不奖励分化。
+##   现有 ortho_loss 作用于【特征层】F_*, 无法阻止【输出层】Y_* 同质化;
+##   故本实验在输出层直接加激励: |cos(Y_i, Y_j)| 逐图去均值后平均。
+##
+## ⚠️ 风险 (必须同时检查, 否则可能重演 use_lowfreq_L 的退化解耦):
+##   单纯压低输出余弦可能让某分支"摆烂"(不再负责重建), 融合层随即弃用它。
+##   故除 out_decorr 外, 必须同时记录:
+##     · diag_v7r_v3_branches 的融合权重 (是否某路→0)
+##     · 各分支单独 PSNR (是否某路显著劣化)
+##
+## 权重 0.5 的依据: 初始 out_decorr≈1.0 (三路输出近同), 乘 0.5 后约 0.5 量级,
+##   与主 L1 (~0.09) 相比偏大 —— 这是【有意为之】: 需要足够强的梯度才能撼动
+##   主损失驱动的同质化收敛; 若过强导致重建劣化, 再下调 (0.1/0.2)。
+seed: 42
+output_dir: outputs/golf_v7r_v3_phaseC_decorr
+dataset:
+  train_input_root: /home/a1005/yzy/dataset/SDSD/indoor/input
+  train_target_root: /home/a1005/yzy/dataset/SDSD/indoor/GT
+  val_input_root: /home/a1005/yzy/dataset/SDSD/test/low-light
+  val_target_root: /home/a1005/yzy/dataset/SDSD/test/GT
+  window_size: 5
+  crop_size: 256
+  num_workers: 0
+  pairing: position
+model:
+  fusion_mode: softmax
+  num_frames: 5
+  encoder_channels:
+  - 32
+  - 64
+  - 128
+  feature_dim: 128
+  rwkv_dim: 192
+  rwkv_heads: 6
+  rwkv_head_size: 32
+  rwkv_blocks: 2
+  spatial_size: 2
+  branch_channels: 128
+  motion_aware_diff: false
+  diff_smooth_kernel: 5
+train:
+  batch_size: 2
+  epochs: 60
+  lr: 0.0005657
+  weight_decay: 0.01
+  log_interval: 100
+  val_interval: 5
+  grad_clip: 1.0
+  ckpt_interval: 500
+  lpips_net: vgg
+loss:
+  w_branch_N: 0.1
+  w_branch_L: 0.1
+  w_branch_M: 0.1
+  lambda_ortho: 0.01
+  w_ssim: 0.0
+  branch_warmup_epochs: 5
+  use_lowfreq_L: false
+  lowfreq_kernel: 16
+  w_output_decorr: 0.5
