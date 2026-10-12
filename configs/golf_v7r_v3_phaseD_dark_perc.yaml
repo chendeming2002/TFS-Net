@@ -1,0 +1,74 @@
+## Phase D: 极暗增广 + 感知/频率损失 (§6.6 + §6.9 的首次训练验证)
+##
+## 相对 golf_v7r_v3_phaseB_softmax_ctl.yaml 的变量只有 loss/dataset 的开关, 其余全同:
+##   dataset.dark_aug_prob        = 0.5          (§6.6-A 只压暗 LQ, GT 不变)
+##   dataset.dark_aug_gamma_range = [1.5, 3.0]
+##   loss.dark_weight_alpha       = 0.5          (§6.6-B 暗区加权, 与裸 L1 同量级)
+##   loss.w_perceptual            = 0.05         (§6.9 VGG 多层感知)
+##   loss.w_freq                  = 0.02         (§6.9 FFT 幅值+相位)
+##
+## 为什么这四项一起上: 它们针对的是同一个已确认的失效场景 —— 极暗序列无法恢复
+## (docs/v7/03-v7r-v3-design.md §6.6)。§6.6-A 在数据侧制造更多极暗样本,
+## §6.6-B 让损失更关注暗区像素, §6.9 两项补上 LPIPS/频率层面的约束。
+## 四个开关此前都只有单测覆盖, 从未真正参与训练。
+##
+## 判据: 不用最终 PSNR (本轮已证 5ep PSNR 的 seed 间方差达 3 dB, 见 §6.17)。
+##   主判据 = 极暗序列 (输入亮度最低的 10 个) 上的逐序列 PSNR 提升;
+##   次判据 = LPIPS (感知项的直接目标) 与整体 PSNR 不劣化。
+##   ⚠️ 必须与同一批次的对照臂比, 不能与本文件之外的旧 run 比。
+##
+## 已知风险: §6.9 的 w_freq 若相位权重过大, 容易在低光噪声上放大伪影;
+##   故 freq_phase_weight 保持默认 1.0, 若出现明显伪影再下调到 0.2。
+seed: 42
+output_dir: outputs/golf_v7r_v3_phaseD_dark_perc
+
+dataset:
+  train_input_root: /home/a1005/yzy/dataset/SDSD/indoor/input
+  train_target_root: /home/a1005/yzy/dataset/SDSD/indoor/GT
+  val_input_root: /home/a1005/yzy/dataset/SDSD/test/low-light
+  val_target_root: /home/a1005/yzy/dataset/SDSD/test/GT
+  window_size: 5
+  crop_size: 256
+  num_workers: 0
+  pairing: position
+  dark_aug_prob: 0.5
+  dark_aug_gamma_range: [1.5, 3.0]
+
+model:
+  fusion_mode: softmax
+  num_frames: 5
+  encoder_channels: [32, 64, 128]
+  feature_dim: 128
+  rwkv_dim: 192
+  rwkv_heads: 6
+  rwkv_head_size: 32
+  rwkv_blocks: 2
+  spatial_size: 2
+  branch_channels: 128
+  motion_aware_diff: false
+  diff_smooth_kernel: 5
+
+train:
+  batch_size: 2
+  epochs: 60
+  lr: 0.0005657
+  weight_decay: 0.01
+  log_interval: 100
+  val_interval: 5
+  grad_clip: 1.0
+  ckpt_interval: 500
+  lpips_net: vgg
+
+loss:
+  w_branch_N: 0.1
+  w_branch_L: 0.1
+  w_branch_M: 0.1
+  lambda_ortho: 0.01
+  w_ssim: 0.0
+  branch_warmup_epochs: 5
+  use_lowfreq_L: false
+  lowfreq_kernel: 16
+  dark_weight_alpha: 0.5
+  w_perceptual: 0.05
+  w_freq: 0.02
+  freq_phase_weight: 1.0

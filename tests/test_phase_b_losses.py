@@ -106,6 +106,44 @@ def test_output_decorr():
     print("  [ok] 默认关闭时不引入 out_decorr 项")
 
 
+def test_output_decorr_constant_guard():
+    """§6.17 修复: 常数分支不得靠"余弦=0"骗过损失项。
+
+    背景: 2026-10-12 的两个 decorr seed 都退化成"某一路输出常数图",
+    因为常数减去自身均值后是全零向量, 余弦恒为 0, 该损失被无成本地最小化。
+    修复后, 任一路近似常数时该项不计入, 梯度不再奖励这种退化。
+    """
+    torch.manual_seed(0)
+    gt = torch.rand(2, 3, 32, 32)
+    crit = GolfV7RLoss(w_output_decorr=1.0)
+
+    # 两路正常、一路为常数图: 该常数分支不应把损失拉到 0
+    y_n = torch.rand(2, 3, 32, 32)
+    y_m = torch.rand(2, 3, 32, 32)
+    const = torch.full((2, 3, 32, 32), 0.5)
+    out = {'final': y_n, 'branch_N': y_n, 'branch_L': const, 'branch_M': y_m,
+           'ortho_loss': torch.tensor(0.1)}
+    v = crit(out, gt)['out_decorr'].item()
+    # 只剩 N-M 一项参与, 而 N/M 随机近正交 → 值仍接近随机基线, 不因常数路塌到 0
+    assert v > 1e-3, f"常数分支仍把损失拉到 0: {v}"
+    print(f"  [ok] 常数分支不再骗过去: out_decorr={v:.4f} (>0)")
+
+    # 三路全为常数 → 无有效项, 返回 0 且可反传
+    const_g = torch.full((2, 3, 32, 32), 0.5, requires_grad=True)
+    allconst = {'final': torch.rand(2, 3, 32, 32, requires_grad=True),
+                'branch_N': const_g, 'branch_L': const_g, 'branch_M': const_g,
+                'ortho_loss': torch.tensor(0.1)}
+    v0 = crit(allconst, gt)['out_decorr'].item()
+    assert v0 == 0.0, v0
+    print("  [ok] 三路全常数 → 该项为 0 (无有效配对)")
+
+    # 全常数时损失项仍可反传 (不能因返回常量而断掉梯度图)
+    loss = GolfV7RLoss(w_output_decorr=1.0)(allconst, gt)['loss']
+    loss.backward()
+    assert allconst['final'].grad is not None, "主损失路径梯度丢失"
+    print("  [ok] 全常数情形下仍可反传")
+
+
 def test_dark_gamma_aug():
     torch.manual_seed(0)
     clip = torch.rand(5, 3, 32, 32)
@@ -127,6 +165,7 @@ def main():
     test_dark_weight_orientation()
     test_terms_independent_and_backprop()
     test_output_decorr()
+    test_output_decorr_constant_guard()
     test_dark_gamma_aug()
     print("\n全部通过 ✅")
 

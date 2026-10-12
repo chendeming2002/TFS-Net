@@ -123,27 +123,36 @@ class GolfV7RLoss(nn.Module):
                      per_image: bool = True) -> torch.Tensor:
         """输出层去相关: |cos(Y_a, Y_b)| 的均值 (逐图计算后平均)。
 
-        与 `TripleQueryTCA._ortho_loss` 的区别 —— 后者作用在**特征层** `F_*`,
-        而本项作用在**输出层** `Y_*` (最终 RGB)。
+        与 `TripleQueryTCA._ortho_loss` 的区别是作用层不同: 后者约束特征层 `F_*`,
+        本项约束输出层 `Y_*` (最终 RGB)。
 
-        动机 (§6.14 复核, 2026-10-10): 实测发现三路特征 `attn_*` 内部已近正交 (−0.34~+0.33),
-        但**输出**余弦高达 0.98; 补测 `mult=0` 表明曲线非单调、`mult=1` 是局部最高点
-        ⇒ **训练主动选择了高余弦** —— 因为主 L1 让三路各自回归同一 GT, 最优解本就是同一张图。
-        即: **特征层正交约束无法阻止输出层同质化**, 必须在输出层加激励。
+        ⚠️ 训练结论 (2026-10-12, 详见 docs/v7/03-v7r-v3-design.md §6.17):
+        本损失有平凡解, 两个 seed 的训练都退化了 —— 让某一路输出常数图即可使余弦恒为 0
+        (常数减去自身均值后是全零向量), 代价远低于"学出不同的结构"。退化解也不会被
+        融合层屏蔽, 因为融合权重受 Σw=1 约束, 无法把该路归零。
 
-        去均值后再算余弦: 三路输出的共同 DC 分量 (均值≈0.30) 会人为抬高余弦,
-        而分支差异体现在**结构/纹理**而非整体亮度, 故减均值后更能反映真实分化程度。
+        已加 `valid` 掩码堵住"精确常数"这条捷径: 任一路能量趋零时不计入本项。
+        但这不足以让本损失变得有用 —— 实验表明它压低的是"相似度", 而不是建立"分工"。
+        若要继续使用, 必须同时保证各分支各自有效 (例如各自有独立的、互不相同的监督目标)。
+
+        去均值后再算余弦的原因: 三路输出的共同 DC 分量会人为抬高余弦,
+        而分支差异体现在结构/纹理而非整体亮度。
         """
         a = y_a.flatten(2).float()   # [B, 3, H*W]
         b = y_b.flatten(2).float()
-        if per_image:
-            a = a - a.mean(dim=2, keepdim=True)
-            b = b - b.mean(dim=2, keepdim=True)
-            cos = (a * b).sum(dim=2) / (a.norm(dim=2) * b.norm(dim=2) + 1e-8)  # [B]
-            return cos.abs().mean()
-        a = a - a.mean()
-        b = b - b.mean()
-        return (a * b).sum().abs() / (a.norm() * b.norm() + 1e-8)
+        if not per_image:
+            a = a - a.mean()
+            b = b - b.mean()
+            return (a * b).sum().abs() / (a.norm() * b.norm() + 1e-8)
+
+        a = a - a.mean(dim=2, keepdim=True)
+        b = b - b.mean(dim=2, keepdim=True)
+        denom = a.norm(dim=2) * b.norm(dim=2)      # [B]
+        valid = denom > 1e-4                        # 任一路近似常数则不计入
+        if not bool(valid.any()):
+            return y_a.new_zeros(())
+        cos = (a * b).sum(dim=2) / denom.clamp_min(1e-8)
+        return (cos.abs() * valid.float()).sum() / valid.float().sum().clamp_min(1.0)
 
     def _output_decorr(self, output_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
         """三路输出两两去相关 (NL/NM/LM 平均)。缺失的键自动跳过。"""
