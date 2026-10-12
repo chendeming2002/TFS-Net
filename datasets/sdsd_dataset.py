@@ -6,6 +6,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
+from .branch_targets import build_branch_targets
 from .transforms import random_dark_gamma, random_flip_pair, random_time_reverse
 
 try:
@@ -61,7 +62,9 @@ def read_image(path):
 class SDSDDataset(Dataset):
     def __init__(self, input_root, target_root, window_size=5, mode="train", crop_size=256,
                  max_seqs=None, pairing="name", exclude_seqs=None,
-                 dark_aug_prob=0.0, dark_aug_gamma_range=(1.5, 3.0)):
+                 dark_aug_prob=0.0, dark_aug_gamma_range=(1.5, 3.0),
+                 branch_targets=False, branch_target_max_shift=4,
+                 branch_target_lowfreq_kernel=31):
         """SDSD 数据集。
 
         pairing:
@@ -79,6 +82,13 @@ class SDSDDataset(Dataset):
         dark_aug_prob / dark_aug_gamma_range:
           - §6.6-A 极暗增广。仅 train 模式生效, 仅作用于 LQ (GT 不动)。
           - 0.0 (默认) → 关闭, 保持历史行为。
+
+        branch_targets:
+          - 分支专属监督目标 (docs/v7/04-model-architecture.md 第四节)。开启后 meta
+            额外带 noise_target / illum_target / motion_target 三张图, 供损失函数让
+            三个分支各自回归不同目标, 从目标层面建立分工。
+          - False (默认) → 关闭, __getitem__ 返回结构与历史完全一致。
+          - 仅 train 模式构造 (验证只需最终输出与 GT 比较)。
         """
         super().__init__()
         self.input_root = input_root
@@ -94,6 +104,9 @@ class SDSDDataset(Dataset):
         self.exclude_seqs = set(exclude_seqs) if exclude_seqs else set()
         self.dark_aug_prob = float(dark_aug_prob or 0.0)
         self.dark_aug_gamma_range = tuple(dark_aug_gamma_range)
+        self.branch_targets = bool(branch_targets)
+        self.branch_target_max_shift = int(branch_target_max_shift)
+        self.branch_target_lowfreq_kernel = int(branch_target_lowfreq_kernel)
         self.samples = self._build_samples()
         self._frame_cache = _FrameLRU(capacity=24)
 
@@ -199,4 +212,10 @@ class SDSDDataset(Dataset):
             "index": center_idx,
             "frame_name": os.path.basename(sample["lq_paths"][center_idx]),
         }
+        if self.branch_targets and self.mode == "train":
+            meta.update(build_branch_targets(
+                clip,
+                max_shift=self.branch_target_max_shift,
+                lowfreq_kernel=self.branch_target_lowfreq_kernel,
+            ))
         return clip, target, meta

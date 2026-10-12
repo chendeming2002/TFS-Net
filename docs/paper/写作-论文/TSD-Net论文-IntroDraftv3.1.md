@@ -93,11 +93,11 @@ $$X^{\text{illu}}_t = X^{\text{avg}}_t \oslash \hat{L}_t, \tag{6}$$
 
 and supervise ISPN on it. This target preserves relative reflectance and color while removing absolute exposure, so the branch is not required to reproduce texture that the other branches already handle.
 
-For the motion source, the quantity to be corrected *is* the displacement, so the natural target is a neighbouring frame brought into the center frame's coordinate system:
+For the motion source, the quantity to be corrected *is* the displacement, so the natural target is built from neighbouring frames brought into the center frame's coordinate system. We use the two outermost frames of the window,
 
-$$X^{\text{align}}_t = \mathcal{W}_{i \to t}(I_i), \quad i \in \Omega. \tag{7}$$
+$$X^{\text{align}}_t = \tfrac{1}{2}\big( \mathcal{W}_{t-k \to t}(I_{t-k}) + \mathcal{W}_{t+k \to t}(I_{t+k}) \big), \tag{7}$$
 
-Supervising MCPN on $X^{\text{align}}_t$ makes its output the alignment residual rather than a full reconstruction.
+rather than an average over all of $\Omega$. The outermost frames carry the largest displacement and therefore the strongest alignment signal; averaging over all neighbours instead makes Eq. (7) numerically almost indistinguishable from Eq. (5)—we measure a mean absolute difference of $0.012$—which would leave NDPN and MCPN with effectively the same target and defeat the purpose of the construction. Supervising MCPN on $X^{\text{align}}_t$ makes its output the alignment residual rather than a full reconstruction.
 
 The three targets differ by construction: $X^{\text{avg}}_t$ retains texture but not alignment, $X^{\text{illu}}_t$ retains relative structure but not absolute illumination, and $X^{\text{align}}_t$ retains geometry but not temporal aggregation. Their optima no longer coincide, so the branches cannot all converge to the same function, and the fusion stage receives three genuinely distinct candidates. The re-integration loss remains the original $\ell_1$ between the fused output $O_t$ and $X_t$; no additional penalty terms are introduced.
 

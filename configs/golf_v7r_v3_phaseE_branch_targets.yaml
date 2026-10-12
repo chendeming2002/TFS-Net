@@ -1,0 +1,82 @@
+## Phase E: 分支专属监督目标 (docs/v7/04-model-architecture.md 第四节)
+##
+## 相对 golf_v7r_v3_phaseE_shared_ctl.yaml 的唯一变量:
+##   loss.branch_specific_targets = true
+## 其余全同 (bs=2, lr=5.657e-4, position 配对, 70 序列, 5 epoch)。
+##
+## 要解决的问题:
+##   三个分支原本都对同一张 GT 做 L1, 最优解因此是同一张图 ——
+##   Y_N = Y_L = Y_M = GT 是全局最优, 三路同质化不是缺陷而是该目标下的正确解。
+##   实测三路输出余弦 0.996–0.999; 消融任一路后最终指标不变 (§6.17 附带发现)。
+##
+## 本方案的做法:
+##   让三路回归【互不相同】的目标, 使"三路输出相同"在目标层面就是错的。
+##   三个目标都从输入片段自身构造, 不需要额外标注:
+##     branch_N → noise_target   邻帧对齐后与中心帧取时序均值
+##     branch_L → illum_target   时序均值图除以自身低频分量 (去绝对曝光)
+##     branch_M → motion_target  最远两帧对齐后取平均 (承载最大位移校正)
+##
+## 为什么目标在数据侧构造而不用模型内的 FlowEstimator:
+##   目标必须在前向之前就固定。若目标随模型参数变化, 它就成了可被优化器绕过的
+##   软约束, 会重演 w_output_decorr 的退化 (§6.17)。块匹配是纯函数, 输入定则输出定。
+##
+## 判据 (不用最终 PSNR —— 本机 5ep 的 seed 间方差实测达 3 dB, §6.17):
+##   主判据 = 三路输出余弦是否从 0.996–0.999 显著下降;
+##   次判据 = 每路与【自己目标】的误差是否下降 (确认各自在学该学的东西);
+##   安全判据 = 三路单独 PSNR 都保持合理 (无某路塌成常数的退化);
+##   分工判据 = scripts/diag_v7r_v3_branch_ablation.py 去掉任一路后指标应明显变差。
+##     改进前基线读数: 对照臂 seed0 去 L 路 +0.111 dB / 20 好 4 差 (即可自由替代)。
+##
+## 已知代价: 数据侧每个样本要做 25 次块匹配 (±4 范围, step=2),
+##   实测对 num_workers=0 的加载有一定开销; 若 step/epoch 时间上升超过 30%,
+##   可把 branch_target_max_shift 降到 2 (搜索量 9 次)。
+seed: 42
+output_dir: outputs/golf_v7r_v3_phaseE_branch_targets
+
+dataset:
+  train_input_root: /home/a1005/yzy/dataset/SDSD/indoor/input
+  train_target_root: /home/a1005/yzy/dataset/SDSD/indoor/GT
+  val_input_root: /home/a1005/yzy/dataset/SDSD/test/low-light
+  val_target_root: /home/a1005/yzy/dataset/SDSD/test/GT
+  window_size: 5
+  crop_size: 256
+  num_workers: 0
+  pairing: position
+  branch_target_max_shift: 4
+  branch_target_lowfreq_kernel: 31
+
+model:
+  fusion_mode: softmax
+  num_frames: 5
+  encoder_channels: [32, 64, 128]
+  feature_dim: 128
+  rwkv_dim: 192
+  rwkv_heads: 6
+  rwkv_head_size: 32
+  rwkv_blocks: 2
+  spatial_size: 2
+  branch_channels: 128
+  motion_aware_diff: false
+  diff_smooth_kernel: 5
+
+train:
+  batch_size: 2
+  epochs: 60
+  lr: 0.0005657
+  weight_decay: 0.01
+  log_interval: 100
+  val_interval: 5
+  grad_clip: 1.0
+  ckpt_interval: 500
+  lpips_net: vgg
+
+loss:
+  w_branch_N: 0.1
+  w_branch_L: 0.1
+  w_branch_M: 0.1
+  lambda_ortho: 0.01
+  w_ssim: 0.0
+  branch_warmup_epochs: 5
+  use_lowfreq_L: false
+  lowfreq_kernel: 16
+  branch_specific_targets: true

@@ -16,7 +16,7 @@ import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict
+from typing import Dict, Optional
 
 
 class GolfV7RLoss(nn.Module):
@@ -46,7 +46,8 @@ class GolfV7RLoss(nn.Module):
                  w_freq: float = 0.0,
                  freq_phase_weight: float = 1.0,
                  dark_weight_alpha: float = 0.0,
-                 dark_weight_gamma: float = 1.0):
+                 dark_weight_gamma: float = 1.0,
+                 branch_specific_targets: bool = False):
         """Phase B 开关 (§6.6-B 暗区加权 + §6.9 感知/频率损失)。
 
         w_perceptual / w_freq / dark_weight_alpha:
@@ -55,6 +56,15 @@ class GolfV7RLoss(nn.Module):
           - >0 时对 L1 做亮度倒数加权: w(x) = (1/(lum(x)+eps))^gamma 归一化到均值 1。
             动机: L1 在亮区数值大, 暗区梯度被亮区主导 → 极暗序列学不动。
             归一化保证总 loss 尺度不变, 不因加权而实质改变有效学习率。
+        branch_specific_targets (docs/v7/04-model-architecture.md 第四节):
+          - False (默认) → 三路分支都对同一张 GT 做 L1 (历史行为)。
+          - True  → 三路各自回归【不同】目标 (由数据侧 build_branch_targets 提供):
+                    N 路 → noise_target  (时序均值)
+                    L 路 → illum_target  (光照归一化)
+                    M 路 → motion_target (对齐参考帧)
+            动机: 共享目标下 Y_N = Y_L = Y_M = GT 就是全局最优, 三路同质化是该目标的
+            正确解而非缺陷。换成互不相同的目标后最优解不再重合, 分工在目标层面成立。
+            目标缺失时自动回退到 GT, 并在首次发生时告警。
         """
         super().__init__()
         self.w_branch_N = w_branch_N
@@ -65,6 +75,8 @@ class GolfV7RLoss(nn.Module):
         self.branch_warmup_epochs = branch_warmup_epochs
         self.use_lowfreq_L = use_lowfreq_L
         self.lowfreq_kernel = int(lowfreq_kernel) if lowfreq_kernel else 16
+        self.branch_specific_targets = bool(branch_specific_targets)
+        self._warned_missing_targets = False
 
         self.current_epoch = 0
         self._use_ssim = w_ssim > 0
@@ -189,8 +201,32 @@ class GolfV7RLoss(nn.Module):
         frac = min(1.0, (self.current_epoch + 1) / self.branch_warmup_epochs)
         return base * frac
 
+    _BRANCH_TARGET_KEYS = {
+        'branch_N': 'noise_target',
+        'branch_L': 'illum_target',
+        'branch_M': 'motion_target',
+    }
+
+    def _resolve_branch_target(self, key: str, gt: torch.Tensor,
+                               targets: Optional[Dict[str, torch.Tensor]]) -> torch.Tensor:
+        """取该分支应当回归的目标。关闭开关或目标缺失时回退到 GT。"""
+        if not self.branch_specific_targets:
+            return gt
+        name = self._BRANCH_TARGET_KEYS[key]
+        if targets is not None and targets.get(name) is not None:
+            return targets[name].to(device=gt.device, dtype=gt.dtype)
+        if not self._warned_missing_targets:
+            warnings.warn(
+                "branch_specific_targets=True 但未收到 "
+                f"{sorted(self._BRANCH_TARGET_KEYS.values())}; 已回退到 GT。"
+                " 请确认数据集已开启 branch_targets 且训练脚本透传了这些键。")
+            self._warned_missing_targets = True
+        return gt
+
     def forward(self, output_dict: Dict[str, torch.Tensor],
-                gt: torch.Tensor) -> Dict[str, torch.Tensor]:
+                gt: torch.Tensor,
+                branch_targets: Optional[Dict[str, torch.Tensor]] = None
+                ) -> Dict[str, torch.Tensor]:
         pred = output_dict['final']
         loss_l1 = F.l1_loss(pred, gt)
         loss = loss_l1
@@ -205,12 +241,11 @@ class GolfV7RLoss(nn.Module):
                 w = self._branch_weight(base_w)
                 if w > 0:
                     pred_b = output_dict[key]
+                    gt_b = self._resolve_branch_target(key, gt, branch_targets)
                     # Phase A.3 开关: Branch-L 只监督低频分量 (从标签层面强制分工)
                     if key == 'branch_L' and self.use_lowfreq_L:
                         pred_b = self._lowfreq(pred_b)
-                        gt_b = self._lowfreq(gt)
-                    else:
-                        gt_b = gt
+                        gt_b = self._lowfreq(gt_b)
                     bl = F.l1_loss(pred_b, gt_b)
                     loss = loss + w * bl
                     loss_dict[key] = bl

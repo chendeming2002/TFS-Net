@@ -45,6 +45,7 @@ def main():
     logger.info(f"Dataset pairing mode: {pairing}")
     if exclude_seqs:
         logger.info(f"Train exclude_seqs (hold-out protocol): {exclude_seqs}")
+    branch_targets_on = bool(cfg.get('loss', {}).get('branch_specific_targets', False))
     train_ds = SDSDDataset(
         input_root=cfg['dataset']['train_input_root'],
         target_root=cfg['dataset']['train_target_root'],
@@ -55,10 +56,17 @@ def main():
         exclude_seqs=exclude_seqs,
         dark_aug_prob=cfg['dataset'].get('dark_aug_prob', 0.0),
         dark_aug_gamma_range=cfg['dataset'].get('dark_aug_gamma_range', (1.5, 3.0)),
+        branch_targets=branch_targets_on,
+        branch_target_max_shift=cfg['dataset'].get('branch_target_max_shift', 4),
+        branch_target_lowfreq_kernel=cfg['dataset'].get('branch_target_lowfreq_kernel', 31),
     )
     if train_ds.dark_aug_prob > 0:
         logger.info(f"Dark aug ON (§6.6-A): prob={train_ds.dark_aug_prob}, "
                     f"gamma_range={train_ds.dark_aug_gamma_range} (只压暗 LQ, GT 不变)")
+    if branch_targets_on:
+        logger.info("Branch-specific targets ON: N→noise_target, L→illum_target, "
+                    f"M→motion_target (max_shift={train_ds.branch_target_max_shift}, "
+                    f"lowfreq_kernel={train_ds.branch_target_lowfreq_kernel})")
     train_loader = DataLoader(
         train_ds, batch_size=cfg['train']['batch_size'], shuffle=True,
         num_workers=cfg['dataset'].get('num_workers', 0),
@@ -166,7 +174,14 @@ def main():
             gt = gt.to(device, non_blocking=True)
 
             output_dict = model(lq)
-            loss_dict = criterion(output_dict, gt)
+            batch_targets = None
+            if branch_targets_on:
+                batch_targets = {
+                    name: meta[name].to(device, non_blocking=True)
+                    for name in ('noise_target', 'illum_target', 'motion_target')
+                    if name in meta
+                }
+            loss_dict = criterion(output_dict, gt, batch_targets)
             loss = loss_dict['loss']
 
             optimizer.zero_grad()
