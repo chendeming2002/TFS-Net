@@ -33,40 +33,25 @@ Our main contributions are summarized as follows:
 
 ### 3.1 Tri-Source Decoupled Restoration Framework
 
-We formulate low-light video enhancement as a **tri-source decoupled restoration** problem. Let $\{I_{t-k}, \dots, I_t, \dots, I_{t+k}\}$ denote a sliding window of $T = 2k+1$ consecutive low-light frames centered at the target frame $I_t$. Each observed frame $I_t$ is modeled as a composite of three underlying degradation sources acting upon a latent clean signal $X_t$:
+A low-light video window is a set of $T = 2k+1$ frames $\{I_{t-k}, \dots, I_t, \dots, I_{t+k}\}$ centered at $I_t$, and each frame is produced from a clean signal $X_t$ by two physical processes. Illumination attenuates the signal, and the sensor adds noise whose variance grows with the signal:
 
-$$I_t = \mathcal{D}\big(\underbrace{\mathcal{I}(X_t)}_{\text{illumination}},\; \underbrace{\mathcal{N}_t}_{\text{noise}},\; \underbrace{\mathcal{M}_t}_{\text{motion}}\big),$$
+$$I_t(p) = L_t(p) \cdot X_t(p) + n_t(p), \quad n_t(p) \sim \mathcal{N}\big(0,\; \sigma_s^2 \cdot L_t(p) \cdot X_t(p) + \sigma_r^2\big), \tag{1}$$
 
-where $\mathcal{I}(\cdot)$ represents the illumination degradation operator that suppresses exposure and disrupts brightness constancy, $\mathcal{N}_t$ denotes the sensor noise term, and $\mathcal{M}_t$ accounts for motion-induced corruption including blur and misalignment. The composite operator $\mathcal{D}$ captures the entangled interaction of these three sources in the observed image.
+where $L_t(p) \in (0, 1]$ is the attenuation at pixel $p$ and $\sigma_s^2$, $\sigma_r^2$ are the shot and read noise parameters, following Wei *et al.* [2], Foi *et al.* [14], and Feng *et al.* [9]. Motion adds a displacement between frames, so the content at $p$ in frame $t'$ comes from $p + \mathbf{d}_{t \to t'}(p)$ in frame $t$:
 
-Adopting the signal-dependent noise formation model of Wei *et al.* [2] and Foi *et al.* [14], and the dark-frame noise modeling of Feng *et al.* [9], the observed pixel intensity at spatial location $p$ satisfies
+$$I_{t'}(p) \approx L_{t'}(p) \cdot X_t\big(p + \mathbf{d}_{t \to t'}(p)\big) + n_{t'}(p). \tag{2}$$
 
-$$I_t(p) = L_t(p) \cdot X_t(p) + n_t(p), \quad n_t(p) \sim \mathcal{N}\big(0,\; \sigma_s^2 \cdot L_t(p) \cdot X_t(p) + \sigma_r^2\big),$$
+Together, these processes define a joint decomposition of the observation into its three sources:
 
-where $L_t(p) \in (0, 1]$ is the illumination attenuation at pixel $p$, and $\sigma_s^2$, $\sigma_r^2$ are the shot noise and read noise parameters. Across frames, motion introduces a displacement $\mathbf{d}_{t \to t'}(p)$ between frames $t$ and $t'$:
+$$I_t = \mathcal{D}\big(\mathcal{I}(X_t),\; \mathcal{N}_t,\; \mathcal{M}_t\big), \tag{3}$$
 
-$$I_{t'}(p) \approx L_{t'}(p) \cdot X_t\big(p + \mathbf{d}_{t \to t'}(p)\big) + n_{t'}(p).$$
+where $\mathcal{I}(X_t)$, $\mathcal{N}_t$, and $\mathcal{M}_t$ are the illumination, noise, and motion sources.
 
-The sources are identified along two dimensions: temporal independence, whether a degradation is independent across consecutive frames, and spatial selectivity, whether it is globally distributed or spatially localized. Their combination yields four canonical degradation types [14, 15]: globally distributed and temporally independent degradation, corresponding to read noise; spatially selective and temporally independent degradation, corresponding to signal-dependent shot noise that dominates in dark regions; globally distributed and temporally correlated degradation, corresponding to illumination variation across frames; and spatially localized and temporally correlated degradation, corresponding to motion. The first two types share temporal independence and are both suppressed by temporal aggregation, so they form the imaging noise source. The third is the illumination source, a slowly varying global bias. The fourth is the motion source, a structured displacement that requires correspondence or compensation rather than noise suppression.
+The question is how to group these processes for restoration, and the answer depends on how each one behaves across frames. Two questions sort every degradation: does it persist from one frame to the next, and does it act globally over the image or locally on a region? Crossing the answers gives four canonical types [14, 15]. Read noise is global and redrawn at every frame, and shot noise is local and redrawn at every frame, with strength set by the signal. Both are removed by temporal averaging, so they form one imaging-noise source. Illumination variation is global and persistent, a slowly changing bias over the clip. Motion is local and persistent, a displacement that must be compensated, because averaging it would only smear the moving object.
 
-The three sources exhibit fundamentally different temporal statistics, as summarized in Table 1:
+Each source therefore calls for a different operation: averaging over frames for noise, a smooth global estimate for illumination, and alignment for motion. Any two-source grouping forces one operation onto a source it does not fit. Pooling noise with motion averages misaligned frames and produces ghosting. Pooling illumination with motion estimates a bias from content that is still moving. Pooling illumination with noise estimates the gain from the noisy signal, so the subsequent correction amplifies the noise it was meant to remove. This is why a two-source split is insufficient and the three sources must be kept apart.
 
-| Property | Illumination $\mathcal{I}$ | Noise $\mathcal{N}$ | Motion $\mathcal{M}$ |
-|:---|:---|:---|:---|
-| **Temporal type** | Bias (slowly varying) | Variance (i.i.d. across $t$) | Displacement (structured) |
-| **Frame correlation** | $\|L_t - L_{t-1}\| \to 0$ | $\mathbb{E}[\mathcal{N}_t \cdot \mathcal{N}_{t'}] \approx 0,\; t \neq t'$ | $\mathbf{d}_{t \to t'} \neq 0$ in moving regions |
-| **Optimal strategy** | Spatial smoothness prior | Temporal averaging under correspondence | Alignment / compensation |
-| **Amplification chain** | Amplifies noise via $\nabla\mathcal{I}$ | Degrades $\mathcal{I}$ estimation | Breaks correspondence for denoising |
-
-This taxonomy reveals why **a two-source split is insufficient**: any grouping that merges two of the three sources into a single branch conflates degradation types with incompatible temporal statistics.
-
-- **Illumination + Noise** vs. Motion (Retinex-style): The "reflectance" component $R = I / L$ absorbs both noise and clean texture. Noise amplification during the $I/L$ division makes subsequent denoising harder, as the noise variance becomes spatially dependent on the potentially inaccurate $L$ estimate.
-- **Illumination + Motion** vs. Noise: The "structural" component absorbs both slowly varying illumination and structured motion, preventing the model from exploiting the temporal smoothness of $L$ for flicker suppression.
-- **Noise + Motion** vs. Illumination: The "residual" component absorbs both random noise and structured motion. Since noise benefits from temporal averaging while motion requires compensation, the unified component must simultaneously denoise *and* deblur, objectives whose optimal temporal processing strategies are diametrically opposed.
-
-The sources are also coupled. Illumination enhancement amplifies noise; motion breaks the temporal correspondence that multi-frame denoising relies on; and illumination estimation is misled by both noise and motion artifacts. These couplings call for decoupling at the level of representation: each source needs its own processing path, while all paths draw on the same evidence from the clip.
-
-We realize this decomposition with one dedicated branch per source. BranchN is a NAFBlock network with channel attention for the imaging noise source. BranchL adds an illumination prediction head with a Retinex-style decomposition and a learnable gamma for the illumination source. BranchM adds optical flow estimation, deformable alignment, and confidence gating for the motion source. All three branches read features from a shared encoder and temporal module, together with a Triple Query TCA that gives each branch its own query over three clip statistics: the frame mean, the spatially smoothed mean, and the peak inter-frame difference.
+Accordingly, TSDR assigns one branch to each source: BranchN for imaging noise, BranchL for illumination, and BranchM for motion. The sources are coupled, since illumination gain amplifies noise and motion breaks the frame correspondence that denoising relies on, so the branches draw on one shared temporal evidence base. A shared encoder and a MatrixRWKV temporal module produce clip-level context, and the Triple Query TCA gives each branch its own query over three clip statistics: the frame mean, the spatially smoothed mean, and the peak inter-frame difference. V7RFusion then combines the three branch outputs with per-pixel softmax weights over the center frame. Sharing evidence while separating outputs is the design goal, and Section 3.2 explains how the outputs are made to differ.
 
 ### 3.2 Source-Decoupled Supervision
 
