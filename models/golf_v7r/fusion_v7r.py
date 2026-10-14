@@ -64,21 +64,35 @@ class V7RFusion(nn.Module):
     """v7r 三分支融合 + 可选中心帧残差 (不破坏图像)
 
     mode:
-      - "softmax" : 历史实现, 纯竞争归一化 `Σ w_k·Y_k` (∂/∂Y_k = w_k, 无下界 → 会塌缩)
-      - "floored" : 新增 (推荐), 加权重下限 `g_k = ε + (1−3ε)·softmax_k` (∂/∂Y_k ≥ ε)
+      - "softmax"  : 历史实现, 纯竞争归一化 `Σ w_k·Y_k` (∂/∂Y_k = w_k, 无下界 → 会塌缩)
+      - "floored"  : 加权重下限 `g_k = ε + (1−3ε)·softmax_k` (∂/∂Y_k ≥ ε)
+      - "additive" : 加性加权 `Σ w_k·Y_k`, w_k = softplus(logit + b), 不归一化。
+        零初始化时 w_k = 1 (因为 softplus⁻¹(1) = ln(e−1)), 故初始输出 = Σ Y_k。
+        §6.19 的频带划分目标满足 ΣY_k = GT, 因此该项在初始化时就精确还原 GT。
+        ⚠️ 必须配 ΣS = GT 的目标使用; 配凸组合目标会差一个 3 倍因子。
+    residual_freeze:
+      - True 时把中心帧残差门 tanh(γ) 固定为 0。
+        动机 (§6.19): 实测 tanh(γ) 会增长到 0.47–0.60, 即最终输出有近一半直接来自
+        输入中心帧。这会掩盖三分支的问题 —— §6.17 的退化分支正是因此"最终 PSNR 看不出
+        异常"。冻结为 0 后, 融合输出必须由三分支自己承担, 任何退化都会立刻暴露在指标上。
+        这是有意的诊断性设计, 不是性能优化。
     """
+
+    # softplus(x) = 1 的解, 用于让 additive 模式的权重从 1 起步
+    _SOFTPLUS_INV_ONE = 0.5413248546129181
 
     def __init__(self, in_channels: int = 3, hidden_channels: int = 32,
                  num_blocks: int = 2, mode: str = "softmax",
-                 weight_floor: float = 0.1):
+                 weight_floor: float = 0.1, residual_freeze: bool = False):
         super().__init__()
-        if mode not in ("softmax", "floored"):
-            raise ValueError(f"mode must be 'softmax' or 'floored', got {mode!r}")
+        if mode not in ("softmax", "floored", "additive"):
+            raise ValueError(
+                f"mode must be 'softmax', 'floored' or 'additive', got {mode!r}")
         if not (0.0 <= weight_floor < 1.0 / 3.0):
             raise ValueError(f"weight_floor must be in [0, 1/3), got {weight_floor}")
         self.mode = mode
         self.weight_floor = float(weight_floor)
-        self.mode = mode
+        self.residual_freeze = bool(residual_freeze)
         gate_in = in_channels * 4  # Y_N, Y_L, Y_M, X_t
 
         # 逐像素自适应权重网络
@@ -118,11 +132,16 @@ class V7RFusion(nn.Module):
 
         if self.mode == "softmax":
             weights = F.softmax(logits, dim=1)
-        else:
+        elif self.mode == "floored":
             # 权重下限: g = ε + (1−3ε)·softmax  ⇒  Σg = 1 (仍是凸组合),
             # 且 ∂Y/∂Y_k = g_k ≥ ε, 结构性地杜绝梯度自锁死
             eps = self.weight_floor
             weights = eps + (1.0 - 3.0 * eps) * F.softmax(logits, dim=1)
+        else:
+            # 加性: 权重不归一化, softplus 保证为正且无上界。
+            # 零初始化 + 偏置 ln(e−1) ⇒ softplus(ln(e−1)) = 1, 故初始输出 = Σ Y_k。
+            # 配 ΣS = GT 的频带目标时, 初始化即精确还原 GT。
+            weights = F.softplus(logits + self._SOFTPLUS_INV_ONE)
 
         w_N, w_L, w_M = weights[:, 0:1], weights[:, 1:2], weights[:, 2:3]
         Y_fused = w_N * Y_N + w_L * Y_L + w_M * Y_M
@@ -130,8 +149,12 @@ class V7RFusion(nn.Module):
         # 轻量精化 (起点恒等, 不会破坏)
         Y_refined = self.refine(Y_fused)
 
-        # 可选中心帧残差 (gamma 从 0 起)
-        gamma = torch.tanh(self.residual_gamma)
+        # 可选中心帧残差 (gamma 从 0 起)。
+        # residual_freeze=True 时硬置 0 —— 零张量不参与梯度, 等价于该门被永久关闭。
+        if self.residual_freeze:
+            gamma = torch.zeros((), device=Y_fused.device, dtype=Y_fused.dtype)
+        else:
+            gamma = torch.tanh(self.residual_gamma)
         O_t = (Y_refined + gamma * X_t).clamp(0.0, 1.0)
 
         return {"O_t": O_t, "weights": weights, "Y_fused": Y_fused}

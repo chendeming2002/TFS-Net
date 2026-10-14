@@ -47,7 +47,8 @@ class GolfV7RLoss(nn.Module):
                  freq_phase_weight: float = 1.0,
                  dark_weight_alpha: float = 0.0,
                  dark_weight_gamma: float = 1.0,
-                 branch_specific_targets: bool = False):
+                 branch_specific_targets: bool = False,
+                 branch_target_normalize: bool = True):
         """Phase B 开关 (§6.6-B 暗区加权 + §6.9 感知/频率损失)。
 
         w_perceptual / w_freq / dark_weight_alpha:
@@ -76,6 +77,8 @@ class GolfV7RLoss(nn.Module):
         self.use_lowfreq_L = use_lowfreq_L
         self.lowfreq_kernel = int(lowfreq_kernel) if lowfreq_kernel else 16
         self.branch_specific_targets = bool(branch_specific_targets)
+        # §6.19: 三带量级差约 100 倍, 按带归一化使三路贡献可比 (仅对频率划分目标有意义)
+        self.branch_target_normalize = bool(branch_target_normalize)
         self._warned_missing_targets = False
 
         self.current_epoch = 0
@@ -247,7 +250,14 @@ class GolfV7RLoss(nn.Module):
                         pred_b = self._lowfreq(pred_b)
                         gt_b = self._lowfreq(gt_b)
                     bl = F.l1_loss(pred_b, gt_b)
-                    loss = loss + w * bl
+                    if self.branch_target_normalize and self.branch_specific_targets:
+                        # 各频带量级差约 100 倍 (低频带 |·|≈0.53, 中频 0.014, 高频 0.006),
+                        # 直接相加会让低频路独占分支梯度。除以该带自身的平均绝对值,
+                        # 使三路贡献可比 —— 这是尺度的归一化, 不改变各路的梯度方向。
+                        scale = gt_b.detach().abs().mean().clamp_min(1e-3)
+                        loss = loss + w * (bl / scale)
+                    else:
+                        loss = loss + w * bl
                     loss_dict[key] = bl
 
         # 正交约束 (作用在【特征层】F_*)

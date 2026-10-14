@@ -63,8 +63,10 @@ class SDSDDataset(Dataset):
     def __init__(self, input_root, target_root, window_size=5, mode="train", crop_size=256,
                  max_seqs=None, pairing="name", exclude_seqs=None,
                  dark_aug_prob=0.0, dark_aug_gamma_range=(1.5, 3.0),
-                 branch_targets=False, branch_target_max_shift=4,
-                 branch_target_lowfreq_kernel=31):
+                 branch_targets=False, branch_target_kernel_low=31,
+                 branch_target_kernel_high=5,
+                 branch_target_motion_share_mid=0.5,
+                 branch_target_motion_share_high=0.2):
         """SDSD 数据集。
 
         pairing:
@@ -84,9 +86,9 @@ class SDSDDataset(Dataset):
           - 0.0 (默认) → 关闭, 保持历史行为。
 
         branch_targets:
-          - 分支专属监督目标 (docs/v7/04-model-architecture.md 第四节)。开启后 meta
-            额外带 noise_target / illum_target / motion_target 三张图, 供损失函数让
-            三个分支各自回归不同目标, 从目标层面建立分工。
+          - 分支专属监督目标 (docs/v7/03-v7r-v3-design.md §6.19)。开启后 meta 额外带
+            illum_target / motion_target / noise_target 三张图 —— 它们是【GT 的频率划分】,
+            三者之和恒等于 GT。供损失函数让三个分支各自回归不同频带, 从目标层面建立分工。
           - False (默认) → 关闭, __getitem__ 返回结构与历史完全一致。
           - 仅 train 模式构造 (验证只需最终输出与 GT 比较)。
         """
@@ -105,8 +107,10 @@ class SDSDDataset(Dataset):
         self.dark_aug_prob = float(dark_aug_prob or 0.0)
         self.dark_aug_gamma_range = tuple(dark_aug_gamma_range)
         self.branch_targets = bool(branch_targets)
-        self.branch_target_max_shift = int(branch_target_max_shift)
-        self.branch_target_lowfreq_kernel = int(branch_target_lowfreq_kernel)
+        self.branch_target_kernel_low = int(branch_target_kernel_low)
+        self.branch_target_kernel_high = int(branch_target_kernel_high)
+        self.branch_target_motion_share_mid = float(branch_target_motion_share_mid)
+        self.branch_target_motion_share_high = float(branch_target_motion_share_high)
         self.samples = self._build_samples()
         self._frame_cache = _FrameLRU(capacity=24)
 
@@ -214,8 +218,10 @@ class SDSDDataset(Dataset):
         }
         if self.branch_targets and self.mode == "train":
             meta.update(build_branch_targets(
-                clip,
-                max_shift=self.branch_target_max_shift,
-                lowfreq_kernel=self.branch_target_lowfreq_kernel,
+                target,
+                kernel_low=self.branch_target_kernel_low,
+                kernel_high=self.branch_target_kernel_high,
+                motion_share_mid=self.branch_target_motion_share_mid,
+                motion_share_high=self.branch_target_motion_share_high,
             ))
         return clip, target, meta

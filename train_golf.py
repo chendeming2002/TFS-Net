@@ -62,6 +62,9 @@ def build_dataloaders(cfg, smoke=False):
     ds_cfg = cfg["dataset"]
     max_train = ds_cfg.get("max_train_seqs", None)
     max_val = ds_cfg.get("max_val_seqs", None)
+    # pairing 默认 name —— 保持历史行为。R2 原训练用的就是此默认 (错位配对),
+    # 因此做纯架构对照时必须显式设为 position (§6.10 混杂说明)。
+    pairing = ds_cfg.get("pairing", "name")
     train_set = SDSDDataset(
         input_root=ds_cfg["train_input_root"],
         target_root=ds_cfg["train_target_root"],
@@ -69,6 +72,7 @@ def build_dataloaders(cfg, smoke=False):
         mode="train",
         crop_size=ds_cfg["crop_size"],
         max_seqs=max_train,
+        pairing=pairing,
     )
     val_set = SDSDDataset(
         input_root=ds_cfg["val_input_root"],
@@ -77,6 +81,7 @@ def build_dataloaders(cfg, smoke=False):
         mode="val",
         crop_size=ds_cfg["crop_size"],
         max_seqs=max_val,
+        pairing=pairing,
     )
 
     if smoke:

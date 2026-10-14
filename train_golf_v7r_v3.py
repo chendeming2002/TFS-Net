@@ -57,16 +57,21 @@ def main():
         dark_aug_prob=cfg['dataset'].get('dark_aug_prob', 0.0),
         dark_aug_gamma_range=cfg['dataset'].get('dark_aug_gamma_range', (1.5, 3.0)),
         branch_targets=branch_targets_on,
-        branch_target_max_shift=cfg['dataset'].get('branch_target_max_shift', 4),
-        branch_target_lowfreq_kernel=cfg['dataset'].get('branch_target_lowfreq_kernel', 31),
+        branch_target_kernel_low=cfg['dataset'].get('branch_target_kernel_low', 31),
+        branch_target_kernel_high=cfg['dataset'].get('branch_target_kernel_high', 5),
+        branch_target_motion_share_mid=cfg['dataset'].get('branch_target_motion_share_mid', 0.5),
+        branch_target_motion_share_high=cfg['dataset'].get('branch_target_motion_share_high', 0.2),
     )
     if train_ds.dark_aug_prob > 0:
         logger.info(f"Dark aug ON (§6.6-A): prob={train_ds.dark_aug_prob}, "
                     f"gamma_range={train_ds.dark_aug_gamma_range} (只压暗 LQ, GT 不变)")
     if branch_targets_on:
-        logger.info("Branch-specific targets ON: N→noise_target, L→illum_target, "
-                    f"M→motion_target (max_shift={train_ds.branch_target_max_shift}, "
-                    f"lowfreq_kernel={train_ds.branch_target_lowfreq_kernel})")
+        logger.info("Branch-specific targets ON (§6.19 GT 频带划分): "
+                    "L→低频(光照), M/N 共享中高频 (运动/噪声); "
+                    f"kernel={train_ds.branch_target_kernel_low}/"
+                    f"{train_ds.branch_target_kernel_high}, "
+                    f"motion_share_mid={train_ds.branch_target_motion_share_mid}, "
+                    f"motion_share_high={train_ds.branch_target_motion_share_high}")
     train_loader = DataLoader(
         train_ds, batch_size=cfg['train']['batch_size'], shuffle=True,
         num_workers=cfg['dataset'].get('num_workers', 0),

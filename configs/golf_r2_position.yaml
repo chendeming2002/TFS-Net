@@ -1,0 +1,71 @@
+## R2 position 配对重训: 为 §6.10 的纯架构对照补齐前提
+##
+## 背景: 现有的 "v7r-v3 比 R2 高 +1.55/+1.82 dB" 这个结论混杂了两部分差异 ——
+##   架构差异 (统计先验 KV + 三路 Query + MatrixRWKV vs R2 的 Concat-KV) 与
+##   配对协议差异。证据: `pairing` 参数于 commit 7c58806 (2026-10-06) 才加入
+##   SDSDDataset, 而 R2 训练于 2026-09-17→09-20, 走默认 name 配对 (错位);
+##   v7r-v3 用 position 配对。§5.4 的受控实验已证 name 错位配对对本家族是负迁移,
+##   故 R2 被系统性拖低, +1.55 dB 不能作为纯架构声明。
+##
+## 本配置唯一变量 vs configs/golf_r2.yaml:
+##   dataset.pairing = position   (原为默认 name)
+## 其余每一项都逐字照抄 golf_r2.yaml, 以便与 R2 原 run 直接对比, 把"架构差异"
+## 从"协议差异"中分离出来。
+##
+## 判据: 重训后的 R2-position 与 v7r-v3 在 DID 上用同一协议 (--frac 0.33, 358 帧,
+##   VGG-LPIPS) 对比。此时差值方可归因于架构。
+##   ⚠️ 仍不可称为跨论文 SOTA 对比 —— 两者 best 都是在泄漏的 SDSD val 上选的。
+seed: 42
+output_dir: outputs/golf_r2_position
+
+dataset:
+  train_input_root: /home/a1005/yzy/dataset/SDSD/indoor/input
+  train_target_root: /home/a1005/yzy/dataset/SDSD/indoor/GT
+  val_input_root: /home/a1005/yzy/dataset/SDSD/test/low-light
+  val_target_root: /home/a1005/yzy/dataset/SDSD/test/GT
+  window_size: 5
+  crop_size: 256
+  num_workers: 2
+  max_val_seqs: 5
+  val_crop_size: 256
+  pairing: position
+
+model:
+  type: GolfNet
+  in_channels: 3
+  num_frames: 5
+  encoder_channels: [32, 64, 128]
+  tca_channels: 128
+  tca_heads: 4
+  tca_num_blocks: 6
+  branch_blocks: [3, 2, 3]
+  fusion_blocks: 2
+  gamma: 2.0
+
+train:
+  batch_size: 2
+  epochs: 60
+  lr: 0.0008
+  weight_decay: 0.0001
+  amp: true
+  log_interval: 50
+  val_interval: 10
+  warmup_epochs: 5
+  grad_clip: 0.5
+  grad_accum_steps: 8
+
+loss:
+  type: GolfLoss
+  lambda_N: 0.3
+  lambda_L: 0.3
+  lambda_M: 0.3
+  lambda_ortho: 0.01
+  lambda_temp: 0.02
+  lambda_div: 0.05
+  use_ssim: true
+  ssim_weight: 0.3
+
+eval:
+  tile_size: 256
+  tile_overlap: 32
+  amp: false

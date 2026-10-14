@@ -104,7 +104,8 @@ def test_backward_compat():
 
 
 def test_bad_args():
-    for bad in ("additive", "mean", ""):
+    # "additive" 自 §6.19 起是合法模式 (配频带划分目标使用), 故不在非法列表中
+    for bad in ("mean", "", "softmax_", "FLOORED"):
         try:
             V7RFusion(mode=bad)
             raise AssertionError(f"mode={bad!r} 应被拒绝")

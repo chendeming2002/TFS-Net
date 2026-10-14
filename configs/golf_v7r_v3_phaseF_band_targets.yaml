@@ -1,0 +1,96 @@
+## Phase F: GT 频带划分监督目标 + 加性融合 (§6.19 定稿)
+##
+## 相对 golf_v7r_v3_phaseE_shared_ctl.yaml 的变量:
+##   model.fusion_mode             = additive   加性融合 (非凸组合)
+##   model.fusion_residual_freeze  = true       冻结中心帧残差门
+##   loss.branch_specific_targets  = true       三路各回归一个频带
+##   loss.branch_target_normalize  = true       按带归一化 (三带幅度差约 30 倍)
+##   loss.w_branch_*               = 0.3        高于历史的 0.1
+##
+## ## 为什么融合必须改成加性
+##
+## 三路目标满足 ΣS ≡ GT (【求和】性质), 而凸组合融合给的是加权【平均】。
+## 两者放在一起差一个 3 倍因子 —— 三路都完美拟合时, softmax 融合只能输出 GT/3。
+## 实测: additive 输出均值 0.6886 = GT 均值; softmax 输出 0.2295 = GT/3。
+## 因此本轮必须用 additive, 否则残差门一冻结, 训练在数学上就不可能收敛。
+##
+## ## 三个目标怎么分
+##
+## 按 TSDR 的物理描述分配频带, 且中频/高频由 M、N 共享:
+##   BranchL (光照, 低频):     S_L = P                       低频带 (慢变、全局)
+##   BranchM (运动, 中高频):   S_M = 0.5·Q + 0.2·R           运动边界在中高频
+##   BranchN (噪声, 中到高频): S_N = 0.5·Q + 0.8·R           噪声全频段、高频显著
+## 其中 P = LPF_31(GT), Q = LPF_5(GT) − P, R = GT − LPF_5(GT), P+Q+R ≡ GT。
+##
+## 早期版本把 N 限制在最细高频 (S_N = R), 实测该带幅度远低于低频带, N 路等于拿到空图,
+## 学不到去噪 —— 与 TSDR "噪声全频段" 的描述矛盾。共享写法下 N 含高频 80% + 中频 50%。
+##
+## ## 加性融合的抗塌缩性质 (不再需要权重下限)
+##
+## ∂O/∂Y_k = w_k = softplus(logit_k + ln(e−1)), 零初始化时 w_k = 1。
+## softplus 恒正, 某一路权重无法被压到 0; 且某路若塌缩, 它负责的整个频带在输出中缺失,
+## 误差陡增, 梯度会把该路推回来 —— 分区本身即抗塌缩机制。
+##
+## ## 判据 (预先登记, 四条必须一起读)
+##
+##   1. 三路与各自目标的误差随训练下降        ← 确认每路在学该学的东西
+##   2. 三路输出余弦显著低于 0.99             ← 分工的直接体现
+##   3. 三路单独 PSNR 都在合理区间            ← 排除"某路塌成常数"
+##   4. 消融: 去掉任一路后指标明显变差        ← 分工的功能证据
+##   ⚠️ 判据 4 单独看会被误导: 塌成常数的分支消融代价同样大 (§6.18 的教训)。
+##
+## 先跑 1 个 5ep 单 run 看判据 1/3, 再决定是否铺开 3v3。
+seed: 42
+output_dir: outputs/golf_v7r_v3_phaseF_band_targets
+
+dataset:
+  train_input_root: /home/a1005/yzy/dataset/SDSD/indoor/input
+  train_target_root: /home/a1005/yzy/dataset/SDSD/indoor/GT
+  val_input_root: /home/a1005/yzy/dataset/SDSD/test/low-light
+  val_target_root: /home/a1005/yzy/dataset/SDSD/test/GT
+  window_size: 5
+  crop_size: 256
+  num_workers: 0
+  pairing: position
+  branch_target_kernel_low: 31
+  branch_target_kernel_high: 5
+  branch_target_motion_share_mid: 0.5
+  branch_target_motion_share_high: 0.2
+
+model:
+  fusion_mode: additive
+  fusion_residual_freeze: true
+  num_frames: 5
+  encoder_channels: [32, 64, 128]
+  feature_dim: 128
+  rwkv_dim: 192
+  rwkv_heads: 6
+  rwkv_head_size: 32
+  rwkv_blocks: 2
+  spatial_size: 2
+  branch_channels: 128
+  motion_aware_diff: false
+  diff_smooth_kernel: 5
+
+train:
+  batch_size: 2
+  epochs: 60
+  lr: 0.0005657
+  weight_decay: 0.01
+  log_interval: 100
+  val_interval: 5
+  grad_clip: 1.0
+  ckpt_interval: 500
+  lpips_net: vgg
+
+loss:
+  w_branch_N: 0.3
+  w_branch_L: 0.3
+  w_branch_M: 0.3
+  lambda_ortho: 0.01
+  w_ssim: 0.0
+  branch_warmup_epochs: 5
+  use_lowfreq_L: false
+  lowfreq_kernel: 16
+  branch_specific_targets: true
+  branch_target_normalize: true

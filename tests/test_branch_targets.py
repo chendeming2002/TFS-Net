@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""分支专属监督目标的单元测试 (docs/v7/04-model-architecture.md 第四节)。
+"""GT 频带划分监督目标 + 加性融合的单元测试 (docs/v7/03-v7r-v3-design.md §6.19)。
 
-验证:
-  1. 三个目标互不相同 —— 这是整个方案的前提, 若目标相同则等于什么都没改;
-  2. 目标的物理性质符合设计 (时序均值比单帧噪声小; 光照归一化去掉了低频差异);
-  3. 对齐搜索能找到正确位移 (用人工平移的合成片段验证);
-  4. 损失函数在开关打开时真的用了三个不同目标, 关闭时与历史行为逐位一致;
-  5. 目标缺失时回退到 GT 并告警, 不崩溃;
-  6. 反传正常。
+设计要点与对应的验证:
+  1. **ΣS ≡ GT** —— 三个目标之和恒等于 GT。加性融合在权重为 1 时精确还原 GT;
+  2. **中频/高频由 M、N 共享** —— N 覆盖中频到高频, 不局限于最细高频;
+  3. **三带两两正交** —— 不存在两路学同一张图 (可用性由共享比例调节);
+  4. **中高频带均值为零** —— 输出常数在这些带上的误差即 GT 自身能量;
+  5. **加性融合初始化即精确还原** —— 这是与凸组合的关键区别。
+     凸组合 Σw=1 配 ΣS=GT 会差 3 倍因子, 是本设计必须避开的历史错误。
 
 运行:
     PYTHONPATH=. python tests/test_branch_targets.py
@@ -17,179 +17,297 @@ import sys
 import warnings
 
 import torch
+import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from datasets.branch_targets import (_best_global_shift, _integer_shift,
-                                     build_branch_targets)
+from datasets.branch_targets import build_branch_targets, lowpass
+from models.golf_v7r.fusion_v7r import V7RFusion
 from models.golf_v7r.loss import GolfV7RLoss
 
 
-def test_targets_are_distinct():
-    """三个目标必须互不相同, 否则方案等价于什么都没改。"""
+def test_partition_sums_to_gt():
+    """三个目标之和必须恒等于 GT —— 加性融合可达性的依据。"""
     torch.manual_seed(0)
-    clip = torch.rand(5, 3, 64, 64)
-    t = build_branch_targets(clip)
-
-    for name in ('noise_target', 'illum_target', 'motion_target'):
-        assert name in t, f"缺少 {name}"
-        assert t[name].shape == (3, 64, 64), t[name].shape
-
-    pairs = [('noise_target', 'illum_target'),
-             ('noise_target', 'motion_target'),
-             ('illum_target', 'motion_target')]
-    for a, b in pairs:
-        diff = (t[a] - t[b]).abs().mean().item()
-        assert diff > 1e-3, f"{a} 与 {b} 几乎相同 (平均差 {diff:.2e})"
-    print("  [ok] 三目标互不相同: " + ", ".join(
-        f"{a[0]}-{b[0]}={(t[a] - t[b]).abs().mean().item():.4f}" for a, b in pairs))
+    gt = torch.rand(3, 64, 64)
+    t = build_branch_targets(gt, kernel_low=31, kernel_high=5)
+    total = t['illum_target'] + t['motion_target'] + t['noise_target']
+    err = (total - gt).abs().max().item()
+    assert err < 1e-6, f"三目标之和与 GT 不符, 最大误差 {err:.2e}"
+    print(f"  [ok] ΣS ≡ GT (最大误差 {err:.2e})")
 
 
-def test_noise_target_reduces_variance():
-    """时序均值目标应当比单帧噪声更小 —— 这是 N 路该学它的理由。"""
-    torch.manual_seed(1)
-    clean = torch.rand(1, 3, 48, 48).repeat(5, 1, 1, 1)
-    noisy = (clean + 0.1 * torch.randn_like(clean)).clamp(0, 1)
-    t = build_branch_targets(noisy)
+def test_motion_and_noise_share_mid_and_high():
+    """M 与 N 必须同时含有中频与高频成分 —— 这是"共享"的定义。
 
-    center_err = (noisy[2] - clean[2]).abs().mean().item()
-    avg_err = (t['noise_target'] - clean[2]).abs().mean().item()
-    assert avg_err < center_err, f"时序均值未降噪: {avg_err:.4f} >= {center_err:.4f}"
-    print(f"  [ok] 时序均值降噪: 中心帧误差 {center_err:.4f} → 均值误差 {avg_err:.4f}")
-
-
-def test_illum_target_removes_lowfreq():
-    """光照归一化目标应当去掉整体亮度差异 —— 这是 L 路该学它的理由。
-
-    两个只差一个全局亮度系数的片段, 归一化后的目标应当非常接近。
+    早期版本把 N 限定在最细高频 (GT − LPF_5(GT)), 实测该带幅度远低于低频带,
+    N 路等于拿到空图。此处直接核验两路在 Q、R 上的份额。
     """
+    torch.manual_seed(1)
+    gt = torch.rand(3, 128, 128)
+    kl, kh = 31, 5
+    lp_low = lowpass(gt, kl)
+    lp_high = lowpass(gt, kh)
+    Q = lp_high - lp_low      # 中频
+    R = gt - lp_high          # 高频
+
+    t = build_branch_targets(gt, kernel_low=kl, kernel_high=kh,
+                             motion_share_mid=0.5, motion_share_high=0.2)
+    want_m = 0.5 * Q + 0.2 * R
+    want_n = 0.5 * Q + 0.8 * R
+    assert torch.allclose(t['motion_target'], want_m, atol=1e-6), "M 的中高频份额不符"
+    assert torch.allclose(t['noise_target'], want_n, atol=1e-6), "N 的中高频份额不符"
+    print("  [ok] M/N 共享中频与高频 (N: 中频 50% + 高频 80%; M: 中频 50% + 高频 20%)")
+
+
+def test_noise_band_is_not_trivial():
+    """N 路的幅度必须与其它两路可比 —— 不能是"几乎空白的图"。"""
     torch.manual_seed(2)
-    base = torch.rand(5, 3, 64, 64) * 0.5 + 0.25
-    dim = (base * 0.5).clamp(0, 1)
-
-    t_base = build_branch_targets(base)
-    t_dim = build_branch_targets(dim)
-
-    raw_gap = (base[2] - dim[2]).abs().mean().item()
-    illum_gap = (t_base['illum_target'] - t_dim['illum_target']).abs().mean().item()
-    assert illum_gap < raw_gap, f"归一化未去掉亮度差: {illum_gap:.4f} >= {raw_gap:.4f}"
-    print(f"  [ok] 光照归一化: 原始亮度差 {raw_gap:.4f} → 归一化后 {illum_gap:.4f}")
+    gt = torch.rand(3, 128, 128) * 0.6 + 0.2
+    t = build_branch_targets(gt, kernel_low=31, kernel_high=5)
+    amp = {k: v.abs().mean().item() for k, v in t.items()}
+    ratio = amp['noise_target'] / amp['illum_target']
+    assert ratio > 0.02, f"N 路幅度仅为 L 路的 {ratio:.1%}, 过低"
+    print(f"  [ok] 三路幅度可比: L={amp['illum_target']:.4f}, "
+          f"M={amp['motion_target']:.4f}, N={amp['noise_target']:.4f}")
 
 
-def test_shift_search_finds_known_offset():
-    """对齐搜索应当能找到人工注入的位移。"""
+def test_high_bands_have_zero_mean():
+    """中频与高频目标的均值为零 —— "常数不可行"的依据。"""
     torch.manual_seed(3)
-    ref = torch.rand(3, 48, 48)
-    for want in [(0, 0), (2, 0), (0, -2), (-2, 2), (4, -4)]:
-        moved = _integer_shift(ref, want[0], want[1])
-        # 反向找: moved 需要被平移 -want 才能回到 ref
-        found = _best_global_shift(ref, moved, max_shift=4, step=2)
-        assert found == (-want[0], -want[1]), f"want {want}, got {found}"
-    print("  [ok] 位移搜索在 ±4 (step=2) 内全部命中")
+    gt = torch.rand(3, 128, 128) * 0.8 + 0.1
+    t = build_branch_targets(gt, kernel_low=31, kernel_high=5)
+    for name in ('motion_target', 'noise_target'):
+        m = t[name].mean().item()
+        assert abs(m) < 0.01, f"{name} 均值 {m:+.4f} 偏大, 常数输出可能蒙混过关"
+    print(f"  [ok] 中/高频带均值为零 (M={t['motion_target'].mean():+.5f}, "
+          f"N={t['noise_target'].mean():+.5f})")
+
+
+def test_targets_are_distinct():
+    """三个目标必须互不相同 —— 否则等于什么都没改 (§6.18 的失败模式)。"""
+    torch.manual_seed(4)
+    gt = torch.rand(3, 128, 128)
+    t = build_branch_targets(gt, kernel_low=31, kernel_high=5)
+    pairs = [('illum_target', 'motion_target'), ('illum_target', 'noise_target'),
+             ('motion_target', 'noise_target')]
+    for a, b in pairs:
+        d = (t[a] - t[b]).abs().mean().item()
+        assert d > 1e-3, f"{a} 与 {b} 几乎相同 (平均绝对差 {d:.5f})"
+    print("  [ok] 三目标互不相同: " + ", ".join(
+        f"{a[0]}-{b[0]}={(t[a]-t[b]).abs().mean().item():.4f}" for a, b in pairs))
+
+
+def test_additive_fusion_reproduces_gt():
+    """加性融合在三路各拟合自己目标时, 必须精确还原 GT。
+
+    这是与凸组合的关键区别: 凸组合给的是加权【平均】, 而 ΣS = GT 是【求和】性质,
+    两者相差 3 倍因子。历史上正是这个错误导致设计不可行。
+    """
+    torch.manual_seed(5)
+    gt = torch.rand(3, 64, 64)
+    t = build_branch_targets(gt, kernel_low=15, kernel_high=5)
+    YL = t['illum_target'].unsqueeze(0)
+    YM = t['motion_target'].unsqueeze(0)
+    YN = t['noise_target'].unsqueeze(0)
+    x = torch.zeros_like(YL)
+
+    fus = V7RFusion(mode='additive', residual_freeze=True)
+    out = fus(YN, YL, YM, x)
+    w = [round(out['weights'][0, i].mean().item(), 4) for i in range(3)]
+    assert all(abs(v - 1.0) < 1e-4 for v in w), f"初始权重应为 1, 实测 {w}"
+    err = (out['O_t'] - gt.unsqueeze(0).clamp(0, 1)).abs().max().item()
+    assert err < 1e-4, f"加性融合未能还原 GT, 最大误差 {err:.4f}"
+    print(f"  [ok] 加性融合初始化即精确还原 GT (权重={w}, 误差={err:.2e})")
+
+
+def test_convex_fusion_would_fail():
+    """反证: 凸组合配频带目标会差 3 倍 —— 记录这个历史错误, 防止回退。"""
+    torch.manual_seed(6)
+    gt = torch.rand(3, 64, 64)
+    t = build_branch_targets(gt, kernel_low=15, kernel_high=5)
+    YL = t['illum_target'].unsqueeze(0)
+    YM = t['motion_target'].unsqueeze(0)
+    YN = t['noise_target'].unsqueeze(0)
+    x = torch.zeros_like(YL)
+    fus = V7RFusion(mode='softmax', residual_freeze=True)
+    out = fus(YN, YL, YM, x)
+    ratio = gt.mean().item() / max(out['O_t'].mean().item(), 1e-9)
+    assert abs(ratio - 3.0) < 0.05, f"预期差 3 倍, 实测 {ratio:.2f}"
+    print(f"  [ok] 反证: 凸组合差 3 倍 (GT/输出 = {ratio:.2f}) → 必须用加性")
+
+
+def test_additive_gradient_is_positive():
+    """加性模式下权重恒为正, 不存在"某路权重归零则梯度断流"的问题。"""
+    torch.manual_seed(7)
+    fus = V7RFusion(mode='additive')
+    with torch.no_grad():          # 极端负偏置: softplus 仍严格为正
+        fus.weight_net[-1].bias.fill_(-20.0)
+    y = [torch.rand(1, 3, 16, 16) for _ in range(3)]
+    out = fus(y[0], y[1], y[2], torch.zeros_like(y[0]))
+    wmin = out['weights'].min().item()
+    assert wmin > 0, f"权重出现非正值 {wmin}"
+    print(f"  [ok] 极端负偏置下权重仍为正 (min w = {wmin:.2e})")
+
+
+def test_constant_output_is_penalized():
+    """常数输出必须在中/高频带上产生显著误差 (封死平凡解)。"""
+    torch.manual_seed(8)
+    gt = torch.rand(3, 128, 128) * 0.8 + 0.1
+    t = build_branch_targets(gt, kernel_low=31, kernel_high=5)
+    pred = torch.full_like(t['noise_target'], float(t['noise_target'].mean()))
+    err = F.l1_loss(pred, t['noise_target']).item()
+    assert err > 1e-3, f"常数输出在 N 带上的误差仅 {err:.5f}"
+    print(f"  [ok] 常数输出在 N 带上误差 = {err:.5f} (正常输出为 0)")
+
+
+def test_band_normalization_balances_contributions():
+    """按带归一化后三路分支损失可比 —— 否则低频路独占梯度。"""
+    torch.manual_seed(9)
+    gt = torch.rand(2, 3, 64, 64) * 0.8 + 0.1
+    y = torch.zeros(2, 3, 64, 64)
+    out = {'final': y, 'branch_N': y, 'branch_L': y, 'branch_M': y,
+           'ortho_loss': torch.tensor(0.1)}
+    t = build_branch_targets(gt[0], kernel_low=15, kernel_high=5)
+    targets = {k: v.unsqueeze(0).repeat(2, 1, 1, 1) for k, v in t.items()}
+
+    kw = dict(branch_specific_targets=True, branch_warmup_epochs=0)
+    raw = GolfV7RLoss(branch_target_normalize=False, **kw)(out, gt, targets)
+    norm = GolfV7RLoss(branch_target_normalize=True, **kw)(out, gt, targets)
+
+    ratio_raw = raw['branch_L'].item() / max(raw['branch_M'].item(), 1e-9)
+    assert ratio_raw > 3, f"原始 L/M 损失应差 3 倍以上, 实测 {ratio_raw:.1f}"
+
+    def contribution(d, branch_key, target_name):
+        scale = targets[target_name].abs().mean().clamp_min(1e-3).item()
+        return d[branch_key].item() / scale
+
+    l_n = contribution(norm, 'branch_L', 'illum_target')
+    m_n = contribution(norm, 'branch_M', 'motion_target')
+    assert abs(l_n / max(m_n, 1e-9) - 1.0) < 0.05, f"归一化后应接近, 实测 {l_n/m_n:.3f}"
+    assert norm['loss'].item() != raw['loss'].item(), "归一化未影响总损失"
+    print(f"  [ok] 按带归一化: 原始比 {ratio_raw:.1f} → 归一化后 {l_n/m_n:.3f}")
+
+
+def test_bad_args_rejected():
+    """kernel 顺序错误、共享比例越界、偶数核都必须报错。"""
+    gt = torch.rand(3, 32, 32)
+    for kw, what in [({'kernel_low': 5, 'kernel_high': 15}, 'kernel 顺序'),
+                     ({'motion_share_mid': 1.5}, '共享比例越界')]:
+        try:
+            build_branch_targets(gt, **kw)
+        except ValueError:
+            continue
+        raise AssertionError(f"{what} 未被拒绝")
+    try:
+        lowpass(gt, 16)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("偶数核未被拒绝")
+    print("  [ok] 非法参数均被正确拒绝")
 
 
 def test_loss_uses_distinct_targets():
-    """开关打开时, 三路的分支损失必须对各自目标计算。"""
-    torch.manual_seed(4)
+    """开关打开时三路分别对各自频带算 L1。"""
+    torch.manual_seed(10)
     gt = torch.rand(2, 3, 32, 32)
     y = torch.rand(2, 3, 32, 32)
     out = {'final': y, 'branch_N': y.clone(), 'branch_L': y.clone(),
            'branch_M': y.clone(), 'ortho_loss': torch.tensor(0.1)}
+    t = build_branch_targets(gt[0], kernel_low=9, kernel_high=5)
+    targets = {k: v.unsqueeze(0).repeat(2, 1, 1, 1) for k, v in t.items()}
 
-    targets = {
-        'noise_target': torch.zeros(2, 3, 32, 32),
-        'illum_target': torch.ones(2, 3, 32, 32),
-        'motion_target': torch.full((2, 3, 32, 32), 0.5),
-    }
     crit = GolfV7RLoss(branch_specific_targets=True, branch_warmup_epochs=0)
     d = crit(out, gt, targets)
-
-    # 三路分支损失应当互不相同 (因为目标是 0 / 1 / 0.5 三个不同常数)
-    vals = [d['branch_N'].item(), d['branch_L'].item(), d['branch_M'].item()]
-    assert len(set(round(v, 6) for v in vals)) == 3, f"三路损失未分化: {vals}"
-    # 逐项核对: 对常数目标, L1 = mean|y - c|
-    for key, name in (('branch_N', 'noise_target'),
-                      ('branch_L', 'illum_target'),
+    for key, name in (('branch_N', 'noise_target'), ('branch_L', 'illum_target'),
                       ('branch_M', 'motion_target')):
-        want = (y - targets[name]).abs().mean().item()
+        want = F.l1_loss(y, targets[name]).item()
         assert abs(d[key].item() - want) < 1e-6, (key, d[key].item(), want)
-    print(f"  [ok] 三路分别回归各自目标: N/L/M = "
+    vals = [d['branch_N'].item(), d['branch_L'].item(), d['branch_M'].item()]
+    print(f"  [ok] 三路分别回归各自频带: N/L/M = "
           f"{vals[0]:.4f} / {vals[1]:.4f} / {vals[2]:.4f}")
 
 
 def test_loss_default_matches_history():
-    """开关默认关闭时, 损失必须与历史行为逐位一致。"""
-    torch.manual_seed(5)
+    """默认关闭时与历史行为逐位一致。"""
+    torch.manual_seed(11)
     gt = torch.rand(2, 3, 32, 32)
     out = {'final': torch.rand(2, 3, 32, 32),
            'branch_N': torch.rand(2, 3, 32, 32),
            'branch_L': torch.rand(2, 3, 32, 32),
            'branch_M': torch.rand(2, 3, 32, 32),
            'ortho_loss': torch.tensor(0.1)}
-
     legacy = GolfV7RLoss()(out, gt)
-    # 即使传入 targets, 开关关闭时也应当忽略
     with_targets = GolfV7RLoss()(out, gt, {
-        'noise_target': torch.zeros(2, 3, 32, 32),
-        'illum_target': torch.ones(2, 3, 32, 32),
-        'motion_target': torch.full((2, 3, 32, 32), 0.5),
-    })
-    assert torch.equal(legacy['loss'], with_targets['loss']), "关闭时不应受 targets 影响"
+        'noise_target': torch.rand(2, 3, 32, 32),
+        'illum_target': torch.rand(2, 3, 32, 32),
+        'motion_target': torch.rand(2, 3, 32, 32)})
+    assert torch.equal(legacy['loss'], with_targets['loss'])
     print(f"  [ok] 默认关闭时行为不变 (loss={legacy['loss'].item():.6f})")
 
 
 def test_missing_targets_fall_back_with_warning():
-    """开关打开但目标缺失时, 应当回退到 GT 并告警, 不崩溃。"""
-    torch.manual_seed(6)
+    """目标缺失时回退到 GT 并告警。"""
+    torch.manual_seed(12)
     gt = torch.rand(2, 3, 32, 32)
     y = torch.rand(2, 3, 32, 32)
     out = {'final': y, 'branch_N': y.clone(), 'branch_L': y.clone(),
            'branch_M': y.clone(), 'ortho_loss': torch.tensor(0.1)}
-
     crit = GolfV7RLoss(branch_specific_targets=True, branch_warmup_epochs=0)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        d = crit(out, gt, None)
-        assert any("branch_specific_targets" in str(w.message) for w in caught), \
-            "目标缺失时未告警"
-    # 回退到 GT 后三路损失应当相同
-    vals = [d['branch_N'].item(), d['branch_L'].item(), d['branch_M'].item()]
-    assert max(vals) - min(vals) < 1e-9, f"回退后三路应一致: {vals}"
+        crit(out, gt, None)
+        assert any("branch_specific_targets" in str(w.message) for w in caught)
     print("  [ok] 目标缺失时回退到 GT 并告警")
 
 
+def test_residual_freeze():
+    """残差门冻结后, 最终输出不得再混入中心帧。"""
+    torch.manual_seed(13)
+    fused = V7RFusion(mode='additive', residual_freeze=True)
+    y = [torch.rand(1, 3, 16, 16) for _ in range(3)]
+    x = torch.zeros(1, 3, 16, 16)
+    out = fused(y[0], y[1], y[2], x)
+    ref = fused.refine(sum(y)).clamp(0, 1)   # 权重为 1 时即 Σy
+    assert torch.allclose(out['O_t'], ref, atol=1e-6), "冻结后输出仍受中心帧影响"
+    print("  [ok] 残差门冻结后输出完全由三分支决定")
+
+
 def test_backward():
-    """反传必须正常, 且梯度确实经过三路分支。"""
-    torch.manual_seed(7)
+    """反传正常, 三路梯度均非零。"""
+    torch.manual_seed(14)
     gt = torch.rand(2, 3, 32, 32)
     final = torch.rand(2, 3, 32, 32, requires_grad=True)
-    y_n = torch.rand(2, 3, 32, 32, requires_grad=True)
-    y_l = torch.rand(2, 3, 32, 32, requires_grad=True)
-    y_m = torch.rand(2, 3, 32, 32, requires_grad=True)
-    out = {'final': final, 'branch_N': y_n, 'branch_L': y_l, 'branch_M': y_m,
-           'ortho_loss': torch.tensor(0.1)}
-    targets = {
-        'noise_target': torch.rand(2, 3, 32, 32),
-        'illum_target': torch.rand(2, 3, 32, 32),
-        'motion_target': torch.rand(2, 3, 32, 32),
-    }
+    tensors = {k: torch.rand(2, 3, 32, 32, requires_grad=True) for k in ('N', 'L', 'M')}
+    out = {'final': final, 'branch_N': tensors['N'], 'branch_L': tensors['L'],
+           'branch_M': tensors['M'], 'ortho_loss': torch.tensor(0.1)}
+    t = build_branch_targets(gt[0], kernel_low=9, kernel_high=5)
+    targets = {k: v.unsqueeze(0).repeat(2, 1, 1, 1) for k, v in t.items()}
     crit = GolfV7RLoss(branch_specific_targets=True, branch_warmup_epochs=0)
     crit(out, gt, targets)['loss'].backward()
-    for name, tensor in (('final', final), ('branch_N', y_n),
-                         ('branch_L', y_l), ('branch_M', y_m)):
+    for name, tensor in [('final', final)] + list(tensors.items()):
         assert tensor.grad is not None and tensor.grad.abs().sum() > 0, f"{name} 无梯度"
     print("  [ok] 反传正常, 三路梯度均非零")
 
 
 def main():
-    print("分支专属监督目标单测:")
+    print("GT 频带划分目标 + 加性融合单测 (§6.19):")
+    test_partition_sums_to_gt()
+    test_motion_and_noise_share_mid_and_high()
+    test_noise_band_is_not_trivial()
+    test_high_bands_have_zero_mean()
     test_targets_are_distinct()
-    test_noise_target_reduces_variance()
-    test_illum_target_removes_lowfreq()
-    test_shift_search_finds_known_offset()
+    test_additive_fusion_reproduces_gt()
+    test_convex_fusion_would_fail()
+    test_additive_gradient_is_positive()
+    test_constant_output_is_penalized()
+    test_band_normalization_balances_contributions()
+    test_bad_args_rejected()
     test_loss_uses_distinct_targets()
     test_loss_default_matches_history()
     test_missing_targets_fall_back_with_warning()
+    test_residual_freeze()
     test_backward()
     print("\n全部通过 ✅")
 
