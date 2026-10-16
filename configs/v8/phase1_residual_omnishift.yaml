@@ -1,0 +1,83 @@
+## v8 Phase 1: b 方案 (对齐残差目标) + BranchM 修复 + OmniShift + ChannelMix
+##
+## 对比基准 configs/golf_v7r_v3_phaseF_band_targets.yaml 的变化:
+##
+## (1) branch_target_mode = "residual"   M 路改为对齐残差 GT - A
+##     S_M = GT - A, S_L = LPF(A), S_N = A - LPF(A)  → ΣS=GT, corr(S_N,S_M)≈0
+##     (旧方案 band: S_M = 0.5Q+0.2R, corr(S_N,S_M)=+0.93, 两路可互相替代)
+##
+## (2) model.spatial_head = "v8"         Omni-Shift + Channel Mix 空间头
+##     OmniShift: α[0]x + α[1]DW1x1 + α[2]DW3x3 + α[3]DW5x5 (可重参数化)
+##     ChannelMix: 2层 MLP + LeakyReLU, 末层零初始化 (补齐 RWKV block 的两段式结构)
+##
+## (3) branch_m 修复: LayerNorm2d + LeakyReLU
+##     GELU 在全新初始化时健康, 但训练过程中 upsample 输出尺度失控 (std 28→1),
+##     导致 to_rgb 首层输出全为负、GELU 完全死亡。
+##     修复: 在 upsample 后插入 LayerNorm2d; 激活改为 LeakyReLU 避免负半轴零梯度。
+##
+## 判据 (必须全部达标才算 M 路真正活起来):
+##   1. branch_M bstd 随训练增长 (应从 0.0010 涨到 0.01 以上)
+##   2. 三路输出余弦显著低于 0.99
+##   3. 三路单独 PSNR 都在合理区间
+##   4. 消融: 去掉 M 路后指标明显变差 (b 方案特有保证: L+N 的和≠GT, 融合必须要 M)
+##
+## 参数量对比:
+##   baseline (legacy head): 3.7423M
+##   v8 (spatial_head=v8):   4.1490M (+0.41M, 全部来自 ChannelMix)
+##
+## 启动后前几百步看 bstd 的 M 列是否开始上升, 如仍停在 0.001 则怀疑 b 方案本身也有问题。
+seed: 42
+output_dir: outputs/v8_phase1_residual_omnishift
+
+dataset:
+  train_input_root: /home/a1005/yzy/dataset/SDSD/indoor/input
+  train_target_root: /home/a1005/yzy/dataset/SDSD/indoor/GT
+  val_input_root: /home/a1005/yzy/dataset/SDSD/test/low-light
+  val_target_root: /home/a1005/yzy/dataset/SDSD/test/GT
+  window_size: 5
+  crop_size: 256
+  num_workers: 0
+  pairing: position
+  branch_target_mode: residual
+  branch_target_kernel_low: 31
+  branch_target_max_shift: 4
+
+model:
+  fusion_mode: additive
+  fusion_residual_freeze: true
+  spatial_head: v8
+  channel_mix_rate: 4
+  num_frames: 5
+  encoder_channels: [32, 64, 128]
+  feature_dim: 128
+  rwkv_dim: 192
+  rwkv_heads: 6
+  rwkv_head_size: 32
+  rwkv_blocks: 2
+  spatial_size: 2
+  branch_channels: 128
+  motion_aware_diff: false
+  diff_smooth_kernel: 5
+
+train:
+  batch_size: 2
+  epochs: 60
+  lr: 0.0005657
+  weight_decay: 0.01
+  log_interval: 100
+  val_interval: 5
+  grad_clip: 1.0
+  ckpt_interval: 500
+  lpips_net: vgg
+
+loss:
+  w_branch_N: 0.3
+  w_branch_L: 0.3
+  w_branch_M: 0.3
+  lambda_ortho: 0.01
+  w_ssim: 0.0
+  branch_warmup_epochs: 5
+  use_lowfreq_L: false
+  lowfreq_kernel: 16
+  branch_specific_targets: true
+  branch_target_normalize: true

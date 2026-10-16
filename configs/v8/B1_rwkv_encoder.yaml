@@ -1,0 +1,71 @@
+## v8 B1: 编码器 NAFBlock → 空间 RWKV block
+##
+## 变量 (相对 outputs/v8_branchM_fix/_cfg.yaml, 即 band 目标 + legacy 空间头 + additive 融合):
+##   model.encoder_block = "rwkv"   编码器每层的 NAFBlock 换成 RWKVEncoderBlock
+##
+## RWKVEncoderBlock 复用 SpatialRWKVHeadV8 (OmniShift + 双向扫描 + Channel Mix),
+## 在编码器里 Q 与 K/V 同源 (单帧自注意力)。接口与 NAFBlock 一致 (同形状进出)。
+##
+## 这是本轮**唯一变动**的变量, 其余配置与 Mfix 完全相同, 因此可以直接归因。
+##
+## 与 NAFBlock 的实质差异: 感受野从局部 (卷积层数决定) 变为全局 (双向扫描覆盖整图)。
+## 参数量: 编码器从 409.5K 升到 628.2K。
+##
+## 判据 (放宽, 属探索性): 指标不明显变差 (落在 seed 方差内) 且显存可控即可采纳。
+##   ⚠️ 本机 5 epoch seed 间方差达 2.4–3.2 dB, 因此不与任何 run 比较 PSNR 数值。
+##   主要看: (1) 训练能否稳定收敛 (损失不上升失控); (2) 显存与步时是否可接受;
+##           (3) 三路活性 (bstd) 是否与 baseline 同量级。
+seed: 42
+output_dir: outputs/v8_B1_rwkv_encoder
+dataset:
+  train_input_root: /home/a1005/yzy/dataset/SDSD/indoor/input
+  train_target_root: /home/a1005/yzy/dataset/SDSD/indoor/GT
+  val_input_root: /home/a1005/yzy/dataset/SDSD/test/low-light
+  val_target_root: /home/a1005/yzy/dataset/SDSD/test/GT
+  window_size: 5
+  crop_size: 256
+  num_workers: 0
+  pairing: position
+  branch_target_kernel_low: 31
+  branch_target_kernel_high: 5
+  branch_target_motion_share_mid: 0.5
+  branch_target_motion_share_high: 0.2
+model:
+  fusion_mode: additive
+  fusion_residual_freeze: true
+  num_frames: 5
+  encoder_channels:
+  - 32
+  - 64
+  - 128
+  feature_dim: 128
+  rwkv_dim: 192
+  rwkv_heads: 6
+  rwkv_head_size: 32
+  rwkv_blocks: 2
+  spatial_size: 2
+  branch_channels: 128
+  motion_aware_diff: false
+  diff_smooth_kernel: 5
+  encoder_block: rwkv
+train:
+  batch_size: 2
+  epochs: 60
+  lr: 0.0005657
+  weight_decay: 0.01
+  log_interval: 100
+  val_interval: 5
+  grad_clip: 1.0
+  ckpt_interval: 500
+  lpips_net: vgg
+loss:
+  w_branch_N: 0.3
+  w_branch_L: 0.3
+  w_branch_M: 0.3
+  lambda_ortho: 0.01
+  w_ssim: 0.0
+  branch_warmup_epochs: 5
+  use_lowfreq_L: false
+  lowfreq_kernel: 16
+  branch_specific_targets: true
+  branch_target_normalize: true

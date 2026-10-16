@@ -6,7 +6,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-from .branch_targets import build_branch_targets
+from .branch_targets import build_branch_targets, build_branch_targets_residual
 from .transforms import random_dark_gamma, random_flip_pair, random_time_reverse
 
 try:
@@ -66,7 +66,8 @@ class SDSDDataset(Dataset):
                  branch_targets=False, branch_target_kernel_low=31,
                  branch_target_kernel_high=5,
                  branch_target_motion_share_mid=0.5,
-                 branch_target_motion_share_high=0.2):
+                 branch_target_motion_share_high=0.2,
+                 branch_target_mode="band", branch_target_max_shift=4):
         """SDSD 数据集。
 
         pairing:
@@ -91,6 +92,10 @@ class SDSDDataset(Dataset):
             三者之和恒等于 GT。供损失函数让三个分支各自回归不同频带, 从目标层面建立分工。
           - False (默认) → 关闭, __getitem__ 返回结构与历史完全一致。
           - 仅 train 模式构造 (验证只需最终输出与 GT 比较)。
+        branch_target_mode:
+          - "band"(默认): 按频带划分, M 与 N 共享中高频 (v7.5 定稿方案)。
+          - "residual"(v8 b 方案): M 路改为对齐残差 GT − A, 与 N 路不重叠。
+            详见 datasets/branch_targets.py::build_branch_targets_residual。
         """
         super().__init__()
         self.input_root = input_root
@@ -111,6 +116,12 @@ class SDSDDataset(Dataset):
         self.branch_target_kernel_high = int(branch_target_kernel_high)
         self.branch_target_motion_share_mid = float(branch_target_motion_share_mid)
         self.branch_target_motion_share_high = float(branch_target_motion_share_high)
+        self.branch_target_max_shift = int(branch_target_max_shift)
+        if branch_target_mode not in ("band", "residual"):
+            raise ValueError(
+                "branch_target_mode must be 'band' or 'residual', "
+                "got {!r}".format(branch_target_mode))
+        self.branch_target_mode = branch_target_mode
         self.samples = self._build_samples()
         self._frame_cache = _FrameLRU(capacity=24)
 
@@ -190,6 +201,9 @@ class SDSDDataset(Dataset):
             # (numerically identical to decode->float->crop, ~100x less memory traffic)
             lq_u8 = self._gather_window_u8(sample["lq_paths"], center_idx)
             gt_u8 = cache.get(sample["gt_paths"][center_idx])
+            need_gt_window = self.branch_targets and self.branch_target_mode == "residual"
+            if need_gt_window:
+                gt_win_u8 = self._gather_window_u8(sample["gt_paths"], center_idx)
 
             h, w = lq_u8[0].shape[:2]
             cs = self.crop_size
@@ -198,12 +212,36 @@ class SDSDDataset(Dataset):
 
             clip = np.stack([f[top:top + cs, left:left + cs] for f in lq_u8], axis=0)
             target = gt_u8[top:top + cs, left:left + cs]
+            if need_gt_window:
+                gt_win = np.stack([f[top:top + cs, left:left + cs]
+                                   for f in gt_win_u8], axis=0)
 
             clip = torch.from_numpy(np.ascontiguousarray(clip)).permute(0, 3, 1, 2).float().div_(255.0)
             target = _u8_to_tensor(target)
 
-            clip, target = random_flip_pair(clip, target)
-            clip = random_time_reverse(clip)
+            # 增广在这里显式掷骰子, 而不是调用内部自带随机的 random_flip_pair/
+            # random_time_reverse —— 后者无法从外部得知是否真的翻转了, 而 GT 窗口
+            # 必须与 LQ 施加完全相同的变换, 否则对齐残差会错位。
+            flip_h = _random.random() < 0.5
+            flip_v = _random.random() < 0.5
+            time_rev = _random.random() < 0.5
+            if flip_h:
+                clip = torch.flip(clip, dims=[-1])
+                target = torch.flip(target, dims=[-1])
+            if flip_v:
+                clip = torch.flip(clip, dims=[-2])
+                target = torch.flip(target, dims=[-2])
+            if time_rev:
+                clip = torch.flip(clip, dims=[0])
+            if need_gt_window:
+                gt_win_t = torch.from_numpy(
+                    np.ascontiguousarray(gt_win)).permute(0, 3, 1, 2).float().div_(255.0)
+                if flip_h:
+                    gt_win_t = torch.flip(gt_win_t, dims=[-1])
+                if flip_v:
+                    gt_win_t = torch.flip(gt_win_t, dims=[-2])
+                if time_rev:
+                    gt_win_t = torch.flip(gt_win_t, dims=[0])
             # §6.6-A 极暗增广: 只压暗 LQ, GT 不变 (默认 prob=0 → 不生效)
             clip = random_dark_gamma(clip, prob=self.dark_aug_prob,
                                      gamma_range=self.dark_aug_gamma_range)
@@ -217,11 +255,18 @@ class SDSDDataset(Dataset):
             "frame_name": os.path.basename(sample["lq_paths"][center_idx]),
         }
         if self.branch_targets and self.mode == "train":
-            meta.update(build_branch_targets(
-                target,
-                kernel_low=self.branch_target_kernel_low,
-                kernel_high=self.branch_target_kernel_high,
-                motion_share_mid=self.branch_target_motion_share_mid,
-                motion_share_high=self.branch_target_motion_share_high,
-            ))
+            if self.branch_target_mode == "residual":
+                meta.update(build_branch_targets_residual(
+                    gt_win_t,
+                    kernel_low=self.branch_target_kernel_low,
+                    max_shift=self.branch_target_max_shift,
+                ))
+            else:
+                meta.update(build_branch_targets(
+                    target,
+                    kernel_low=self.branch_target_kernel_low,
+                    kernel_high=self.branch_target_kernel_high,
+                    motion_share_mid=self.branch_target_motion_share_mid,
+                    motion_share_high=self.branch_target_motion_share_high,
+                ))
         return clip, target, meta

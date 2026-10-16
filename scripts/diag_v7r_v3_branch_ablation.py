@@ -62,6 +62,10 @@ def main():
     ck = torch.load(args.ckpt, map_location=dev, weights_only=False)
     model.load_state_dict(ck["model_state_dict"])
     print(f"RESULT loaded epoch {ck.get('epoch')} from {args.ckpt}", flush=True)
+    print(f"RESULT fusion mode={getattr(model.fusion, 'mode', 'softmax')}, "
+          f"residual_freeze={bool(getattr(model.fusion, 'residual_freeze', False))} "
+          f"(消融口径: {'加性-置零' if getattr(model.fusion, 'mode', '') == 'additive' else '凸组合-归一化'})",
+          flush=True)
 
     seqs = list_sequences(args.seq_root, args.n_seqs)
     deltas = {"minusN": [], "minusL": [], "minusM": []}
@@ -85,19 +89,32 @@ def main():
             fusion = model.fusion
             y_n, y_l, y_m = out["branch_N"], out["branch_L"], out["branch_M"]
 
+            # ⚠️ 融合语义必须与模型实际一致, 否则消融数字失真 (2026-10-16 修正):
+            #   softmax / floored → 凸组合 Σw=1, 去掉一路后其余按比例归一化才是"等预算"消融;
+            #   additive          → 权重【不归一化】(softplus, 初始=1, ΣS=GT 的物理前提),
+            #                       去掉一路应直接把该项置 0, 归一化会把剩余路放大 ~1.8×,
+            #                       制造出 +8 dB 量级的假衰减 (实测: 脚本口径 -8.11 dB
+            #                       vs 正确加性口径 +0.08 dB, 见 §6.20)。
+            additive = getattr(fusion, "mode", "softmax") == "additive"
+            freeze = bool(getattr(fusion, "residual_freeze", False))
+
             def compose(w_n, w_l, w_m):
                 fused = w_n * y_n + w_l * y_l + w_m * y_m
                 refined = fusion.refine(fused)
-                gamma = torch.tanh(fusion.residual_gamma)
+                # 冻结时模型硬置 gamma=0 (零张量不参与), 此处必须一致
+                gamma = (torch.zeros((), device=refined.device, dtype=refined.dtype)
+                         if freeze else torch.tanh(fusion.residual_gamma))
                 return (refined + gamma * x_center).clamp(0.0, 1.0)
 
             base = psnr(compose(weights[:, 0:1], weights[:, 1:2], weights[:, 2:3]), gt)
 
-            # 去掉某一路: 该路权重置 0, 其余两路按比例归一化
+            # 去掉某一路
             for name, drop_idx in (("minusN", 0), ("minusL", 1), ("minusM", 2)):
                 w = weights.clone()
                 w[:, drop_idx:drop_idx + 1] = 0.0
-                w = w / w.sum(dim=1, keepdim=True).clamp_min(1e-8)
+                if not additive:
+                    # 凸组合: 其余两路按比例归一化 (保持 Σw=1)
+                    w = w / w.sum(dim=1, keepdim=True).clamp_min(1e-8)
                 deltas[name].append(psnr(compose(w[:, 0:1], w[:, 1:2], w[:, 2:3]), gt) - base)
 
     print(f"RESULT {len(seqs)} sequences", flush=True)

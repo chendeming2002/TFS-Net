@@ -32,6 +32,7 @@ from typing import Tuple, Dict
 
 from models.modules.blocks import LayerNorm2d
 from models.golf_r4.tca_rwkv import RWKVSpatialHead
+from models.golf_v7r.spatial_rwkv_head_v8 import SpatialRWKVHeadV8
 
 
 class MatrixRWKVInjector(nn.Module):
@@ -80,7 +81,8 @@ class TripleQueryTCA(nn.Module):
 
     def __init__(self, feat_dim: int = 128, rwkv_dim: int = 192,
                  num_frames: int = 5, motion_aware_diff: bool = False,
-                 diff_smooth_kernel: int = 5):
+                 diff_smooth_kernel: int = 5, spatial_head: str = "legacy",
+                 channel_mix_rate: int = 4):
         super().__init__()
         self.feat_dim = feat_dim
         self.rwkv_dim = rwkv_dim
@@ -115,9 +117,21 @@ class TripleQueryTCA(nn.Module):
         )
 
         # ========== 3. 三路 RWKV 空间注意力头 (共享 KV, 线性复杂度) ==========
-        self.attn_N = RWKVSpatialHead(feat_dim)
-        self.attn_L = RWKVSpatialHead(feat_dim)
-        self.attn_M = RWKVSpatialHead(feat_dim)
+        # spatial_head (§v8, docs/v8/01-设计.md §三):
+        #   "legacy" → 旧的 RWKVSpatialHead (无局部上下文、无 Channel Mix)
+        #   "v8"     → 规范的 SpatialRWKVHeadV8 (OmniShift + Channel Mix)
+        if spatial_head not in ("legacy", "v8"):
+            raise ValueError(f"spatial_head 必须是 'legacy' 或 'v8', 收到 {spatial_head!r}")
+        self.spatial_head_kind = spatial_head
+        if spatial_head == "v8":
+            head_kwargs = {"hidden_rate": channel_mix_rate}
+            head_cls = SpatialRWKVHeadV8
+        else:
+            head_kwargs = {}
+            head_cls = RWKVSpatialHead
+        self.attn_N = head_cls(feat_dim, **head_kwargs)
+        self.attn_L = head_cls(feat_dim, **head_kwargs)
+        self.attn_M = head_cls(feat_dim, **head_kwargs)
 
         # ========== 4. LayerScale (零初始化 → 初始恒等, 梯度非零) ==========
         self.scale_N = nn.Parameter(torch.zeros(1, feat_dim, 1, 1))

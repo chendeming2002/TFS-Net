@@ -198,3 +198,79 @@ def build_branch_targets_from_clip(clip: torch.Tensor, max_shift: int = 4,
         "illum_target": illum,
         "motion_target": motion,
     }
+
+
+# ===========================================================================
+# b 方案 (v8): M 路改为「对齐残差」目标, 与 N 路不再重叠 (docs/v8/01-设计.md 三·补)
+# ===========================================================================
+#
+# ## 为什么改
+#
+# 旧方案让 M、N 共享中频带: S_M = a*Q + b*R, S_N = (1-a)Q + (1-b)R。两条目标的
+# 相关系数达 +1.0000 —— 它们说的是同一件事, 只是量级不同。融合损失只要求
+# sum_k w_k Y_k = GT, 因此只要 N 覆盖住中高频, M 就没有必须学习的理由。
+# 实测 (v8 三·补): M 路拿到了最大份额的梯度 (l1 项 5.100 vs 自身 1.395) 却仍然
+# 收敛到近似零输出, 因为那是该目标下最省力的解。
+#
+# ## 改成什么
+#
+# 让 M 专门负责「对齐残差」—— 中心帧 GT 与其对齐邻帧平均之差:
+#
+#     A   = mean_i W_{i->t}(GT_i)     对齐后的邻帧平均
+#     S_L = LPF_k(A)                  低频带 (光照)
+#     S_N = A - S_L                   中高频带 (噪声/结构)
+#     S_M = GT - A                    对齐残差 (运动)
+#
+# ## 为什么这样就不再重叠
+#
+# S_M 与 S_N 的相关系数实测仅 +0.14 (旧方案 +1.0000)。关键性质:
+#
+#     |S_L + S_N - GT| 恒等于 |S_M|
+#
+# 即 L 与 N 的目标里完全不含 S_M 的信息: 两路再完美, 其和也只等于 A 而不等于 GT,
+# 差额必须由 M 补上。这使 M 路在融合损失下成为不可替代的。
+#
+# sum_k S_k = GT 仍然精确成立 (实测误差 1e-8), 与加性融合算子配套。
+
+
+def _best_shift_torch(ref, src, max_shift=4, step=2):
+    """整数平移搜索 (供 GT 对齐残差使用, 逻辑同 _best_global_shift)。"""
+    best, best_err = (0, 0), float("inf")
+    for dy in range(-max_shift, max_shift + 1, step):
+        for dx in range(-max_shift, max_shift + 1, step):
+            err = (ref - _integer_shift(src, dy, dx)).abs().mean().item()
+            if err < best_err:
+                best_err, best = err, (dy, dx)
+    return best
+
+
+def build_branch_targets_residual(gt_window, kernel_low=31, max_shift=4):
+    """b 方案: M 路负责对齐残差。
+
+    gt_window: [T, 3, H, W] GT 窗口 (中心帧在 T//2)
+    返回 illum_target / noise_target / motion_target, 三者之和恒等于中心帧 GT。
+
+    与 build_branch_targets 的区别: 后者按频带划分, M 与 N 共享中高频因而重叠;
+    本函数改用「对齐邻帧平均 A」作为分界, 使 M 的目标 = GT - A 与
+    N 的目标 = A - LPF(A) 在信息上不重叠。
+    """
+    T = gt_window.shape[0]
+    center = T // 2
+    gt_c = gt_window[center]
+
+    aligned = []
+    for t in range(T):
+        if t == center:
+            continue
+        dy, dx = _best_shift_torch(gt_c, gt_window[t], max_shift=max_shift)
+        aligned.append(_integer_shift(gt_window[t], dy, dx))
+    if not aligned:
+        aligned = [gt_c]
+    a = torch.stack(aligned, dim=0).mean(dim=0)
+
+    s_l = lowpass(a, kernel_low)
+    return {
+        "illum_target": s_l,
+        "noise_target": a - s_l,
+        "motion_target": gt_c - a,
+    }

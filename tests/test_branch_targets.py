@@ -21,7 +21,8 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from datasets.branch_targets import build_branch_targets, lowpass
+from datasets.branch_targets import (
+    build_branch_targets, build_branch_targets_residual, lowpass)
 from models.golf_v7r.fusion_v7r import V7RFusion
 from models.golf_v7r.loss import GolfV7RLoss
 
@@ -291,6 +292,87 @@ def test_backward():
     print("  [ok] 反传正常, 三路梯度均非零")
 
 
+def test_residual_targets_sum_to_center_gt():
+    """b 方案 (对齐残差) 的三个目标之和恒等于中心帧。"""
+    torch.manual_seed(20)
+    window = torch.rand(5, 3, 48, 48)
+    t = build_branch_targets_residual(window, kernel_low=15)
+    total = t['illum_target'] + t['noise_target'] + t['motion_target']
+    err = (total - window[2]).abs().max().item()
+    assert err < 1e-6, f"残差目标和与中心帧不符, 最大误差 {err:.2e}"
+    print(f"  [ok] b 方案 ΣS ≡ 中心帧 GT (最大误差 {err:.2e})")
+
+
+def _structured_window(T=5, size=64, shift=2):
+    """构造一个可对齐的合成窗口: 每个时刻的内容是同一图案的整数位移。
+
+    纯随机窗口之间没有可对齐的结构, 位移搜索会失效, 无法检验 b 方案的意图;
+    这里让第 t 帧等于中心帧图案整体偏移 (t-2)·shift, 位移搜索应能找回它。
+    """
+    torch.manual_seed(21)
+    base = torch.zeros(3, size, size)
+    base[:, size // 4:size // 2, size // 4:size // 2] = 1.0
+    base[:, size // 2:3 * size // 4, size // 2:3 * size // 4] = 0.5
+    window = []
+    for t in range(T):
+        dy = int(round((t - T // 2) * shift))
+        window.append(torch.roll(base, shifts=dy, dims=-2))
+    return torch.stack(window, dim=0)
+
+
+def test_residual_targets_are_orthogonal():
+    """b 方案的 S_N 与 S_M 必须接近正交 —— 这是相对 band 方案的核心改进。
+
+    band 方案两路共享中频, 实测 corr(S_N, S_M) = +0.93, 融合只需其一;
+    b 方案把 S_M 定义为"对齐后的余量", 与 S_N (对齐结果的高频) 在设计上不重叠。
+    """
+    window = _structured_window()
+    t = build_branch_targets_residual(window, kernel_low=15, max_shift=4)
+    a = t['noise_target'].flatten() - t['noise_target'].mean()
+    b = t['motion_target'].flatten() - t['motion_target'].mean()
+    corr = (a * b).sum() / (a.norm() * b.norm() + 1e-12)
+    assert corr.abs() < 0.3, f"S_N 与 S_M 相关性过高 ({corr:.3f}), 两路仍可互相替代"
+    print(f"  [ok] b 方案 corr(S_N, S_M) = {corr:+.3f} (band 方案为 +0.93)")
+
+
+def test_residual_targets_lack_dc():
+    """b 方案的 N、M 目标是纯零均值纹理 —— 这是 N、M 两路塌缩的直接原因。
+
+    实测: 归一化损失下, "输出常数 0" 使零均值目标到达损失下界, 该路失去学习动力。
+    本测试把这一性质固化下来, 提醒后续不要在有直流分量的假设下调这两个目标。
+    """
+    torch.manual_seed(22)
+    window = torch.rand(5, 3, 64, 64) * 0.1 + 0.02   # 低亮度场景
+    t = build_branch_targets_residual(window, kernel_low=15)
+    dc_n = t['noise_target'].mean().abs().item()
+    dc_m = t['motion_target'].mean().abs().item()
+    std_n = t['noise_target'].std().item()
+    std_m = t['motion_target'].std().item()
+    assert dc_n / std_n < 0.2, f"S_N 直流比过高 ({dc_n/std_n:.3f})"
+    assert dc_m / std_m < 0.3, f"S_M 直流比过高 ({dc_m/std_m:.3f})"
+    print(f"  [ok] b 方案 N/M 目标近乎零均值 (DC/std: N={dc_n/std_n:.3f}, M={dc_m/std_m:.3f})")
+
+
+def test_branch_specific_tiny_target_gives_low_gradient_signal():
+    """零均值小目标在归一化损失下, "输出 0" 即接近损失下界 —— 解释 N/M 塌缩的机制测试。
+
+    对一个零均值信号 s, 常数预测 c 的平均绝对误差在 c = median(s) ≈ 0 处取最小;
+    归一到单位尺度后该最小值约为 0.8 (批量 L1 下), 而任何非零输出都要额外付出拟合成本。
+    这里直接验证"向 0 收缩"是该目标下的低损失方向。
+    """
+    torch.manual_seed(23)
+    gt = torch.rand(3, 64, 64) * 0.1
+    t = build_branch_targets(gt, kernel_low=15, kernel_high=5,
+                             motion_share_mid=0.5, motion_share_high=0.5)
+    target = t['motion_target']
+    scale = target.abs().mean().clamp_min(1e-3)
+    loss_zero = F.l1_loss(torch.zeros_like(target), target) / scale
+    loss_true = F.l1_loss(target, target) / scale
+    assert loss_zero < 1.05, f"输出 0 的归一化损失应接近下界, 实为 {loss_zero:.3f}"
+    assert loss_zero > loss_true, "输出 0 不应优于输出真值"
+    print(f"  [ok] 零均值目标下输出 0 的归一化损失 = {loss_zero:.3f} (输出真值 = {loss_true:.3f})")
+
+
 def main():
     print("GT 频带划分目标 + 加性融合单测 (§6.19):")
     test_partition_sums_to_gt()
@@ -309,6 +391,11 @@ def main():
     test_missing_targets_fall_back_with_warning()
     test_residual_freeze()
     test_backward()
+    print("\nb 方案 (对齐残差) 单测:")
+    test_residual_targets_sum_to_center_gt()
+    test_residual_targets_are_orthogonal()
+    test_residual_targets_lack_dc()
+    test_branch_specific_tiny_target_gives_low_gradient_signal()
     print("\n全部通过 ✅")
 
 

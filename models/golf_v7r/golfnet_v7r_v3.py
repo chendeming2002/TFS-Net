@@ -55,7 +55,10 @@ class GolfNet_v7r_v3(nn.Module):
                  diff_smooth_kernel: int = 5,
                  fusion_mode: str = "softmax",
                  fusion_weight_floor: float = 0.1,
-                 fusion_residual_freeze: bool = False):
+                 fusion_residual_freeze: bool = False,
+                 spatial_head: str = "legacy",
+                 channel_mix_rate: int = 4,
+                 encoder_block: str = "naf"):
         super().__init__()
         self.num_frames = num_frames
         self.C1, self.C2, self.C3 = encoder_channels
@@ -67,6 +70,7 @@ class GolfNet_v7r_v3(nn.Module):
             in_channels=3,
             out_channels_list=encoder_channels,
             num_blocks_per_scale=[2, 2, 2],
+            block_type=encoder_block,
         )
 
         # ========== Stage 2: 投影 + 像素级时序对齐 ==========
@@ -88,10 +92,13 @@ class GolfNet_v7r_v3(nn.Module):
         self.rwkv_norm = nn.LayerNorm(rwkv_dim)
 
         # 3.3 Triple Query TCA (三路查询 × 共享统计先验 KV)
+        self.spatial_head = spatial_head
         self.triple_query_tca = TripleQueryTCA(
             feat_dim=feature_dim, rwkv_dim=rwkv_dim, num_frames=num_frames,
             motion_aware_diff=motion_aware_diff,
             diff_smooth_kernel=diff_smooth_kernel,
+            spatial_head=spatial_head,
+            channel_mix_rate=channel_mix_rate,
         )
 
         # ========== Stage 4: 三分支 ==========

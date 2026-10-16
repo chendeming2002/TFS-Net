@@ -1,0 +1,72 @@
+## v8 补测 R1: 只换分支目标 (residual), 空间头保持 legacy
+##
+## 目的: phase1 同时改了"分支目标"和"空间头"两个变量, 结果无法归因。
+## 本 run 固定 legacy 空间头, 只把目标从 band 换成 residual, 与 phase1 (v8 头 + residual)
+## 对照, 即可判断 N/M 两路塌成常数图是来自目标还是来自空间头。
+##
+## 与 phase1 的唯一差别: model.spatial_head = legacy (不引入 OmniShift 与 Channel Mix)
+## 其余 (residual 目标 / additive 融合 / residual_freeze / 损失权重) 完全一致。
+##
+## 判据 (与 phase1 相同, 用机制判据, 不比 PSNR):
+##   1. N/M 输出的空间方差 (是否仍是常数图)
+##   2. 三路与各自目标的误差是否随训练下降
+##   3. 消融: 去掉 N / 去掉 M 的代价 (正确加性口径: 直接置零, 不归一化)
+##
+## 预期 (待验证): 若 N/M 仍塌, 则根因是 residual 目标缺直流分量, 与空间头无关;
+##                若 N/M 活起来, 则根因在 v8 空间头 (或其与 residual 目标的相互作用)。
+##
+## 参数量: legacy 头, 应与 v7.5 定稿一致 (3.7423M)
+seed: 42
+output_dir: outputs/v8_R1_residual_legacy
+
+dataset:
+  train_input_root: /home/a1005/yzy/dataset/SDSD/indoor/input
+  train_target_root: /home/a1005/yzy/dataset/SDSD/indoor/GT
+  val_input_root: /home/a1005/yzy/dataset/SDSD/test/low-light
+  val_target_root: /home/a1005/yzy/dataset/SDSD/test/GT
+  window_size: 5
+  crop_size: 256
+  num_workers: 0
+  pairing: position
+  branch_target_mode: residual
+  branch_target_kernel_low: 31
+  branch_target_max_shift: 4
+
+model:
+  fusion_mode: additive
+  fusion_residual_freeze: true
+  spatial_head: legacy
+  num_frames: 5
+  encoder_channels: [32, 64, 128]
+  feature_dim: 128
+  rwkv_dim: 192
+  rwkv_heads: 6
+  rwkv_head_size: 32
+  rwkv_blocks: 2
+  spatial_size: 2
+  branch_channels: 128
+  motion_aware_diff: false
+  diff_smooth_kernel: 5
+
+train:
+  batch_size: 2
+  epochs: 60
+  lr: 0.0005657
+  weight_decay: 0.01
+  log_interval: 100
+  val_interval: 5
+  grad_clip: 1.0
+  ckpt_interval: 500
+  lpips_net: vgg
+
+loss:
+  w_branch_N: 0.3
+  w_branch_L: 0.3
+  w_branch_M: 0.3
+  lambda_ortho: 0.01
+  w_ssim: 0.0
+  branch_warmup_epochs: 5
+  use_lowfreq_L: false
+  lowfreq_kernel: 16
+  branch_specific_targets: true
+  branch_target_normalize: true

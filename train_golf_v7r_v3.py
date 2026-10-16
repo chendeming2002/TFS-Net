@@ -61,13 +61,14 @@ def main():
         branch_target_kernel_high=cfg['dataset'].get('branch_target_kernel_high', 5),
         branch_target_motion_share_mid=cfg['dataset'].get('branch_target_motion_share_mid', 0.5),
         branch_target_motion_share_high=cfg['dataset'].get('branch_target_motion_share_high', 0.2),
+        branch_target_mode=cfg['dataset'].get('branch_target_mode', 'band'),
+        branch_target_max_shift=cfg['dataset'].get('branch_target_max_shift', 4),
     )
     if train_ds.dark_aug_prob > 0:
         logger.info(f"Dark aug ON (§6.6-A): prob={train_ds.dark_aug_prob}, "
                     f"gamma_range={train_ds.dark_aug_gamma_range} (只压暗 LQ, GT 不变)")
     if branch_targets_on:
-        logger.info("Branch-specific targets ON (§6.19 GT 频带划分): "
-                    "L→低频(光照), M/N 共享中高频 (运动/噪声); "
+        logger.info(f"Branch-specific targets ON (mode={train_ds.branch_target_mode}); "
                     f"kernel={train_ds.branch_target_kernel_low}/"
                     f"{train_ds.branch_target_kernel_high}, "
                     f"motion_share_mid={train_ds.branch_target_motion_share_mid}, "
@@ -200,6 +201,12 @@ def main():
 
             if (step + 1) % log_interval == 0:
                 msg = f"  Step {step+1}/{len(train_loader)} - Loss: {loss.item():.4f}"
+                # 分支活性: 输出空间标准差。塌成常数图时该值趋零 (v7.5 的 branch_M 即如此)。
+                # 记录它可以在早期发现某一路放弃学习, 而不必等到跑完再做诊断。
+                if 'branch_N' in output_dict:
+                    bstd = [output_dict[k].std().item()
+                            for k in ('branch_N', 'branch_L', 'branch_M')]
+                    msg += f" | bstd={bstd[0]:.4f}/{bstd[1]:.4f}/{bstd[2]:.4f}"
                 if 'inject_stat' in output_dict:
                     gk = output_dict['inject_stat']['gate_k']
                     msg += (f" | gate={output_dict['inject_stat']['gate'].item():.4f}"
