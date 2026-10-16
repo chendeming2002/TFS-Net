@@ -84,13 +84,13 @@ class TripleQueryTCA(nn.Module):
                  diff_smooth_kernel: int = 5, spatial_head: str = "legacy",
                  channel_mix_rate: int = 4,
                  use_omni_shift: bool = True,
-                 use_channel_mix: bool = True):
+                 use_channel_mix: bool = True,
+                 kv_split: bool = False):
         super().__init__()
         self.feat_dim = feat_dim
         self.rwkv_dim = rwkv_dim
         self.num_frames = num_frames
         self.center_idx = num_frames // 2
-
         # Phase A.2 开关: 运动感知差分 (§6.8).
         # False → 历史行为 (max|center - F_t|, 被噪声主导, §6.3 实测 3.19× vs 1.53×)。
         # True  → 对 center / 邻帧先做空间低通再求差, 抑制高频噪声、保留结构位移。
@@ -117,6 +117,21 @@ class TripleQueryTCA(nn.Module):
             nn.Conv2d(3 * feat_dim, feat_dim, 1, bias=True),
             LayerNorm2d(feat_dim),
         )
+
+        # ========== 2b. 分支专属 KV 投影 (v8 M3, 见 docs/v8/03-M支路重构设计.md §4) ==========
+        # kv_split=True 时, 三路各自从**不同的输入来源**构造 KV:
+        #   N → ctx_mean   (帧间均值, 对 i.i.d. 噪声的最优估计)
+        #   L → ctx_smooth (低频平滑, 光照的慢变趋势)
+        #   M → feat_center(中心帧特征, 不经任何时序聚合)
+        # 目的是让三路从数据流上就分开, 而不是靠损失函数逼出差异。
+        self.kv_split = bool(kv_split)
+        if self.kv_split:
+            self.kv_proj_N = nn.Sequential(
+                nn.Conv2d(feat_dim, feat_dim, 1, bias=True), LayerNorm2d(feat_dim))
+            self.kv_proj_L = nn.Sequential(
+                nn.Conv2d(feat_dim, feat_dim, 1, bias=True), LayerNorm2d(feat_dim))
+            self.kv_proj_M = nn.Sequential(
+                nn.Conv2d(feat_dim, feat_dim, 1, bias=True), LayerNorm2d(feat_dim))
 
         # ========== 3. 三路 RWKV 空间注意力头 (共享 KV, 线性复杂度) ==========
         # spatial_head (§v8, docs/v8/01-设计.md §三):
@@ -211,7 +226,7 @@ class TripleQueryTCA(nn.Module):
         Q_L = self.query_L(feat_spatial)
         Q_M = self.query_M(feat_spatial)
 
-        # ========== Step 2: 共享 KV (统计先验 + MatrixRWKV 三路门控) ==========
+        # ========== Step 2: KV 构建 ==========
         ctx_mean = self._ctx_mean(feats_seq)      # [B, C, H, W]
         ctx_smooth = self._ctx_smooth(feats_seq)  # [B, C, H, W]
         ctx_diff = self._ctx_diff(feats_seq)      # [B, C, H, W]
@@ -224,14 +239,23 @@ class TripleQueryTCA(nn.Module):
         s_smooth = ctx_smooth * (1.0 + gate[:, 1])
         s_diff = ctx_diff * (1.0 + gate[:, 2])
 
-        kv_shared = self.kv_proj(
-            torch.cat([s_mean, s_smooth, s_diff], dim=1)
-        )  # [B, C, H, W]
+        if self.kv_split:
+            # 分支专属 KV (v8 M3): 三路从不同来源构造, 数据流上即分开。
+            # N 用帧间均值, L 用低频平滑, M 用中心帧特征 (feat_spatial, 无时序聚合)。
+            kv_N = self.kv_proj_N(s_mean)
+            kv_L = self.kv_proj_L(s_smooth)
+            kv_M = self.kv_proj_M(feat_spatial)
+        else:
+            # 共享 KV (历史行为): 三个统计量拼接后统一投影, 三路共用。
+            kv_shared = self.kv_proj(
+                torch.cat([s_mean, s_smooth, s_diff], dim=1)
+            )  # [B, C, H, W]
+            kv_N = kv_L = kv_M = kv_shared
 
-        # ========== Step 3: 三路 RWKV 空间注意力 (共享 KV, 差异化 Q) ==========
-        attn_N = self.attn_N(Q_N, kv_shared)  # [B, C, H, W]
-        attn_L = self.attn_L(Q_L, kv_shared)
-        attn_M = self.attn_M(Q_M, kv_shared)
+        # ========== Step 3: 三路 RWKV 空间注意力 (差异化 KV, 差异化 Q) ==========
+        attn_N = self.attn_N(Q_N, kv_N)  # [B, C, H, W]
+        attn_L = self.attn_L(Q_L, kv_L)
+        attn_M = self.attn_M(Q_M, kv_M)
 
         # ========== Step 4: LayerScale 残差 (以 PixelTemporal 特征为基) ==========
         raw_N = feat_spatial + attn_N * self.scale_N

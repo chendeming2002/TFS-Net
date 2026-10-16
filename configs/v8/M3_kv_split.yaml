@@ -1,0 +1,66 @@
+## v8 M3: M2 基础上三源 KV 按支路分流
+##
+## 基线: outputs/v8_M2_gated (M2)
+## 唯一变量: model.kv_split = True
+##
+## 目的: 单独验证三源解耦的重设计 (docs/v8/03-M支路重构设计.md §4)。
+##   N → 帧间均值, L → 低频平滑, M → 中心帧特征。三路从不同来源构造 KV,
+##   分工发生在数据流上, 不依赖损失函数参数化地逼出来。
+##
+## 判据见 02-实验计划.md §三。
+##
+seed: 42
+output_dir: outputs/v8_M3_kv_split
+dataset:
+  train_input_root: /home/a1005/yzy/dataset/SDSD/indoor/input
+  train_target_root: /home/a1005/yzy/dataset/SDSD/indoor/GT
+  val_input_root: /home/a1005/yzy/dataset/SDSD/test/low-light
+  val_target_root: /home/a1005/yzy/dataset/SDSD/test/GT
+  window_size: 5
+  crop_size: 256
+  num_workers: 0
+  pairing: position
+  branch_target_kernel_low: 31
+  branch_target_kernel_high: 5
+  branch_target_motion_share_mid: 0.5
+  branch_target_motion_share_high: 0.2
+model:
+  fusion_mode: gated
+  fusion_residual_freeze: true
+  num_frames: 5
+  encoder_channels:
+  - 32
+  - 64
+  - 128
+  feature_dim: 128
+  rwkv_dim: 192
+  rwkv_heads: 6
+  rwkv_head_size: 32
+  rwkv_blocks: 2
+  spatial_size: 2
+  branch_channels: 128
+  motion_aware_diff: false
+  diff_smooth_kernel: 5
+  branch_m_single_frame: true
+  kv_split: true
+train:
+  batch_size: 2
+  epochs: 60
+  lr: 0.0005657
+  weight_decay: 0.01
+  log_interval: 100
+  val_interval: 5
+  grad_clip: 1.0
+  ckpt_interval: 500
+  lpips_net: vgg
+loss:
+  w_branch_N: 0.3
+  w_branch_L: 0.3
+  w_branch_M: 0.3
+  lambda_ortho: 0.01
+  w_ssim: 0.0
+  branch_warmup_epochs: 5
+  use_lowfreq_L: false
+  lowfreq_kernel: 16
+  branch_specific_targets: true
+  branch_target_normalize: true

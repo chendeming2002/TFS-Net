@@ -85,29 +85,46 @@ class ConfidenceEstimator(nn.Module):
 
 
 class BranchMSimple(nn.Module):
-    """Branch-M (简化): Motion Compensation, 仅用 ±1 两帧"""
+    """Branch-M (简化): 运动补偿
+
+    Args:
+        single_frame: 是否使用单帧模式 (v8 M1, 见 docs/v8/03-M支路重构设计.md)。
+
+            False (默认/历史行为): 用 ±1 两帧做光流估计与变形对齐, 再与中心帧拼接。
+                该做法在 SDSD 这类"相邻帧位移很小"的数据上, 对齐结果与中心帧几乎相同,
+                M 支路的输入因此与 N、L 高度重合, 学不到独立的东西。
+
+            True: 完全去掉 flow / deform / conf 三个模块, 只用中心帧特征。
+                依据是运动在单帧里就表现为局部结构的偏移与模糊, 不需要跨帧估计。
+                这样 M 的输入从数据流上与 N、L 分开, 不依赖损失函数逼出差异。
+    """
 
     def __init__(self, channels: int = 128, enc_channels: int = 64,
                  num_frames: int = 5, num_blocks: int = 2,
-                 out_channels: int = 3):
+                 out_channels: int = 3, single_frame: bool = False):
         super().__init__()
         self.channels = channels
         self.num_frames = num_frames
         self.center_idx = num_frames // 2
+        self.single_frame = bool(single_frame)
 
         # 只用中心帧两侧的相邻帧 (t-1, t+1)
         self.neighbor_offsets = [-1, 1]
 
-        self.neigh_proj = nn.Sequential(
-            nn.Conv2d(enc_channels, channels, 1, bias=True),
-            LayerNorm2d(channels),
-        )
-        self.flow_estimator = FlowEstimator(channels)
-        self.deform_align = DeformableAlign()
-        self.conf_estimator = ConfidenceEstimator(channels)
+        if not self.single_frame:
+            self.neigh_proj = nn.Sequential(
+                nn.Conv2d(enc_channels, channels, 1, bias=True),
+                LayerNorm2d(channels),
+            )
+            self.flow_estimator = FlowEstimator(channels)
+            self.deform_align = DeformableAlign()
+            self.conf_estimator = ConfidenceEstimator(channels)
+            # fusion: center + 2 邻居 = 3 × channels
+            num_inputs = 1 + len(self.neighbor_offsets)
+        else:
+            # 单帧模式: 只有中心帧一路输入
+            num_inputs = 1
 
-        # fusion: center + 2 邻居 = 3 × channels
-        num_inputs = 1 + len(self.neighbor_offsets)
         self.fusion_conv = nn.Sequential(
             nn.Conv2d(channels * num_inputs, channels, 1, bias=True),
             LayerNorm2d(channels),
@@ -154,7 +171,14 @@ class BranchMSimple(nn.Module):
         return aggregated, flow_center, conf_avg
 
     def forward(self, F_M: torch.Tensor, F2_seq: torch.Tensor) -> dict:
-        aggregated, flow_vis, conf_map = self._align_and_aggregate(F_M, F2_seq)
+        if self.single_frame:
+            # 单帧模式: 只经中心帧特征, 不做任何跨帧操作
+            aggregated = self.fusion_conv(F_M)
+            B, C, H, W = F_M.shape
+            flow_vis = torch.zeros(B, 2, H, W, device=F_M.device, dtype=F_M.dtype)
+            conf_map = torch.ones(B, 1, H, W, device=F_M.device, dtype=F_M.dtype)
+        else:
+            aggregated, flow_vis, conf_map = self._align_and_aggregate(F_M, F2_seq)
         x = self.refine_blocks(aggregated)
         x = self.upsample(x)
         x = self.to_rgb_norm(x)

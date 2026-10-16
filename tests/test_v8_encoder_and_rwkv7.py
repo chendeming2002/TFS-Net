@@ -161,6 +161,151 @@ def test_rwkv7_channel_mix_shape_and_backward():
     print("  [ok] Channel Mix 形状正确且全部参数有梯度")
 
 
+def test_branch_m_single_frame_ignores_neighbors():
+    """单帧 M 支路 (v8 M1) 的输出不应随邻帧变化 —— 这是"只用中心帧"的定义。
+
+    历史行为 (跨帧对齐) 会读 F2_seq 里的邻帧; 单帧模式必须完全不读,
+    否则它仍与 N、L 的输入重合, 无法在数据流上分开。
+    """
+    from models.golf_v7r.branch_m_simple import BranchMSimple
+    torch.manual_seed(20)
+    blk = BranchMSimple(channels=32, enc_channels=16, num_frames=5,
+                        single_frame=True).eval()
+    F_M = torch.randn(1, 32, 8, 8)
+    F2_a = torch.randn(1, 5, 16, 8, 8)
+    F2_b = torch.randn(1, 5, 16, 8, 8)      # 完全不同的邻帧
+    with torch.no_grad():
+        y_a = blk(F_M, F2_a)["Y_M"]
+        y_b = blk(F_M, F2_b)["Y_M"]
+    assert torch.allclose(y_a, y_b), "单帧 M 支路的输出不应受邻帧影响"
+    print("  [ok] 单帧 M 支路不读邻帧 (换掉 F2_seq 输出不变)")
+
+
+def test_branch_m_cross_frame_reads_neighbors():
+    """历史 (跨帧) M 支路的输出应随邻帧变化 —— 与单帧模式形成对照。"""
+    from models.golf_v7r.branch_m_simple import BranchMSimple
+    torch.manual_seed(21)
+    blk = BranchMSimple(channels=32, enc_channels=16, num_frames=5,
+                        single_frame=False).eval()
+    F_M = torch.randn(1, 32, 8, 8)
+    F2_a = torch.randn(1, 5, 16, 8, 8)
+    F2_b = torch.randn(1, 5, 16, 8, 8)
+    with torch.no_grad():
+        y_a = blk(F_M, F2_a)["Y_M"]
+        y_b = blk(F_M, F2_b)["Y_M"]
+    assert not torch.allclose(y_a, y_b), "跨帧 M 支路应受邻帧影响"
+    print("  [ok] 跨帧 M 支路读邻帧 (换掉 F2_seq 输出改变)")
+
+
+def test_branch_m_single_frame_fewer_params():
+    """单帧模式去掉 flow/deform/conf, 参数量应明显低于跨帧模式。"""
+    from models.golf_v7r.branch_m_simple import BranchMSimple
+    n_single = sum(p.numel() for p in BranchMSimple(
+        channels=32, enc_channels=16, num_frames=5, single_frame=True).parameters())
+    n_cross = sum(p.numel() for p in BranchMSimple(
+        channels=32, enc_channels=16, num_frames=5, single_frame=False).parameters())
+    assert n_single < n_cross, "单帧模式参数量应低于跨帧模式"
+    print(f"  [ok] 单帧 M 参数量 {n_single/1e3:.1f}K < 跨帧 {n_cross/1e3:.1f}K")
+
+
+def test_branch_m_single_frame_backward():
+    """单帧 M 支路反传正常: 整条通路的投影与输出层都应有梯度。"""
+    from models.golf_v7r.branch_m_simple import BranchMSimple
+    torch.manual_seed(22)
+    blk = BranchMSimple(channels=32, enc_channels=16, num_frames=5,
+                        single_frame=True)
+    F_M = torch.randn(1, 32, 8, 8)
+    F2 = torch.randn(1, 5, 16, 8, 8)
+    blk(F_M, F2)["Y_M"].sum().backward()
+    key_names = [n for n, _ in blk.named_parameters()
+                 if any(k in n for k in ("fusion_conv", "to_rgb", "upsample"))]
+    assert key_names, "未找到预期参数"
+    dead = [n for n in key_names
+            if blk.get_parameter(n).grad is None
+            or blk.get_parameter(n).grad.abs().sum() == 0]
+    assert not dead, f"主路径参数无梯度: {dead}"
+    print(f"  [ok] 单帧 M 支路反传正常 ({len(key_names)} 个主路径参数均有梯度)")
+
+
+def test_kv_split_changes_attention_inputs():
+    """三源 KV 分流 (v8 M3) 后, 三路的 KV 不应再相同。
+
+    历史行为是三路共用同一个 kv_shared; 分流后 N 用帧间均值、L 用低频平滑、
+    M 用中心帧特征。本测试用 hook 抓三路注意力头的 context 输入做比较。
+    """
+    from models.golf_v7r.triple_query_tca import TripleQueryTCA
+    torch.manual_seed(30)
+    B, T, C, H, W = 1, 5, 32, 16, 16
+    feat_spatial = torch.randn(B, C, H, W)
+    feats_seq = torch.randn(B, T, C, H, W)
+    rwkv_ctx = torch.randn(B, T, 64)
+
+    def collect(kv_split):
+        tca = TripleQueryTCA(feat_dim=C, rwkv_dim=64, num_frames=T,
+                             kv_split=kv_split).eval()
+        seen = {}
+        for name in ("attn_N", "attn_L", "attn_M"):
+            head = getattr(tca, name)
+            def make_hook(nm):
+                def hook(module, args):
+                    seen[nm] = args[1].detach().clone()   # (center_feat, context_feat)
+                return hook
+            head.register_forward_pre_hook(make_hook(name))
+        with torch.no_grad():
+            tca(feat_spatial, feats_seq, rwkv_ctx)
+        return seen
+
+    shared = collect(False)
+    assert torch.allclose(shared["attn_N"], shared["attn_L"], atol=1e-6) and \
+        torch.allclose(shared["attn_L"], shared["attn_M"], atol=1e-6), \
+        "关闭分流时三路 KV 应完全相同 (历史行为)"
+    print("  [ok] kv_split=False 时三路共用同一个 KV")
+
+    split = collect(True)
+    assert not torch.allclose(split["attn_N"], split["attn_L"], atol=1e-6), \
+        "分流后 N 与 L 的 KV 应不同"
+    assert not torch.allclose(split["attn_L"], split["attn_M"], atol=1e-6), \
+        "分流后 L 与 M 的 KV 应不同"
+    assert not torch.allclose(split["attn_N"], split["attn_M"], atol=1e-6), \
+        "分流后 N 与 M 的 KV 应不同"
+    print("  [ok] kv_split=True 时三路 KV 两两不同")
+
+
+def test_kv_split_backward():
+    """KV 分流后反传正常: LayerScale 更新一步后, 三个专属投影都有梯度。
+
+    首步的 kv_proj_* 无梯度是 LayerScale 零初始化造成的 (attn 输出被 0 乘,
+    梯度回不到它的输入), 与 Channel Mix 末层零初始化同理, 不是死锁:
+    scale 在首步即拿到梯度, 更新后 KV 投影即变为可达。
+    """
+    from models.golf_v7r.triple_query_tca import TripleQueryTCA
+    torch.manual_seed(31)
+    B, T, C, H, W = 1, 5, 32, 16, 16
+    tca = TripleQueryTCA(feat_dim=C, rwkv_dim=64, num_frames=T, kv_split=True)
+    fs = torch.randn(B, C, H, W)
+    seq = torch.randn(B, T, C, H, W)
+    ctx = torch.randn(B, T, 64)
+
+    def run():
+        F_N, F_L, F_M, ortho, _ = tca(fs, seq, ctx)
+        (F_N.sum() + F_L.sum() + F_M.sum() + ortho).backward()
+        return F_N, F_L, F_M
+
+    run()
+    # LayerScale 零初始化 → 首步先把 scale 更新离开 0, 打开注意力通路
+    with torch.no_grad():
+        for name in ("scale_N", "scale_L", "scale_M"):
+            p = tca.get_parameter(name)
+            p -= 0.1 * p.grad
+    for p in tca.parameters():
+        p.grad = None
+    run()
+    for name in ("kv_proj_N.0.weight", "kv_proj_L.0.weight", "kv_proj_M.0.weight"):
+        g = tca.get_parameter(name).grad
+        assert g is not None and g.abs().sum() > 0, f"{name} 无梯度"
+    print("  [ok] kv_split 反传正常 (scale 更新后三个专属投影均有梯度)")
+
+
 def main():
     print("v8 B1 (RWKV 编码器) 单测:")
     test_encoder_block_shape_and_interface()
@@ -174,6 +319,14 @@ def main():
     test_rwkv7_value_residual_second_layer_receives_gradient()
     test_rwkv7_value_residual_gate_initial_half()
     test_rwkv7_channel_mix_shape_and_backward()
+    print("\nv8 M1 (单帧 M 支路) 单测:")
+    test_branch_m_single_frame_ignores_neighbors()
+    test_branch_m_cross_frame_reads_neighbors()
+    test_branch_m_single_frame_fewer_params()
+    test_branch_m_single_frame_backward()
+    print("\nv8 M3 (三源 KV 分流) 单测:")
+    test_kv_split_changes_attention_inputs()
+    test_kv_split_backward()
     print("\n全部通过 ✅")
 
 

@@ -85,9 +85,9 @@ class V7RFusion(nn.Module):
                  num_blocks: int = 2, mode: str = "softmax",
                  weight_floor: float = 0.1, residual_freeze: bool = False):
         super().__init__()
-        if mode not in ("softmax", "floored", "additive"):
+        if mode not in ("softmax", "floored", "additive", "gated"):
             raise ValueError(
-                f"mode must be 'softmax', 'floored' or 'additive', got {mode!r}")
+                f"mode must be 'softmax', 'floored', 'additive' or 'gated', got {mode!r}")
         if not (0.0 <= weight_floor < 1.0 / 3.0):
             raise ValueError(f"weight_floor must be in [0, 1/3), got {weight_floor}")
         self.mode = mode
@@ -95,21 +95,51 @@ class V7RFusion(nn.Module):
         self.residual_freeze = bool(residual_freeze)
         gate_in = in_channels * 4  # Y_N, Y_L, Y_M, X_t
 
-        # 逐像素自适应权重网络
-        layers = []
-        c_in = gate_in
-        for i in range(max(num_blocks, 1)):
-            layers += [
-                nn.Conv2d(c_in, hidden_channels, 3, 1, 1, bias=True),
-                nn.GELU(),
-            ]
-            c_in = hidden_channels
-        layers += [nn.Conv2d(hidden_channels, in_channels, 1, 1, 0, bias=True)]
-        self.weight_net = nn.Sequential(*layers)
-        # 末层零初始化 → softmax 均匀 1/3 → g_k = ε + (1−3ε)/3 = 1/3
-        # 故 floored 模式的初始输出与 softmax 完全一致 (受控对照前提)
-        nn.init.zeros_(self.weight_net[-1].weight)
-        nn.init.zeros_(self.weight_net[-1].bias)
+        # 逐像素自适应权重网络 (softmax / floored / additive 三种模式使用)。
+        # gated 模式不用它 —— 若仍建立, 它会成为既不参与前向也不接收梯度的死参数。
+        if mode == "gated":
+            self.weight_net = None
+        else:
+            layers = []
+            c_in = gate_in
+            for i in range(max(num_blocks, 1)):
+                layers += [
+                    nn.Conv2d(c_in, hidden_channels, 3, 1, 1, bias=True),
+                    nn.GELU(),
+                ]
+                c_in = hidden_channels
+            layers += [nn.Conv2d(hidden_channels, in_channels, 1, 1, 0, bias=True)]
+            self.weight_net = nn.Sequential(*layers)
+            # 末层零初始化 → softmax 均匀 1/3 → g_k = ε + (1−3ε)/3 = 1/3
+            # 故 floored 模式的初始输出与 softmax 完全一致 (受控对照前提)
+            nn.init.zeros_(self.weight_net[-1].weight)
+            nn.init.zeros_(self.weight_net[-1].bias)
+
+        # 门控融合 (mode="gated", v8 M2): 多帧流 (N、L) 算门, 单帧流 (M) 提供内容。
+        # 门是逐通道的 sigmoid, 输入为 [Y_N, Y_L, X_t] —— 只用多帧流与中心帧,
+        # 不看 Y_M, 以便门表达"多帧是否一致"这一判断, 与 PRE-Mamba 的双流 MSSM 一致
+        # (reference_repos/PRE-Mamba/.../mssm.py 第 322 行)。
+        if mode == "gated":
+            g_layers = []
+            c_in = in_channels * 3
+            for _ in range(max(num_blocks, 1)):
+                g_layers += [nn.Conv2d(c_in, hidden_channels, 3, 1, 1, bias=True),
+                             nn.GELU()]
+                c_in = hidden_channels
+            g_layers += [nn.Conv2d(hidden_channels, in_channels, 1, 1, 0, bias=True)]
+            self.gate_net = nn.Sequential(*g_layers)
+            # bias=2.0 → sigmoid(2)≈0.88 → 门初始接近常开, 保留大部分单帧内容
+            nn.init.zeros_(self.gate_net[-1].weight)
+            nn.init.constant_(self.gate_net[-1].bias, 2.0)
+            # 基线 (多帧流本身): 初始化为 Y_N + Y_L 的直通, 使初始输出
+            # ≈ Y_N + Y_L + 0.88·Y_M, 与加性融合的起点同量级, 不丢多帧信息。
+            self.base_net = nn.Conv2d(in_channels * 3, in_channels, 1, 1, 0, bias=True)
+            with torch.no_grad():
+                self.base_net.weight.zero_()
+                self.base_net.bias.zero_()
+                for c in range(in_channels):       # 输入前 2×in_channels 是 Y_N, Y_L
+                    self.base_net.weight[c, c, 0, 0] = 1.0
+                    self.base_net.weight[c, in_channels + c, 0, 0] = 1.0
 
         # 轻量局部精化 (恒等初始化, 起点为纯融合结果)
         self.refine = nn.Conv2d(in_channels, in_channels, 3, 1, 1, bias=False)
@@ -127,24 +157,34 @@ class V7RFusion(nn.Module):
 
     def forward(self, Y_N: torch.Tensor, Y_L: torch.Tensor,
                 Y_M: torch.Tensor, X_t: torch.Tensor) -> Dict[str, torch.Tensor]:
-        gate_input = torch.cat([Y_N, Y_L, Y_M, X_t], dim=1)
-        logits = self.weight_net(gate_input)
-
-        if self.mode == "softmax":
-            weights = F.softmax(logits, dim=1)
-        elif self.mode == "floored":
-            # 权重下限: g = ε + (1−3ε)·softmax  ⇒  Σg = 1 (仍是凸组合),
-            # 且 ∂Y/∂Y_k = g_k ≥ ε, 结构性地杜绝梯度自锁死
-            eps = self.weight_floor
-            weights = eps + (1.0 - 3.0 * eps) * F.softmax(logits, dim=1)
+        if self.mode == "gated":
+            # 门控融合: 多帧流 (N、L) + 中心帧算门, 单帧流 (M) 提供内容。
+            #   g      = sigmoid(gate_net([Y_N, Y_L, X_t]))         逐通道门
+            #   Y_base = base_net([Y_N, Y_L, X_t])                  多帧流基线
+            #   Y_fused = g ⊙ Y_M + Y_base
+            # 门不看 Y_M, 所以 M 的贡献由 N、L 的状态决定, 而不是一个可被压到 0 的独立权重。
+            gate_feat = torch.cat([Y_N, Y_L, X_t], dim=1)
+            g = torch.sigmoid(self.gate_net(gate_feat))
+            Y_base = self.base_net(gate_feat)
+            Y_fused = g * Y_M + Y_base
+            weights = g          # 对外保留同名键, 语义为"单帧流被采纳的比例"
         else:
-            # 加性: 权重不归一化, softplus 保证为正且无上界。
-            # 零初始化 + 偏置 ln(e−1) ⇒ softplus(ln(e−1)) = 1, 故初始输出 = Σ Y_k。
-            # 配 ΣS = GT 的频带目标时, 初始化即精确还原 GT。
-            weights = F.softplus(logits + self._SOFTPLUS_INV_ONE)
-
-        w_N, w_L, w_M = weights[:, 0:1], weights[:, 1:2], weights[:, 2:3]
-        Y_fused = w_N * Y_N + w_L * Y_L + w_M * Y_M
+            gate_input = torch.cat([Y_N, Y_L, Y_M, X_t], dim=1)
+            logits = self.weight_net(gate_input)
+            if self.mode == "softmax":
+                weights = F.softmax(logits, dim=1)
+            elif self.mode == "floored":
+                # 权重下限: g = ε + (1−3ε)·softmax  ⇒  Σg = 1 (仍是凸组合),
+                # 且 ∂Y/∂Y_k = g_k ≥ ε, 结构性地杜绝梯度自锁死
+                eps = self.weight_floor
+                weights = eps + (1.0 - 3.0 * eps) * F.softmax(logits, dim=1)
+            else:
+                # 加性: 权重不归一化, softplus 保证为正且无上界。
+                # 零初始化 + 偏置 ln(e−1) ⇒ softplus(ln(e−1)) = 1, 故初始输出 = Σ Y_k。
+                # 配 ΣS = GT 的频带目标时, 初始化即精确还原 GT。
+                weights = F.softplus(logits + self._SOFTPLUS_INV_ONE)
+            w_N, w_L, w_M = weights[:, 0:1], weights[:, 1:2], weights[:, 2:3]
+            Y_fused = w_N * Y_N + w_L * Y_L + w_M * Y_M
 
         # 轻量精化 (起点恒等, 不会破坏)
         Y_refined = self.refine(Y_fused)

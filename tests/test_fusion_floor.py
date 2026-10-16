@@ -92,15 +92,93 @@ def test_backward_compat():
     assert n_sm == n_fl, "floored 不应引入额外参数"
     print(f"  [ok] 默认 softmax; 两模式参数量相同 ({n_sm/1e6:.4f}M)")
 
-    # 历史 ckpt 可直接加载
+    # 历史 ckpt 可直接加载。
+    # 例外: BranchM 修复 (v8) 在 to_rgb 前新增了 to_rgb_norm, 早于该修复的 ckpt
+    # 必然缺这两个键 —— 这是有意的结构改动, 不是不兼容, 因此允许它们缺失。
     ckpt = "outputs/golf_v7r_v3_phaseA_l/best.pth"
     if os.path.exists(ckpt):
         ck = torch.load(ckpt, map_location="cpu", weights_only=False)
-        r = GolfNet_v7r_v3().load_state_dict(ck["model_state_dict"])
-        assert not r.missing_keys and not r.unexpected_keys, (r.missing_keys, r.unexpected_keys)
-        print("  [ok] phaseA_l/best.pth 可直接加载 (无 missing/unexpected)")
+        r = GolfNet_v7r_v3().load_state_dict(ck["model_state_dict"], strict=False)
+        allowed_missing = {"branch_M.to_rgb_norm.weight", "branch_M.to_rgb_norm.bias"}
+        unexpected_missing = set(r.missing_keys) - allowed_missing
+        assert not unexpected_missing, f"出现预期外的缺失键: {unexpected_missing}"
+        assert not r.unexpected_keys, f"出现多余键: {r.unexpected_keys}"
+        print("  [ok] phaseA_l/best.pth 可加载 (仅缺 BranchM 修复新增的 to_rgb_norm)")
     else:
         print("  [skip] 历史 ckpt 不存在, 跳过加载验证")
+
+
+def test_gated_mode_structure():
+    """门控融合 (v8 M2) 的结构性质。
+
+    形式: O = refine(g ⊙ Y_M + Y_base), 其中 g = sigmoid(gate_net([Y_N,Y_L,X_t])),
+    Y_base = base_net([Y_N,Y_L,X_t])。对应 PRE-Mamba 的双流 MSSM 门控
+    (reference_repos/PRE-Mamba/.../mssm.py:322)。
+    """
+    torch.manual_seed(0)
+    B, C, H, W = 2, 3, 32, 32
+    YN = torch.rand(B, C, H, W)
+    YL = torch.rand(B, C, H, W)
+    YM = torch.rand(B, C, H, W)
+    Xc = torch.rand(B, C, H, W)
+    f = V7RFusion(in_channels=3, mode="gated", residual_freeze=True)
+    o = f(YN, YL, YM, Xc)
+
+    gate_feat = torch.cat([YN, YL, Xc], dim=1)
+    g = torch.sigmoid(f.gate_net(gate_feat))
+    base = f.base_net(gate_feat)
+    assert torch.allclose(o["Y_fused"], g * YM + base, atol=1e-6), "门控融合输出形式不符"
+    # 初始: base 应为 Y_N + Y_L 的直通, 门接近常开 (bias=2 → 0.88)
+    assert torch.allclose(base, YN + YL, atol=1e-6), "初始 base 应为 Y_N + Y_L"
+    assert abs(g.mean().item() - 0.881) < 0.01, f"初始门应≈0.881, 实为 {g.mean():.3f}"
+    # gated 模式不建立 weight_net, 避免死参数
+    assert f.weight_net is None, "gated 模式不应建立 weight_net"
+    print(f"  [ok] gated 融合形式正确 (初始门 {g.mean().item():.3f}, base=Y_N+Y_L)")
+
+
+def test_gated_gate_reads_multiframe_not_m():
+    """门必须由多帧流 (N、L) 与中心帧算出, 不读 Y_M。
+
+    这是"多帧做门、单帧做内容"的核心: 改变 Y_M 不应改变门的值,
+    只会改变被门调制的内容。若门读 Y_M, 该性质会被破坏。
+    """
+    torch.manual_seed(1)
+    B, C, H, W = 1, 3, 16, 16
+    YN = torch.rand(B, C, H, W)
+    YL = torch.rand(B, C, H, W)
+    YM = torch.rand(B, C, H, W)
+    Xc = torch.rand(B, C, H, W)
+    f = V7RFusion(in_channels=3, mode="gated", residual_freeze=True)
+
+    gate_feat = torch.cat([YN, YL, Xc], dim=1)
+    g1 = torch.sigmoid(f.gate_net(gate_feat))
+    YM2 = torch.rand(B, C, H, W)
+    g2 = torch.sigmoid(f.gate_net(gate_feat))   # 门只看 N/L/X, 与 Y_M 无关
+    assert torch.allclose(g1, g2), "门不应受 Y_M 影响"
+
+    # 而输出必须随 Y_M 变化 (单帧流确实提供内容)
+    o1 = f(YN, YL, YM, Xc)["Y_fused"]
+    o2 = f(YN, YL, YM2, Xc)["Y_fused"]
+    assert not torch.allclose(o1, o2), "输出应随 Y_M 变化"
+    print("  [ok] 门只由多帧流决定, 单帧流只提供内容")
+
+
+def test_gated_backward():
+    """门控融合反传正常: gate_net 末层与 base_net 首步即有梯度。"""
+    torch.manual_seed(2)
+    B, C, H, W = 2, 3, 16, 16
+    YN = torch.rand(B, C, H, W, requires_grad=True)
+    YL = torch.rand(B, C, H, W, requires_grad=True)
+    YM = torch.rand(B, C, H, W, requires_grad=True)
+    Xc = torch.rand(B, C, H, W)
+    f = V7RFusion(in_channels=3, mode="gated", residual_freeze=True)
+    f(YN, YL, YM, Xc)["O_t"].sum().backward()
+    for name in ("gate_net.4.weight", "base_net.weight"):
+        g = f.get_parameter(name).grad
+        assert g is not None and g.abs().sum() > 0, f"{name} 无梯度"
+    for t, nm in ((YN, "Y_N"), (YL, "Y_L"), (YM, "Y_M")):
+        assert t.grad is not None and t.grad.abs().sum() > 0, f"{nm} 无梯度"
+    print("  [ok] gated 融合反传正常 (门/基线/三路输入均有梯度)")
 
 
 def test_bad_args():
@@ -127,6 +205,10 @@ def main():
     test_gradient_floor_under_collapse()
     test_backward_compat()
     test_bad_args()
+    print("\nV7RFusion 门控融合单测 (v8 M2):")
+    test_gated_mode_structure()
+    test_gated_gate_reads_multiframe_not_m()
+    test_gated_backward()
     print("\n全部通过 ✅")
 
 

@@ -60,7 +60,9 @@ class GolfNet_v7r_v3(nn.Module):
                  channel_mix_rate: int = 4,
                  use_omni_shift: bool = True,
                  use_channel_mix: bool = True,
-                 encoder_block: str = "naf"):
+                 encoder_block: str = "naf",
+                 branch_m_single_frame: bool = False,
+                 kv_split: bool = False):
         super().__init__()
         self.num_frames = num_frames
         self.C1, self.C2, self.C3 = encoder_channels
@@ -103,6 +105,7 @@ class GolfNet_v7r_v3(nn.Module):
             channel_mix_rate=channel_mix_rate,
             use_omni_shift=use_omni_shift,
             use_channel_mix=use_channel_mix,
+            kv_split=kv_split,
         )
 
         # ========== Stage 4: 三分支 ==========
@@ -110,7 +113,8 @@ class GolfNet_v7r_v3(nn.Module):
         self.branch_L = BranchLSimple(channels=branch_channels, num_blocks=2)
         self.branch_M = BranchMSimple(channels=branch_channels,
                                       enc_channels=self.C2,
-                                      num_frames=num_frames, num_blocks=2)
+                                      num_frames=num_frames, num_blocks=2,
+                                      single_frame=branch_m_single_frame)
 
         # ========== Stage 5: Fusion ==========
         # fusion_mode: "softmax" (历史) / "floored" (§6.16 权重下限防梯度自锁死)

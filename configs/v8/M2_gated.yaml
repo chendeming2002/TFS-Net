@@ -1,0 +1,66 @@
+## v8 M2: M1 基础上融合改门控 (PRE-Mamba 式多帧门控)
+##
+## 基线: outputs/v8_M1_single_frame (M1)
+## 唯一变量: model.fusion_mode = "gated"
+##
+## 目的: 单独验证门控融合的边际作用。门由多帧流 (N、L) 与中心帧算出, 单帧流 (M) 提供内容,
+##   对应 PRE-Mamba 双流 MSSM 的 mgafeat = act(multi_gate ⊙ single) + multi
+##   (reference_repos/PRE-Mamba/.../mssm.py:322)。
+##
+## 与 additive 的区别: M 的输出不再被一个可压到 0 的独立权重乘, 而由 N、L 的状态决定用不用。
+## 判据见 02-实验计划.md §三。
+##
+seed: 42
+output_dir: outputs/v8_M2_gated
+dataset:
+  train_input_root: /home/a1005/yzy/dataset/SDSD/indoor/input
+  train_target_root: /home/a1005/yzy/dataset/SDSD/indoor/GT
+  val_input_root: /home/a1005/yzy/dataset/SDSD/test/low-light
+  val_target_root: /home/a1005/yzy/dataset/SDSD/test/GT
+  window_size: 5
+  crop_size: 256
+  num_workers: 0
+  pairing: position
+  branch_target_kernel_low: 31
+  branch_target_kernel_high: 5
+  branch_target_motion_share_mid: 0.5
+  branch_target_motion_share_high: 0.2
+model:
+  fusion_mode: gated
+  fusion_residual_freeze: true
+  num_frames: 5
+  encoder_channels:
+  - 32
+  - 64
+  - 128
+  feature_dim: 128
+  rwkv_dim: 192
+  rwkv_heads: 6
+  rwkv_head_size: 32
+  rwkv_blocks: 2
+  spatial_size: 2
+  branch_channels: 128
+  motion_aware_diff: false
+  diff_smooth_kernel: 5
+  branch_m_single_frame: true
+train:
+  batch_size: 2
+  epochs: 60
+  lr: 0.0005657
+  weight_decay: 0.01
+  log_interval: 100
+  val_interval: 5
+  grad_clip: 1.0
+  ckpt_interval: 500
+  lpips_net: vgg
+loss:
+  w_branch_N: 0.3
+  w_branch_L: 0.3
+  w_branch_M: 0.3
+  lambda_ortho: 0.01
+  w_ssim: 0.0
+  branch_warmup_epochs: 5
+  use_lowfreq_L: false
+  lowfreq_kernel: 16
+  branch_specific_targets: true
+  branch_target_normalize: true
