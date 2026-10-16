@@ -207,6 +207,36 @@ def test_bad_directions_rejected():
     raise AssertionError("通道数不能整除方向数时未报错")
 
 
+def test_switches_disable_components():
+    """两个开关关闭时, 对应子模块不建立, 参数计数下降, 且仍能前向反传。"""
+    torch.manual_seed(11)
+    full = SpatialRWKVHeadV8(32)
+    no_omni = SpatialRWKVHeadV8(32, use_omni_shift=False)
+    no_cm = SpatialRWKVHeadV8(32, use_channel_mix=False)
+    no_both = SpatialRWKVHeadV8(32, use_omni_shift=False, use_channel_mix=False)
+
+    n_full = sum(p.numel() for p in full.parameters())
+    n_no_omni = sum(p.numel() for p in no_omni.parameters())
+    n_no_cm = sum(p.numel() for p in no_cm.parameters())
+    n_no_both = sum(p.numel() for p in no_both.parameters())
+
+    assert no_omni.omni_shift is None, "关闭开关后 omni_shift 仍被建立"
+    assert no_cm.channel_mix is None, "关闭开关后 channel_mix 仍被建立"
+    assert n_no_omni < n_full, "关掉 OmniShift 后参数量未下降"
+    assert n_no_cm < n_full, "关掉 ChannelMix 后参数量未下降"
+    assert n_no_both < n_no_omni and n_no_both < n_no_cm, "两个都关后参数量未进一步下降"
+
+    # 三种关闭组合都必须能前向反传
+    for head in (no_omni, no_cm, no_both):
+        x_c = torch.randn(1, 32, 8, 8, requires_grad=True)
+        x_kv = torch.randn(1, 32, 8, 8, requires_grad=True)
+        y = head(x_c, x_kv)
+        assert y.shape == x_c.shape
+        y.sum().backward()
+    print(f"  [ok] 开关生效 (参数: 完整 {n_full/1e3:.1f}K, 无 OmniShift {n_no_omni/1e3:.1f}K, "
+          f"无 ChannelMix {n_no_cm/1e3:.1f}K, 都关 {n_no_both/1e3:.1f}K)")
+
+
 def main():
     print("v8 空间 RWKV 头单测 (OmniShift + Channel Mix):")
     test_omni_shift_output_shape()
@@ -221,6 +251,7 @@ def main():
     test_query_gating_differentiates_outputs()
     test_gradients_flow_to_both_inputs()
     test_bad_directions_rejected()
+    test_switches_disable_components()
     print("\n全部通过 ✅")
 
 

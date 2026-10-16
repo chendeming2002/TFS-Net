@@ -1,0 +1,66 @@
+## v8 A-impl: 空间头只加 OmniShift (不加 Channel Mix)
+##
+## 基线: outputs/v8_branchM_fix/_cfg.yaml (band 目标 + legacy 头 + additive 融合)
+## 变量: model.spatial_head=v8, use_omni_shift=True, use_channel_mix=False
+##
+## 目的: 单独评估 OmniShift (局部邻域归纳偏置) 的作用, 与 A-cm 构成单变量序列。
+##   完整 A 组序列: legacy 头 (Mfix) → A-impl (加 OmniShift) → A-cm (再加 Channel Mix)
+## 判据见 docs/v8/02-实验计划.md §三, 重点是三路输出的空间方差与正确口径的消融代价。
+##
+seed: 42
+output_dir: outputs/v8_A_impl_omnishift_only
+dataset:
+  train_input_root: /home/a1005/yzy/dataset/SDSD/indoor/input
+  train_target_root: /home/a1005/yzy/dataset/SDSD/indoor/GT
+  val_input_root: /home/a1005/yzy/dataset/SDSD/test/low-light
+  val_target_root: /home/a1005/yzy/dataset/SDSD/test/GT
+  window_size: 5
+  crop_size: 256
+  num_workers: 0
+  pairing: position
+  branch_target_kernel_low: 31
+  branch_target_kernel_high: 5
+  branch_target_motion_share_mid: 0.5
+  branch_target_motion_share_high: 0.2
+model:
+  fusion_mode: additive
+  fusion_residual_freeze: true
+  num_frames: 5
+  encoder_channels:
+  - 32
+  - 64
+  - 128
+  feature_dim: 128
+  rwkv_dim: 192
+  rwkv_heads: 6
+  rwkv_head_size: 32
+  rwkv_blocks: 2
+  spatial_size: 2
+  branch_channels: 128
+  motion_aware_diff: false
+  diff_smooth_kernel: 5
+  spatial_head: v8
+  channel_mix_rate: 4
+  use_omni_shift: true
+  use_channel_mix: false
+train:
+  batch_size: 2
+  epochs: 60
+  lr: 0.0005657
+  weight_decay: 0.01
+  log_interval: 100
+  val_interval: 5
+  grad_clip: 1.0
+  ckpt_interval: 500
+  lpips_net: vgg
+loss:
+  w_branch_N: 0.3
+  w_branch_L: 0.3
+  w_branch_M: 0.3
+  lambda_ortho: 0.01
+  w_ssim: 0.0
+  branch_warmup_epochs: 5
+  use_lowfreq_L: false
+  lowfreq_kernel: 16
+  branch_specific_targets: true
+  branch_target_normalize: true

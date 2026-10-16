@@ -58,6 +58,8 @@ class GolfNet_v7r_v3(nn.Module):
                  fusion_residual_freeze: bool = False,
                  spatial_head: str = "legacy",
                  channel_mix_rate: int = 4,
+                 use_omni_shift: bool = True,
+                 use_channel_mix: bool = True,
                  encoder_block: str = "naf"):
         super().__init__()
         self.num_frames = num_frames
@@ -99,6 +101,8 @@ class GolfNet_v7r_v3(nn.Module):
             diff_smooth_kernel=diff_smooth_kernel,
             spatial_head=spatial_head,
             channel_mix_rate=channel_mix_rate,
+            use_omni_shift=use_omni_shift,
+            use_channel_mix=use_channel_mix,
         )
 
         # ========== Stage 4: 三分支 ==========

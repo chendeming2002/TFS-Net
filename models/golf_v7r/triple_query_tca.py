@@ -82,7 +82,9 @@ class TripleQueryTCA(nn.Module):
     def __init__(self, feat_dim: int = 128, rwkv_dim: int = 192,
                  num_frames: int = 5, motion_aware_diff: bool = False,
                  diff_smooth_kernel: int = 5, spatial_head: str = "legacy",
-                 channel_mix_rate: int = 4):
+                 channel_mix_rate: int = 4,
+                 use_omni_shift: bool = True,
+                 use_channel_mix: bool = True):
         super().__init__()
         self.feat_dim = feat_dim
         self.rwkv_dim = rwkv_dim
@@ -124,7 +126,9 @@ class TripleQueryTCA(nn.Module):
             raise ValueError(f"spatial_head 必须是 'legacy' 或 'v8', 收到 {spatial_head!r}")
         self.spatial_head_kind = spatial_head
         if spatial_head == "v8":
-            head_kwargs = {"hidden_rate": channel_mix_rate}
+            head_kwargs = {"hidden_rate": channel_mix_rate,
+                           "use_omni_shift": use_omni_shift,
+                           "use_channel_mix": use_channel_mix}
             head_cls = SpatialRWKVHeadV8
         else:
             head_kwargs = {}

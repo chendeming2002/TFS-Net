@@ -92,18 +92,26 @@ class SpatialRWKVHeadV8(nn.Module):
         channels: 特征通道数
         num_directions: 扫描方向数 (默认 4)
         hidden_rate: Channel Mix 的隐层倍数 (与 Vision-RWKV 默认 4 一致)
+        use_omni_shift: 是否在 K/V 输入前注入局部邻域 (默认 True)。
+        use_channel_mix: 是否启用两段式里的 Channel Mix (默认 True)。
+
+    两个开关默认都为 True, 即完整形态; 单独关掉一个可用于做单变量对照
+    (只加 OmniShift, 或只加 Channel Mix), 见 `docs/v8/02-实验计划.md` 组 A。
     """
 
-    def __init__(self, channels: int, num_directions: int = 4, hidden_rate: int = 4):
+    def __init__(self, channels: int, num_directions: int = 4, hidden_rate: int = 4,
+                 use_omni_shift: bool = True, use_channel_mix: bool = True):
         super().__init__()
         assert channels % num_directions == 0, \
             f"channels({channels}) 必须能被 num_directions({num_directions}) 整除"
         self.channels = channels
         self.num_dirs = num_directions
         self.head_dim = channels // num_directions
+        self.use_omni_shift = bool(use_omni_shift)
+        self.use_channel_mix = bool(use_channel_mix)
 
-        # ---------- 局部上下文 (新增) ----------
-        self.omni_shift = OmniShift(channels)
+        # ---------- 局部上下文 (可选) ----------
+        self.omni_shift = OmniShift(channels) if self.use_omni_shift else None
 
         # ---------- Q/K/V 投影 ----------
         self.proj_q = nn.Linear(channels, channels, bias=False)
@@ -118,15 +126,18 @@ class SpatialRWKVHeadV8(nn.Module):
             FastBiWKV(self.head_dim) for _ in range(num_directions)
         ])
 
-        # ---------- Channel Mix (新增) ----------
+        # ---------- Channel Mix (可选) ----------
         # 经典 RWKV block 的两段式: Time Mix 做跨位置传递, Channel Mix 做逐位置跨通道变换。
         # 用 LeakyReLU 而非 GELU/ReLU², 避免负半轴梯度为零导致永久冻结。
-        hidden = channels * hidden_rate
-        self.channel_mix = nn.Sequential(
-            nn.Linear(channels, hidden, bias=False),
-            nn.LeakyReLU(0.01, inplace=True),
-            nn.Linear(hidden, channels, bias=False),
-        )
+        if self.use_channel_mix:
+            hidden = channels * hidden_rate
+            self.channel_mix = nn.Sequential(
+                nn.Linear(channels, hidden, bias=False),
+                nn.LeakyReLU(0.01, inplace=True),
+                nn.Linear(hidden, channels, bias=False),
+            )
+        else:
+            self.channel_mix = None
 
         self._init_weights()
         self._idx_cache: dict = {}
@@ -137,8 +148,9 @@ class SpatialRWKVHeadV8(nn.Module):
         nn.init.uniform_(self.proj_k.weight, -0.05 / math.sqrt(c), 0.05 / math.sqrt(c))
         for proj in (self.proj_q, self.proj_v, self.proj_out):
             nn.init.uniform_(proj.weight, -0.5 / math.sqrt(c), 0.5 / math.sqrt(c))
-        nn.init.kaiming_uniform_(self.channel_mix[0].weight, a=math.sqrt(5))
-        nn.init.zeros_(self.channel_mix[2].weight)
+        if self.use_channel_mix:
+            nn.init.kaiming_uniform_(self.channel_mix[0].weight, a=math.sqrt(5))
+            nn.init.zeros_(self.channel_mix[2].weight)
 
     # ---------- 扫描 (与旧实现一致, 扫描策略属后续消融项) ----------
     @staticmethod
@@ -202,9 +214,9 @@ class SpatialRWKVHeadV8(nn.Module):
         """
         B, C, H, W = center_feat.shape
 
-        # Q 来自中心帧; K/V 先经 OmniShift 注入局部上下文
+        # Q 来自中心帧; K/V 可选地先经 OmniShift 注入局部上下文
         q_tokens = self.pre_norm(center_feat.flatten(2).transpose(1, 2))
-        ctx = self.omni_shift(context_feat)
+        ctx = self.omni_shift(context_feat) if self.use_omni_shift else context_feat
         kv_tokens = self.pre_norm(ctx.flatten(2).transpose(1, 2))
 
         q = self.proj_q(q_tokens)
@@ -227,8 +239,9 @@ class SpatialRWKVHeadV8(nn.Module):
         out = out.transpose(1, 2).reshape(B, C, H, W)
 
         # Channel Mix: 逐位置跨通道变换 (末层零初始化 → 初始恒等, 梯度可达)
-        cm = self.channel_mix(self.post_norm(out.flatten(2).transpose(1, 2)))
-        out = out + cm.transpose(1, 2).reshape(B, C, H, W)
+        if self.use_channel_mix:
+            cm = self.channel_mix(self.post_norm(out.flatten(2).transpose(1, 2)))
+            out = out + cm.transpose(1, 2).reshape(B, C, H, W)
 
         return out
 
