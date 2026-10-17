@@ -37,7 +37,8 @@ class SharedEncoder(nn.Module):
                  out_channels_list: List[int] = None,
                  num_blocks_per_scale: List[int] = None,
                  block_type: str = "naf",
-                 wkv_mode: str = "legacy"):
+                 wkv_mode: str = "legacy",
+                 block_loops: int = 1):
         super().__init__()
         if out_channels_list is None:
             out_channels_list = [32, 64, 128]
@@ -54,8 +55,11 @@ class SharedEncoder(nn.Module):
             """按 block_type 生成指定数量的 block。"""
             if block_type == "naf":
                 return nn.Sequential(*[NAFBlock(channels) for _ in range(count)])
+            # block_loops: 单个 RWKV block 内部循环的次数 (Re-WKV 的做法, 参数不变)。
+            # 与 num_blocks_per_scale (堆几个独立 block, 参数 ×N) 是两个不同维度。
             from models.golf_v7r.rwkv_encoder_block import RWKVEncoderBlock
-            return nn.Sequential(*[RWKVEncoderBlock(channels, wkv_mode=wkv_mode)
+            return nn.Sequential(*[RWKVEncoderBlock(channels, wkv_mode=wkv_mode,
+                                                    num_loops=block_loops)
                                    for _ in range(count)])
 
         # 入口 conv: RGB → C1

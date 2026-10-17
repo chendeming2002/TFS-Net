@@ -39,26 +39,38 @@ class BranchNSimple(nn.Module):
     """Branch-N (简化): Imaging Noise Denoising"""
 
     def __init__(self, channels: int = 128, num_blocks: int = 2,
-                 out_channels: int = 3):
+                 out_channels: int = 3, at_f1: bool = False):
         super().__init__()
         self.channels = channels
+        # at_f1=True: 输入已经是全分辨率 (F1 尺度), 不再做 2 倍上采样。
+        # 这是 v8 U-Net 式重构的一部分 (见 docs/v8/05-UNet重构设计.md)。
+        self.at_f1 = bool(at_f1)
 
         self.denoise_blocks = nn.Sequential(*[
             NAFBlock(channels) for _ in range(num_blocks)
         ])
         self.channel_attn = ChannelAttention(channels)
 
-        self.upsample = Upsample3x3(in_ch=channels, out_ch=64, scale=2)
-        self.to_rgb = nn.Sequential(
-            nn.Conv2d(64, 32, 3, 1, 1, bias=True),
-            nn.GELU(),
-            nn.Conv2d(32, out_channels, 3, 1, 1, bias=True),
-        )
+        if self.at_f1:
+            self.upsample = None
+            self.to_rgb = nn.Sequential(
+                nn.Conv2d(channels, 32, 3, 1, 1, bias=True),
+                nn.LeakyReLU(0.01, inplace=True),
+                nn.Conv2d(32, out_channels, 3, 1, 1, bias=True),
+            )
+        else:
+            self.upsample = Upsample3x3(in_ch=channels, out_ch=64, scale=2)
+            self.to_rgb = nn.Sequential(
+                nn.Conv2d(64, 32, 3, 1, 1, bias=True),
+                nn.GELU(),
+                nn.Conv2d(32, out_channels, 3, 1, 1, bias=True),
+            )
 
     def forward(self, F_N: torch.Tensor) -> dict:
         x = self.denoise_blocks(F_N)
         x = self.channel_attn(x)
-        x = self.upsample(x)          # [B, 64, H, W]
+        if not self.at_f1:
+            x = self.upsample(x)      # [B, 64, H, W]
         Y_N = self.to_rgb(x)
         return {"Y_N": Y_N}
 

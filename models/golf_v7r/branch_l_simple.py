@@ -25,9 +25,12 @@ class BranchLSimple(nn.Module):
     """Branch-L (简化): Illumination Correction via Retinex"""
 
     def __init__(self, channels: int = 128, num_blocks: int = 2,
-                 gamma_init: float = 2.0, out_channels: int = 3):
+                 gamma_init: float = 2.0, out_channels: int = 3,
+                 at_f1: bool = False):
         super().__init__()
         self.channels = channels
+        # at_f1=True: 输入已是全分辨率, 不再上采样; 光照图直接在 F1 预测。
+        self.at_f1 = bool(at_f1)
 
         self.refine_blocks = nn.Sequential(*[
             NAFBlock(channels) for _ in range(num_blocks)
@@ -43,14 +46,16 @@ class BranchLSimple(nn.Module):
         nn.init.zeros_(self.illum_head[-1].weight)
         nn.init.zeros_(self.illum_head[-1].bias)
 
-        # 上采样
-        self.upsample = Upsample3x3(in_ch=channels, out_ch=64, scale=2)
+        # 上采样 (F1 模式下不需要)
+        self.upsample = None if self.at_f1 else Upsample3x3(
+            in_ch=channels, out_ch=64, scale=2)
 
         # 可学习 gamma
         self.log_gamma = nn.Parameter(torch.tensor(float(gamma_init)).log())
 
-        # 残差补偿 (零初始化)
-        self.residual_conv = nn.Conv2d(64, out_channels, 3, 1, 1, bias=True)
+        # 残差补偿 (零初始化); F1 模式下输入通道就是 channels
+        res_in = channels if self.at_f1 else 64
+        self.residual_conv = nn.Conv2d(res_in, out_channels, 3, 1, 1, bias=True)
         nn.init.zeros_(self.residual_conv.weight)
         nn.init.zeros_(self.residual_conv.bias)
 
@@ -63,8 +68,8 @@ class BranchLSimple(nn.Module):
         # 低分辨率光照图
         L_ds = torch.sigmoid(self.illum_head(x))  # [B,1,H/2,W/2]
 
-        # 上采样特征
-        x_up = self.upsample(x)                    # [B,64,H,W]
+        # 上采样特征 (F1 模式直接用全分辨率特征)
+        x_up = x if self.at_f1 else self.upsample(x)
 
         # 全分辨率光照 (直接 bilinear, 无 illum_refine)
         L_t = F.interpolate(L_ds, size=(H, W), mode='bilinear', align_corners=False)

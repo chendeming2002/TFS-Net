@@ -101,12 +101,15 @@ class BranchMSimple(nn.Module):
 
     def __init__(self, channels: int = 128, enc_channels: int = 64,
                  num_frames: int = 5, num_blocks: int = 2,
-                 out_channels: int = 3, single_frame: bool = False):
+                 out_channels: int = 3, single_frame: bool = False,
+                 at_f1: bool = False):
         super().__init__()
         self.channels = channels
         self.num_frames = num_frames
         self.center_idx = num_frames // 2
         self.single_frame = bool(single_frame)
+        # at_f1=True: 输入已是全分辨率 (F1), 不再做 2 倍上采样。
+        self.at_f1 = bool(at_f1)
 
         # 只用中心帧两侧的相邻帧 (t-1, t+1)
         self.neighbor_offsets = [-1, 1]
@@ -132,15 +135,19 @@ class BranchMSimple(nn.Module):
         self.refine_blocks = nn.Sequential(*[
             NAFBlock(channels) for _ in range(num_blocks)
         ])
-        self.upsample = Upsample3x3(in_ch=channels, out_ch=64, scale=2)
+        if self.at_f1:
+            self.upsample = None
+        else:
+            self.upsample = Upsample3x3(in_ch=channels, out_ch=64, scale=2)
         # 尺度约束 (v8): 这条通路的上游没有任何归一化, 训练中输出尺度会失控
         # (实测 upsample 输出 std 从初始 1.0 涨到 28.6, 而 BranchN 全程 0.012),
         # 导致 to_rgb 首层输出整体为负、GELU 完全死亡 (权重梯度恒为 0)。
         # 归一化使该处的尺度与 BranchN 对齐 (其输入来自 TripleQueryTCA 的 out_norm)。
-        self.to_rgb_norm = LayerNorm2d(64)
+        to_rgb_in = channels if self.at_f1 else 64
+        self.to_rgb_norm = LayerNorm2d(to_rgb_in)
         # 用 LeakyReLU 而非 GELU: 后者在负半轴梯度为零, 一旦输入变负就永久冻结。
         self.to_rgb = nn.Sequential(
-            nn.Conv2d(64, 32, 3, 1, 1, bias=True),
+            nn.Conv2d(to_rgb_in, 32, 3, 1, 1, bias=True),
             nn.LeakyReLU(0.01, inplace=True),
             nn.Conv2d(32, out_channels, 3, 1, 1, bias=True),
         )
@@ -180,7 +187,8 @@ class BranchMSimple(nn.Module):
         else:
             aggregated, flow_vis, conf_map = self._align_and_aggregate(F_M, F2_seq)
         x = self.refine_blocks(aggregated)
-        x = self.upsample(x)
+        if not self.at_f1:
+            x = self.upsample(x)
         x = self.to_rgb_norm(x)
         Y_M = self.to_rgb(x)
         return {"Y_M": Y_M, "flow_vis": flow_vis, "conf_map": conf_map}

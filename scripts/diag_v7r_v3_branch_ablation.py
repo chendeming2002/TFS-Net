@@ -24,7 +24,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from models.golf_v7r import GolfNet_v7r_v3
+from models.golf_v7r import GolfNet_v7r_v3, GolfNet_v8
 
 
 def read_image(path):
@@ -55,10 +55,12 @@ def main():
 
     import yaml
     with open(args.config) as f:
-        model_kwargs = (yaml.safe_load(f) or {}).get("model", {}) or {}
+        model_kwargs = dict((yaml.safe_load(f) or {}).get("model", {}) or {})
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    model = GolfNet_v7r_v3(**model_kwargs).to(dev).eval()
+    arch = model_kwargs.pop("arch", "v7r_v3")
+    model_cls = GolfNet_v8 if arch == "v8" else GolfNet_v7r_v3
+    model = model_cls(**model_kwargs).to(dev).eval()
     ck = torch.load(args.ckpt, map_location=dev, weights_only=False)
     model.load_state_dict(ck["model_state_dict"])
     print(f"RESULT loaded epoch {ck.get('epoch')} from {args.ckpt}", flush=True)

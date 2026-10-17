@@ -38,7 +38,8 @@ import torch.nn.functional as F
 
 _KERNEL = None
 _KERNEL_ERROR = None
-_TMAX = 65536      # 编译期内核模板参数: 支持的最大序列长度 (L=16384 够用)
+_TMAX = 65536        # 反向核用它开栈上数组 (IDEAL_T_LEN = Tmax/32), 不能随意放大;
+                     # 注意这不是序列长度上限: 核内部按 TOKEN_SPLIT 分块, 任意 L 都能处理。
 
 
 def _load_kernel():
@@ -147,13 +148,18 @@ class CudaBiWKV(nn.Module):
         # 与 BiWKV 一致的预处理: fp32、clamp、强制 decay<0
         k = k.float().clamp(-8, 8)
         v = v.float().clamp(-8, 8)
-        # 尺寸保护: 官方核的线程块为 min(16, C) 列 x 32 行, 并要求 B*C 能被列数整除;
-        # C 不是 16 的倍数、或序列超过编译期 Tmax 时, 回退到纯 PyTorch 单归一化实现。
-        # 否则会出现非法内存访问 (实测 head_dim=8 时触发)。回退时**复用本模块的参数**,
-        # 不能新建模块 (那样会丢掉训练中的 spatial_decay / spatial_first)。
-        if C % 16 != 0 or L > _TMAX:
-            return _single_norm_torch(k, v, self.spatial_decay,
-                                      self.spatial_first, total_tokens)
+        # 长度约束说明 (踩过两次坑, 记录清楚):
+        #   · **前向**内核按 TOKEN_SPLIT 分块, 任意 L 都能处理 (实测 L=2073600 整图推理正常);
+        #   · **反向**内核在栈上开了 y/z/zexp 三个 IDEAL_T_LEN 数组 (IDEAL_T_LEN = Tmax/32),
+        #     因此 L 不能超过编译期的 Tmax, 否则 kernel 启动直接报 "invalid argument"。
+        # 训练用的 crop=256 对应 L=65536, 恰好等于 Tmax, 可正常反传;
+        # 整图 (1920x1080, L=2073600) 只做前向, 不反传, 因此不受该约束。
+        # 这里只在"确实需要梯度"时才检查, 而不是把大 L 推给 O(L²) 的纯 PyTorch 回退版
+        # (那样在 L=65536 时就需要 32 TB 显存)。
+        if L > _TMAX and (k.requires_grad or v.requires_grad):
+            raise RuntimeError(
+                f"序列长度 L={L} 超过反向内核上限 _TMAX={_TMAX}。"
+                f" 训练时请减小 crop_size, 或在推理时用 torch.no_grad()。")
         w = -F.softplus(self.spatial_decay)        # w < 0, 衰减因子 exp(w/T · 距离)
         u = self.spatial_first.clamp(-5, 5)
         # 符号映射: 核内衰减写作 exp(-w_kernel·距离), 要求 w_kernel > 0,

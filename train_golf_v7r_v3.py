@@ -132,9 +132,19 @@ def main():
     logger.info(f"Val dataset: {len(val_ds)} samples")
 
     # Model
-    model = GolfNet_v7r_v3(**cfg['model']).to(device)
+    # 模型选择 (v8 重构): 配置里 model.arch = "v8" 时使用 U-Net 式新结构;
+    # 默认仍是 v7r-v3, 保证历史配置与 checkpoint 不受影响。
+    arch = cfg['model'].pop('arch', 'v7r_v3')
+    if arch == 'v8':
+        from models.golf_v7r.golfnet_v8 import GolfNet_v8 as _Net
+        model = _Net(**cfg['model']).to(device)
+        logger.info(f"GolfNet_v8 (U-Net 式聚合) params: "
+                    f"{sum(p.numel() for p in model.parameters())/1e6:.2f}M")
+    else:
+        model = GolfNet_v7r_v3(**cfg['model']).to(device)
+        n_params = sum(p.numel() for p in model.parameters())
+        logger.info(f"GolfNet_v7r_v3 params: {n_params/1e6:.2f}M")
     n_params = sum(p.numel() for p in model.parameters())
-    logger.info(f"GolfNet_v7r_v3 params: {n_params/1e6:.2f}M")
 
     # Loss & Optimizer
     criterion = GolfV7RLoss(**cfg.get('loss', {})).to(device)
