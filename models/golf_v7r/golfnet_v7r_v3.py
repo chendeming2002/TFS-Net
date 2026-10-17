@@ -62,7 +62,8 @@ class GolfNet_v7r_v3(nn.Module):
                  use_channel_mix: bool = True,
                  encoder_block: str = "naf",
                  branch_m_single_frame: bool = False,
-                 kv_split: bool = False):
+                 kv_split: bool = False,
+                 wkv_mode: str = "legacy"):
         super().__init__()
         self.num_frames = num_frames
         self.C1, self.C2, self.C3 = encoder_channels
@@ -75,6 +76,7 @@ class GolfNet_v7r_v3(nn.Module):
             out_channels_list=encoder_channels,
             num_blocks_per_scale=[2, 2, 2],
             block_type=encoder_block,
+            wkv_mode=wkv_mode,
         )
 
         # ========== Stage 2: 投影 + 像素级时序对齐 ==========
@@ -106,6 +108,7 @@ class GolfNet_v7r_v3(nn.Module):
             use_omni_shift=use_omni_shift,
             use_channel_mix=use_channel_mix,
             kv_split=kv_split,
+            wkv_mode=wkv_mode,
         )
 
         # ========== Stage 4: 三分支 ==========

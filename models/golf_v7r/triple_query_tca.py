@@ -85,7 +85,8 @@ class TripleQueryTCA(nn.Module):
                  channel_mix_rate: int = 4,
                  use_omni_shift: bool = True,
                  use_channel_mix: bool = True,
-                 kv_split: bool = False):
+                 kv_split: bool = False,
+                 wkv_mode: str = "legacy"):
         super().__init__()
         self.feat_dim = feat_dim
         self.rwkv_dim = rwkv_dim
@@ -137,16 +138,20 @@ class TripleQueryTCA(nn.Module):
         # spatial_head (§v8, docs/v8/01-设计.md §三):
         #   "legacy" → 旧的 RWKVSpatialHead (无局部上下文、无 Channel Mix)
         #   "v8"     → 规范的 SpatialRWKVHeadV8 (OmniShift + Channel Mix)
+        # wkv_mode (docs/v8/04-训练加速调研.md):
+        #   "legacy"      → 双向各自归一化再平均 (历史行为)
+        #   "single_norm" → 官方 Vision-RWKV 定义, 并启用 CUDA 算子
         if spatial_head not in ("legacy", "v8"):
             raise ValueError(f"spatial_head 必须是 'legacy' 或 'v8', 收到 {spatial_head!r}")
         self.spatial_head_kind = spatial_head
         if spatial_head == "v8":
             head_kwargs = {"hidden_rate": channel_mix_rate,
                            "use_omni_shift": use_omni_shift,
-                           "use_channel_mix": use_channel_mix}
+                           "use_channel_mix": use_channel_mix,
+                           "wkv_mode": wkv_mode}
             head_cls = SpatialRWKVHeadV8
         else:
-            head_kwargs = {}
+            head_kwargs = {"wkv_mode": wkv_mode}
             head_cls = RWKVSpatialHead
         self.attn_N = head_cls(feat_dim, **head_kwargs)
         self.attn_L = head_cls(feat_dim, **head_kwargs)

@@ -100,7 +100,8 @@ class SpatialRWKVHeadV8(nn.Module):
     """
 
     def __init__(self, channels: int, num_directions: int = 4, hidden_rate: int = 4,
-                 use_omni_shift: bool = True, use_channel_mix: bool = True):
+                 use_omni_shift: bool = True, use_channel_mix: bool = True,
+                 wkv_mode: str = "legacy"):
         super().__init__()
         assert channels % num_directions == 0, \
             f"channels({channels}) 必须能被 num_directions({num_directions}) 整除"
@@ -109,6 +110,10 @@ class SpatialRWKVHeadV8(nn.Module):
         self.head_dim = channels // num_directions
         self.use_omni_shift = bool(use_omni_shift)
         self.use_channel_mix = bool(use_channel_mix)
+        if wkv_mode not in ("legacy", "single_norm"):
+            raise ValueError(
+                f"wkv_mode 必须是 'legacy' 或 'single_norm', 收到 {wkv_mode!r}")
+        self.wkv_mode = wkv_mode
 
         # ---------- 局部上下文 (可选) ----------
         self.omni_shift = OmniShift(channels) if self.use_omni_shift else None
@@ -122,9 +127,18 @@ class SpatialRWKVHeadV8(nn.Module):
         self.pre_norm = nn.LayerNorm(channels)
         self.post_norm = nn.LayerNorm(channels)
 
-        self.bi_wkv_list = nn.ModuleList([
-            FastBiWKV(self.head_dim) for _ in range(num_directions)
-        ])
+        # ---------- WKV 实现 ----------
+        # "legacy"      → FastBiWKV (双向各自归一化再平均)
+        # "single_norm" → 官方 Vision-RWKV 定义 (双向单归一化), 优先用 CUDA 算子
+        if wkv_mode == "single_norm":
+            from models.modules.cuda_wkv import make_wkv
+            self.bi_wkv_list = nn.ModuleList([
+                make_wkv(self.head_dim) for _ in range(num_directions)
+            ])
+        else:
+            self.bi_wkv_list = nn.ModuleList([
+                FastBiWKV(self.head_dim) for _ in range(num_directions)
+            ])
 
         # ---------- Channel Mix (可选) ----------
         # 经典 RWKV block 的两段式: Time Mix 做跨位置传递, Channel Mix 做逐位置跨通道变换。

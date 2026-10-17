@@ -38,6 +38,15 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
 
+    # TF32 加速 (v8): 4090 上矩阵乘走 TF32 张量核, 实测前向省约 13%。
+    # 本机 GPU 利用率 100% 但功耗仅 100-130 W / 450 W, 属"小算子串行"特征,
+    # 故加速重点在减少算子数量 (见 docs/v8/04-训练加速调研.md), TF32 是其中的零风险项。
+    # 注意: TF32 把 matmul 尾数精度降到 10 位, 会改变数值结果 —— 但与逐位复现早已放弃
+    # 的现状一致, 不引入新的可比性问题。
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    logger.info("TF32 enabled (matmul + cudnn)")
+
     # Dataset
     pairing = cfg['dataset'].get('pairing', 'name')
     exclude_seqs = cfg['dataset'].get('exclude_seqs') or None
@@ -73,11 +82,21 @@ def main():
                     f"{train_ds.branch_target_kernel_high}, "
                     f"motion_share_mid={train_ds.branch_target_motion_share_mid}, "
                     f"motion_share_high={train_ds.branch_target_motion_share_high}")
+    _train_workers = cfg['dataset'].get('num_workers', 0)
     train_loader = DataLoader(
         train_ds, batch_size=cfg['train']['batch_size'], shuffle=True,
-        num_workers=cfg['dataset'].get('num_workers', 0),
-        pin_memory=False, drop_last=True,
+        num_workers=_train_workers,
+        pin_memory=bool(_train_workers > 0),
+        drop_last=True,
+        persistent_workers=bool(_train_workers > 0),
     )
+    # 数据加载说明 (v8 训练加速):
+    #   num_workers=0 时, 每个 batch 的解码与增广 (约 0.4 s) 会与 GPU 计算完全串行。
+    #   在 WKV 换成 CUDA 算子后 GPU 单步只需几十毫秒, 数据加载就会成为主要瓶颈。
+    #   num_workers>0 时由子进程预取, 与 GPU 计算重叠。代价是每个 worker 有独立的
+    #   Python random 状态, 增广序列不再与单进程一致 —— 逐位复现早已放弃, 这一代价可接受。
+    if _train_workers > 0:
+        logger.info(f"DataLoader: num_workers={_train_workers}, pin_memory=True, 预取与计算重叠")
     logger.info(f"Train dataset: {len(train_ds)} samples, {len(train_loader)} batches")
 
     # 验证集: 默认用 test/low-light (与训练帧级重叠 -> 泄漏, §6.4);

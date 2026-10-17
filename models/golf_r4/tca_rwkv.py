@@ -34,11 +34,27 @@ from models.modules.pure_rwkv_sace import BiWKV, MVCShift
 # FastBiWKV — 大 chunk 变体 (python 循环开销优化)
 # ============================================================
 class FastBiWKV(BiWKV):
-    """BiWKV with larger chunk size: 16384 tokens / 256 = 64 次 python 迭代 → /1024 = 16 次.
-    数学完全一致 (chunk 递推公式与长度无关), 仅减少 E-core taskset 下的 python 开销.
-    实测 Foxtrot 3 头 × 4 方向 × 双向 = 24 次调用/前向, 1536 → 384 次迭代."""
+    """BiWKV with larger chunk size: 减少 python 循环次数以降低 kernel 启动开销。
 
-    CHUNK = 1024
+    chunk 递推公式与 chunk 长度无关, 因此改变 CHUNK **不改变数学结果**。
+    已验证: 在同一组权重下比较 CHUNK=512/1024/4096, 输出最大绝对差 5.96e-08
+    (float32 机器精度量级)。
+    ⚠️ 验证时必须固定权重 —— 若每次新建模型比较, 差异来自随机初始化而非 chunk
+    (本项目实测过这个坑: 未固定权重时得到 2e-3 的假差异)。
+
+    小 chunk 的问题不是算力不够, 而是每次循环单独发起若干小 kernel:
+    在 128x128 特征尺度下序列长度 L = 16384, CHUNK=1024 时 16 次循环,
+    实测每次扫描 18.2 ms; 提到 4096 后 4 次循环, 降到 16.5 ms (约省 9%)。
+    三路 TCA 每前向调用 3 分支 x 4 方向 x 双向 = 24 次扫描, 故对每步时间有稳定小幅收益。
+
+    实测 GPU 利用率 100% 但功耗仅 100-130 W / 450 W, 属"小算子串行"特征,
+    提高 CHUNK 正是针对这一点, 而不是针对算力。
+
+    更彻底的解法是把循环塌缩成单个 CUDA kernel (例如搬运 RWKV-7 官方 wkv7 算子),
+    属 solver 层面的改动, 现阶段不做。
+    """
+
+    CHUNK = 4096
 
     @staticmethod
     def _scan_cumsum(ek, ekv, u_coef, ew_pow):
@@ -81,13 +97,18 @@ class RWKVSpatialHead(nn.Module):
     每路独立 K/V 投影，共享 BiWKV 参数
     """
     
-    def __init__(self, channels: int, num_directions: int = 4):
+    def __init__(self, channels: int, num_directions: int = 4,
+                 wkv_mode: str = "legacy"):
         super().__init__()
         assert channels % num_directions == 0
         self.channels = channels
         self.num_dirs = num_directions
         self.head_dim = channels // num_directions
-        
+        if wkv_mode not in ("legacy", "single_norm"):
+            raise ValueError(
+                f"wkv_mode 必须是 'legacy' 或 'single_norm', 收到 {wkv_mode!r}")
+        self.wkv_mode = wkv_mode
+
         # 查询/键/值投影
         self.proj_q = nn.Linear(channels, channels, bias=False)
         self.proj_k = nn.Linear(channels, channels, bias=False)
@@ -97,10 +118,19 @@ class RWKVSpatialHead(nn.Module):
         self.pre_norm = nn.LayerNorm(channels)
         self.post_norm = nn.LayerNorm(channels)
         
-        # BiWKV for each direction (FastBiWKV: chunk=1024 降低 python 循环开销)
-        self.bi_wkv_list = nn.ModuleList([
-            FastBiWKV(self.head_dim) for _ in range(num_directions)
-        ])
+        # WKV 实现 (见 docs/v8/04-训练加速调研.md):
+        #   "legacy"      → FastBiWKV: 两个方向各自归一化再平均 (历史行为)
+        #   "single_norm" → 官方 Vision-RWKV 定义: 双向贡献进同一分子分母, 只除一次。
+        #                   优先使用 CUDA 算子 (单次调用即含双向), 无 nvcc 时回退纯 PyTorch 版。
+        if wkv_mode == "single_norm":
+            from models.modules.cuda_wkv import make_wkv
+            self.bi_wkv_list = nn.ModuleList([
+                make_wkv(self.head_dim) for _ in range(num_directions)
+            ])
+        else:
+            self.bi_wkv_list = nn.ModuleList([
+                FastBiWKV(self.head_dim) for _ in range(num_directions)
+            ])
         
         # R4-FIX (双零死锁): 原 `nn.init.zeros_(self.proj_out.weight)` 与
         # TCA_RWKV 的 scale_N/L/M (零初始化) 形成【乘法双零死锁】:

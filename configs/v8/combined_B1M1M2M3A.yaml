@@ -1,0 +1,87 @@
+## v8 合并实验: B1 + M1 + M2 + M3 + A (10 epoch)
+##
+## 目的: 用户要求先一次性合并全部结构改动, 看整体是否成立; 后续再逐项拆解消融。
+## 因此本 run **不是单变量**, 不能用于归因; 它的用途是给出"合并版"的整体表现与三路活性,
+## 作为后续消融的出发点。
+##
+## 包含的改动:
+##   B1   encoder_block = "rwkv"        编码器 NAFBlock → 空间 RWKV block
+##   M1   branch_m_single_frame = True  M 支路只用中心帧 (去掉 flow/deform/conf)
+##   M2   fusion_mode = "gated"         门控融合: 多帧 (N、L) 算门, 单帧 (M) 提供内容
+##   M3   kv_split = True               三源 KV 分流 (N→均值, L→低频, M→中心帧)
+##   A    spatial_head = "v8" + OmniShift + Channel Mix
+##   wkv  wkv_mode = "single_norm"      官方 Vision-RWKV 双向定义, 使用 CUDA 算子
+##
+## 为什么包含 wkv_mode:
+##   调研确认旧实现的双向组合方式与官方不一致 (docs/v8/04-训练加速调研.md), 且 CUDA 算子
+##   只实现官方定义。合并阶段一并切到官方定义, 同时获得 4.4 倍的前向加速
+##   (实测 109 ms → 25 ms, batch=1, 256x256)。
+##
+## 判据 (机制判据, 不比 PSNR):
+##   1. 三路输出的空间方差都明显高于常数图水平 (1e-11)
+##   2. 三路与各自目标的误差随训练下降
+##   3. 消融: 去掉任一路有明显代价 (加性/gated 口径: 直接置零, 不归一化)
+##   4. 训练稳定: 显存可控, 损失不失控 (注意 branch_warmup_epochs=5 会让损失自然抬升)
+##
+## 10 epoch (而非 5): 合并改动较多, 5 epoch 下分支预热斜坡刚结束, 不足以判断收敛趋势。
+seed: 42
+output_dir: outputs/v8_combined_B1M1M2M3A
+dataset:
+  train_input_root: /home/a1005/yzy/dataset/SDSD/indoor/input
+  train_target_root: /home/a1005/yzy/dataset/SDSD/indoor/GT
+  val_input_root: /home/a1005/yzy/dataset/SDSD/test/low-light
+  val_target_root: /home/a1005/yzy/dataset/SDSD/test/GT
+  window_size: 5
+  crop_size: 256
+  num_workers: 6
+  pairing: position
+  branch_target_kernel_low: 31
+  branch_target_kernel_high: 5
+  branch_target_motion_share_mid: 0.5
+  branch_target_motion_share_high: 0.2
+model:
+  fusion_mode: gated
+  fusion_residual_freeze: true
+  num_frames: 5
+  encoder_channels:
+  - 32
+  - 64
+  - 128
+  feature_dim: 128
+  rwkv_dim: 192
+  rwkv_heads: 6
+  rwkv_head_size: 32
+  rwkv_blocks: 2
+  spatial_size: 2
+  branch_channels: 128
+  motion_aware_diff: false
+  diff_smooth_kernel: 5
+  branch_m_single_frame: true
+  kv_split: true
+  encoder_block: rwkv
+  spatial_head: v8
+  use_omni_shift: true
+  use_channel_mix: true
+  channel_mix_rate: 4
+  wkv_mode: single_norm
+train:
+  batch_size: 2
+  epochs: 10
+  lr: 0.0005657
+  weight_decay: 0.01
+  log_interval: 100
+  val_interval: 5
+  grad_clip: 1.0
+  ckpt_interval: 500
+  lpips_net: vgg
+loss:
+  w_branch_N: 0.3
+  w_branch_L: 0.3
+  w_branch_M: 0.3
+  lambda_ortho: 0.01
+  w_ssim: 0.0
+  branch_warmup_epochs: 5
+  use_lowfreq_L: false
+  lowfreq_kernel: 16
+  branch_specific_targets: true
+  branch_target_normalize: true

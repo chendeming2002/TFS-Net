@@ -36,7 +36,8 @@ class SharedEncoder(nn.Module):
     def __init__(self, in_channels: int = 3,
                  out_channels_list: List[int] = None,
                  num_blocks_per_scale: List[int] = None,
-                 block_type: str = "naf"):
+                 block_type: str = "naf",
+                 wkv_mode: str = "legacy"):
         super().__init__()
         if out_channels_list is None:
             out_channels_list = [32, 64, 128]
@@ -54,7 +55,8 @@ class SharedEncoder(nn.Module):
             if block_type == "naf":
                 return nn.Sequential(*[NAFBlock(channels) for _ in range(count)])
             from models.golf_v7r.rwkv_encoder_block import RWKVEncoderBlock
-            return nn.Sequential(*[RWKVEncoderBlock(channels) for _ in range(count)])
+            return nn.Sequential(*[RWKVEncoderBlock(channels, wkv_mode=wkv_mode)
+                                   for _ in range(count)])
 
         # 入口 conv: RGB → C1
         self.stem = nn.Conv2d(in_channels, C1, 3, 1, 1, bias=True)

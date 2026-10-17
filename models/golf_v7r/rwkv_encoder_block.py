@@ -51,12 +51,13 @@ class RWKVEncoderBlock(nn.Module):
     """
 
     def __init__(self, channels: int, num_directions: int = 4,
-                 hidden_rate: int = 4, num_loops: int = 1):
+                 hidden_rate: int = 4, num_loops: int = 1,
+                 wkv_mode: str = "legacy"):
         super().__init__()
         assert num_loops >= 1, f"num_loops 必须 ≥ 1, 收到 {num_loops}"
         self.num_loops = int(num_loops)
         self.head = SpatialRWKVHeadV8(channels, num_directions=num_directions,
-                                      hidden_rate=hidden_rate)
+                                      hidden_rate=hidden_rate, wkv_mode=wkv_mode)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for _ in range(self.num_loops):
