@@ -85,8 +85,9 @@ N、M 与自身频带目标的相对误差约 0.7 至 0.9, 学得不充分。扰
 
 **Cross RWKV Gate 已实施并开始 15ep 实验** (`configs/v8/crossrwkv_gate_15ep.yaml`):
 把 `sigmoid(q) * wkv` 的单门换成论文 2411.05636 式 (2)–(4) 的双查询结构 —— R 为带符号
-线性投影, G 经 SiLU 门控, 二者输入为 N/L 的多帧聚合特征与 M 的中心帧特征, K/V 仍取
-各支路自己的频带来源; R、G、K、V 的输入各配一个 OmniShift, 作为论文 Q-Shift 在图像上
+线性投影, G 经 SiLU 门控; R/G 与 K/V 按支路各取一个频带来源: N 的 R/G 用单帧减多帧
+聚合的帧间差值 (噪声估计)、KV 用单帧中高频, L 的 R/G 与 KV 用多帧低通, M 的 R/G 用
+中心帧、KV 用单帧高频残差; 四个投影的输入各配一个 OmniShift, 作为论文 Q-Shift 在图像上
 的替代实现; Channel Mix 按其式 (6)–(8) 重构; 增加逐头 LayerNorm。除 `model.q_mode` 外
 配置与 U-Net 基线完全一致, 参数量 1.100M → 1.175M, 前向耗时不变。详见
 `06-CrossRWKVGate-Q重构设计.md`。

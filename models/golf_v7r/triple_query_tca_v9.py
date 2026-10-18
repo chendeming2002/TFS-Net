@@ -129,10 +129,16 @@ class TripleQueryTCAv9(nn.Module):
 
         Returns: F_N, F_L, F_M ([B, C, H, W]), ortho_loss (scalar)
         """
-        # ---------- 三路 Query ----------
+        # ---------- 三路 Query (R/G) ----------
+        # cross_rwkv: R/G 直接由特征图产生, Q-Shift 在头内部完成。
+        #   L: 多帧聚合特征 (光照是低频、跨帧稳定, 平均后更干净)
+        #   M: 中心帧特征 (运动是单帧内的局部结构偏移, 不做跨帧运算)
+        #   N: 单帧减多帧聚合。这个差值就是帧间不一致量, 物理上对应成像噪声:
+        #      场景结构在帧间稳定, 相减后保留下来的是各帧独立的噪声及其相位,
+        #      而多帧聚合本身已经把噪声平均掉, 用它做查询等于问一个看不到噪声的信号。
         if self.q_mode == "cross_rwkv":
-            # R/G 直接由特征图产生 (N/L 多帧, M 单帧), Q-Shift 在头内部完成
-            Q_N, Q_L, Q_M = F1_multi, F1_multi, F1_single
+            noise_query = F1_single - F1_multi
+            Q_N, Q_L, Q_M = noise_query, F1_multi, F1_single
         else:
             Q_N = self.query_N(F1_multi)
             Q_L = self.query_L(F1_multi)
@@ -142,7 +148,14 @@ class TripleQueryTCAv9(nn.Module):
         multi_low = self._lowpass(F1_multi)
         single_low = self._lowpass(F1_single)
         single_high = F1_single - single_low          # 单帧高频残差
-        kv_N = self.kv_proj_N(multi_low)
+        if self.q_mode == "cross_rwkv":
+            # N 的 KV 取单帧的中高频成分 (单帧减去大核低通), 与 N 的目标频带
+            # (0.5 中频 + 0.8 高频) 对齐; 若沿用多帧低通, 键值里只剩平滑结构,
+            # 与要预测的噪声频带方向相反。
+            cd = max(self.lowpass_kernel * 3, 9)
+            kv_N = self.kv_proj_N(F1_single - self._lowpass(F1_single, kernel=cd))
+        else:
+            kv_N = self.kv_proj_N(multi_low)
         kv_L = self.kv_proj_L(self._lowpass(F1_multi, kernel=max(self.lowpass_kernel * 3, 9)))
         kv_M = self.kv_proj_M(single_high)
 
@@ -152,8 +165,11 @@ class TripleQueryTCAv9(nn.Module):
         attn_M = self.attn_M(Q_M, kv_M)
 
         # ---------- 残差 + 归一化 ----------
-        # 残差基按支路来源选取: N/L 以多帧特征为基, M 以单帧特征为基。
-        # 这与 KV 的来源保持一致, 避免"注意力算的是单帧、残差却加多帧"的混用。
+        # 残差基按支路来源选取:
+        #   N: 以多帧聚合为基。查询是单帧与聚合的差值, 即噪声估计, 把它加回
+        #      已经去噪的聚合结果上, 正好是"干净结构 + 噪声"的组合。
+        #   L: 以多帧聚合为基 (与 KV 一致)。
+        #   M: 以单帧为基, 避免"注意力算的是单帧、残差却加多帧"的混用。
         F_N = self.out_norm_N(F1_multi + attn_N * self.scale_N)
         F_L = self.out_norm_L(F1_multi + attn_L * self.scale_L)
         F_M = self.out_norm_M(F1_single + attn_M * self.scale_M)
