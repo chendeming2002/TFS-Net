@@ -34,6 +34,7 @@ import torch.nn.functional as F
 from models.modules.blocks import LayerNorm2d
 from models.golf_r4.tca_rwkv import RWKVSpatialHead
 from models.golf_v7r.spatial_rwkv_head_v8 import SpatialRWKVHeadV8
+from models.golf_v7r.cross_rwkv_head_v8 import CrossRWKVHeadV8
 
 
 class TripleQueryTCAv9(nn.Module):
@@ -44,26 +45,40 @@ class TripleQueryTCAv9(nn.Module):
         spatial_head: "v8" (OmniShift + Channel Mix) 或 "legacy"
         wkv_mode: "single_norm" (官方双向定义 + CUDA 算子) 或 "legacy"
         lowpass_kernel: 低频分离用的平均池化核 (M 的高频残差与 L 的低频趋势共用)
+        q_mode: "receptance" 为旧的 sigmoid(q) 门控; "cross_rwkv" 使用
+            CrossRWKVHeadV8, R/G 直接接收特征图 (N/L 传多帧聚合, M 传中心帧),
+            不再经过 query_* 卷积。见 docs/v8/06-CrossRWKVGate-Q重构设计.md
     """
 
     def __init__(self, feat_dim: int = 32, spatial_head: str = "v8",
                  wkv_mode: str = "single_norm", lowpass_kernel: int = 9,
                  num_directions: int = 4, channel_mix_rate: int = 4,
-                 use_omni_shift: bool = True, use_channel_mix: bool = True):
+                 use_omni_shift: bool = True, use_channel_mix: bool = True,
+                 q_mode: str = "receptance"):
         super().__init__()
         self.feat_dim = feat_dim
         self.lowpass_kernel = int(lowpass_kernel)
         if spatial_head not in ("legacy", "v8"):
             raise ValueError(f"spatial_head 必须是 'legacy' 或 'v8', 收到 {spatial_head!r}")
+        if q_mode not in ("receptance", "cross_rwkv"):
+            raise ValueError(f"q_mode 必须是 'receptance' 或 'cross_rwkv', 收到 {q_mode!r}")
+        if q_mode == "cross_rwkv" and spatial_head != "v8":
+            raise ValueError("cross_rwkv 查询只实现于 spatial_head='v8'")
         self.spatial_head_kind = spatial_head
+        self.q_mode = q_mode
 
         # ---------- 三路 Query: N/L 来自多帧, M 来自单帧 ----------
-        self.query_N = nn.Sequential(
-            LayerNorm2d(feat_dim), nn.Conv2d(feat_dim, feat_dim, 1, bias=False))
-        self.query_L = nn.Sequential(
-            LayerNorm2d(feat_dim), nn.Conv2d(feat_dim, feat_dim, 1, bias=False))
-        self.query_M = nn.Sequential(
-            LayerNorm2d(feat_dim), nn.Conv2d(feat_dim, feat_dim, 1, bias=False))
+        # cross_rwkv 模式下 R/G 直接接收特征图, 由 CrossRWKVHeadV8 内部的 Q-Shift 处理,
+        # 这里不再需要额外的 1x1 卷积。
+        if q_mode == "receptance":
+            self.query_N = nn.Sequential(
+                LayerNorm2d(feat_dim), nn.Conv2d(feat_dim, feat_dim, 1, bias=False))
+            self.query_L = nn.Sequential(
+                LayerNorm2d(feat_dim), nn.Conv2d(feat_dim, feat_dim, 1, bias=False))
+            self.query_M = nn.Sequential(
+                LayerNorm2d(feat_dim), nn.Conv2d(feat_dim, feat_dim, 1, bias=False))
+        else:
+            self.query_N = self.query_L = self.query_M = None
 
         # ---------- 三路 KV: 来源各不相同 ----------
         # N: 多帧特征的低通 (帧间平均后的主成分, 对应 i.i.d. 噪声被抑制后的结果)
@@ -83,7 +98,7 @@ class TripleQueryTCAv9(nn.Module):
                            "use_channel_mix": use_channel_mix,
                            "num_directions": num_directions,
                            "wkv_mode": wkv_mode}
-            head_cls = SpatialRWKVHeadV8
+            head_cls = CrossRWKVHeadV8 if q_mode == "cross_rwkv" else SpatialRWKVHeadV8
         else:
             head_kwargs = {"num_directions": num_directions, "wkv_mode": wkv_mode}
             head_cls = RWKVSpatialHead
@@ -115,9 +130,13 @@ class TripleQueryTCAv9(nn.Module):
         Returns: F_N, F_L, F_M ([B, C, H, W]), ortho_loss (scalar)
         """
         # ---------- 三路 Query ----------
-        Q_N = self.query_N(F1_multi)
-        Q_L = self.query_L(F1_multi)
-        Q_M = self.query_M(F1_single)
+        if self.q_mode == "cross_rwkv":
+            # R/G 直接由特征图产生 (N/L 多帧, M 单帧), Q-Shift 在头内部完成
+            Q_N, Q_L, Q_M = F1_multi, F1_multi, F1_single
+        else:
+            Q_N = self.query_N(F1_multi)
+            Q_L = self.query_L(F1_multi)
+            Q_M = self.query_M(F1_single)
 
         # ---------- 三路 KV ----------
         multi_low = self._lowpass(F1_multi)

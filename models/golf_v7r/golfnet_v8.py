@@ -62,6 +62,8 @@ class GolfNet_v8(nn.Module):
         fusion_mode: "additive" / "gated" / "softmax" / "floored"
         fusion_residual_freeze: 是否冻结中心帧残差门
         kv_mode: 供 TripletQueryTCAv9 使用的 KV 来源 ("split" 为本设计的按支路分流)
+        q_mode: "receptance" (旧的 sigmoid(Q) 门控) 或 "cross_rwkv"
+            (Cross RWKV Gate, R/G 双查询; 见 docs/v8/06-CrossRWKVGate-Q重构设计.md)
     """
 
     def __init__(self,
@@ -80,7 +82,8 @@ class GolfNet_v8(nn.Module):
                  fusion_mode: str = "additive",
                  fusion_weight_floor: float = 0.1,
                  fusion_residual_freeze: bool = True,
-                 branch_m_single_frame: bool = True):
+                 branch_m_single_frame: bool = True,
+                 q_mode: str = "receptance"):
         super().__init__()
         self.num_frames = num_frames
         self.C1, self.C2, self.C3 = encoder_channels
@@ -111,6 +114,7 @@ class GolfNet_v8(nn.Module):
             feat_dim=self.C1, spatial_head=spatial_head, wkv_mode=wkv_mode,
             lowpass_kernel=lowpass_kernel, channel_mix_rate=channel_mix_rate,
             use_omni_shift=use_omni_shift, use_channel_mix=use_channel_mix,
+            q_mode=q_mode,
         )
 
         # ---------- Stage 4: 三分支 (F1 尺度直出, 不再上采样) ----------
