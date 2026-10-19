@@ -145,19 +145,23 @@ class TripleQueryTCAv9(nn.Module):
             Q_M = self.query_M(F1_single)
 
         # ---------- 三路 KV ----------
-        multi_low = self._lowpass(F1_multi)
-        single_low = self._lowpass(F1_single)
-        single_high = F1_single - single_low          # 单帧高频残差
+        # cross_rwkv: 全带 KV, 不在检索入口做固定滤波。频带分工交由目标与输出侧,
+        # 不再把内容池在注意力之前切掉一块 (见 docs/v8/07)。
+        #   N: 多帧聚合。噪声是帧间独立量, 它的内容池是多帧平均后的结果。
+        #   L: 中心帧。光照是当前帧自身的属性, 多帧平均会把曝光变化抹平,
+        #      与要预测的中心帧光照图错位。R/G 仍取多帧聚合, 提供跨帧结构参照。
+        #   M: 中心帧。与它不引入跨帧运算的约定一致。
         if self.q_mode == "cross_rwkv":
-            # N 的 KV 取单帧的中高频成分 (单帧减去大核低通), 与 N 的目标频带
-            # (0.5 中频 + 0.8 高频) 对齐; 若沿用多帧低通, 键值里只剩平滑结构,
-            # 与要预测的噪声频带方向相反。
-            cd = max(self.lowpass_kernel * 3, 9)
-            kv_N = self.kv_proj_N(F1_single - self._lowpass(F1_single, kernel=cd))
+            kv_N = self.kv_proj_N(F1_multi)
+            kv_L = self.kv_proj_L(F1_single)
+            kv_M = self.kv_proj_M(F1_single)
         else:
+            multi_low = self._lowpass(F1_multi)
+            single_low = self._lowpass(F1_single)
             kv_N = self.kv_proj_N(multi_low)
-        kv_L = self.kv_proj_L(self._lowpass(F1_multi, kernel=max(self.lowpass_kernel * 3, 9)))
-        kv_M = self.kv_proj_M(single_high)
+            kv_L = self.kv_proj_L(self._lowpass(
+                F1_multi, kernel=max(self.lowpass_kernel * 3, 9)))
+            kv_M = self.kv_proj_M(F1_single - single_low)
 
         # ---------- 三路注意力 ----------
         attn_N = self.attn_N(Q_N, kv_N)
@@ -168,10 +172,12 @@ class TripleQueryTCAv9(nn.Module):
         # 残差基按支路来源选取:
         #   N: 以多帧聚合为基。查询是单帧与聚合的差值, 即噪声估计, 把它加回
         #      已经去噪的聚合结果上, 正好是"干净结构 + 噪声"的组合。
-        #   L: 以多帧聚合为基 (与 KV 一致)。
+        #   L: 全带 KV 时以中心帧为基。注意力在中心帧的光照内容上检索, 结果应加回
+        #      同一来源, 否则等于把中心帧的光照修正量叠加到多帧平均上, 两处位移不一致。
         #   M: 以单帧为基, 避免"注意力算的是单帧、残差却加多帧"的混用。
+        L_base = F1_single if self.q_mode == "cross_rwkv" else F1_multi
         F_N = self.out_norm_N(F1_multi + attn_N * self.scale_N)
-        F_L = self.out_norm_L(F1_multi + attn_L * self.scale_L)
+        F_L = self.out_norm_L(L_base + attn_L * self.scale_L)
         F_M = self.out_norm_M(F1_single + attn_M * self.scale_M)
 
         ortho_loss = self._ortho_loss(F_N, F_L, F_M)

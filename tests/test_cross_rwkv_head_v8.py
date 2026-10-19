@@ -148,6 +148,39 @@ def test_old_path_unchanged():
     print(f"  [ok] 旧路径 query_N 参数量 = {q_params}")
 
 
+def test_kv_source_full_mode():
+    """全带 KV: N 的 KV 取多帧, L 与 M 取中心帧, 且 M 单帧约定不变。"""
+    torch.manual_seed(11)
+    tca = TripleQueryTCAv9(32, spatial_head="v8", wkv_mode="legacy",
+                           q_mode="cross_rwkv").eval()
+    multi = torch.randn(1, 32, 16, 16)
+    single = torch.randn(1, 32, 16, 16)
+    with torch.no_grad():
+        F_N, F_L, F_M, _ = tca(multi, single)
+        F_L2, F_M2 = None, None
+        # 用随机扰动而不是常数平移: LayerNorm2d 会抵消常数平移, 测不出依赖关系
+        F_N2, F_L2, F_M2, _ = tca(multi + 0.1 * torch.randn_like(multi), single)
+    # N 依赖多帧输入
+    assert (F_N - F_N2).abs().mean().item() > 1e-6, "N 路未使用多帧 KV"
+    # L 的 R/G 依赖多帧, 因此也会变化; 但 M 必须完全不依赖多帧
+    assert (F_M - F_M2).abs().mean().item() < 1e-6, "M 路受多帧输入影响"
+    print(f"  [ok] full 模式 KV 来源正确 (N 变化 {(F_N-F_N2).abs().mean():.2e}, "
+          f"M 变化 {(F_M-F_M2).abs().mean():.2e})")
+
+
+def test_kv_source_full_forward():
+    torch.manual_seed(12)
+    tca = TripleQueryTCAv9(32, spatial_head="v8", wkv_mode="legacy",
+                           q_mode="cross_rwkv")
+    multi = torch.randn(2, 32, 12, 12, requires_grad=True)
+    single = torch.randn(2, 32, 12, 12, requires_grad=True)
+    F_N, F_L, F_M, ortho = tca(multi, single)
+    (F_N.mean() + F_L.mean() + F_M.mean() + ortho).backward()
+    assert torch.isfinite(F_N).all() and torch.isfinite(F_M).all()
+    assert multi.grad.abs().sum() > 0 and single.grad.abs().sum() > 0
+    print("  [ok] full 模式前向/反向正常")
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in tests:
