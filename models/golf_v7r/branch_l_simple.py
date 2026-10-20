@@ -3,15 +3,27 @@
 Branch-L (简化版): 光照校正 (Retinex)
 
 与 Golf R2 的差异:
-  - 去掉 illum_refine 全分辨率修正 (低分辨率 L 直接 bilinear 到全分辨率)
+  - 去掉 illum_refine 全分辨率修正 (光照图不再单独精化)
   - 2×NAFBlock (保持)
-  - Upsample3x3 (vs UpsampleBlock + F1 skip)
+  - Upsample3x3 (仅 at_f1=False 时使用; v8 的 at_f1=True 下不建立)
   - 保留 Retinex 物理先验 (L_t, R_t, learnable gamma) ⭐
   - 保留 residual_conv 残差补偿
 
-Input:  F_L  [B, 128, H/2, W/2]  (矩阵 RWKV 注入的光照上下文)
-        X_t  [B, 3, H, W]        (中心帧原图 [0,1])
-Output: Y_L, L_t, R_t
+## 两种工作模式 (at_f1)
+
+| | `at_f1=False` (历史) | `at_f1=True` (v8 默认) |
+|---|---|---|
+| 输入 F_L | F2 尺度 `[B, C, H/2, W/2]` | F1 全分辨率 `[B, C, H, W]` |
+| 光照图 | 在 H/2 上预测, 再 bilinear 上采样到 H | **直接在 H×W 上预测** |
+| 特征上采样 | `Upsample3x3` | 无 (`self.upsample = None`) |
+
+v8 的三条支路都在 F1 直出, 走右列: **本模块内不存在任何降采样或上采样**。
+`F.interpolate(..., size=(H, W))` 在 `at_f1=True` 时输入已是 H×W, 是恒等空操作 ——
+保留它是为了让两条路径共用同一段代码。分辨率由调用方决定, 模块内不做假设。
+
+Input:  F_L  [B, C, H, W]   (矩阵 RWKV 注入的光照上下文; C = channels, v8 用 32)
+        X_t  [B, 3, H, W]   (中心帧原图 [0,1])
+Output: Y_L, L_t, R_t       (分辨率同 F_L; at_f1=True 时即 F1 全分辨率)
 """
 import torch
 import torch.nn as nn
@@ -21,7 +33,7 @@ from models.modules.blocks import NAFBlock, LayerNorm2d
 from models.golf_v7r.upsample import Upsample3x3
 
 
-class BranchLSimple(nn.Module):
+class LBranch(nn.Module):
     """Branch-L (简化): Illumination Correction via Retinex"""
 
     def __init__(self, channels: int = 128, num_blocks: int = 2,
@@ -37,7 +49,7 @@ class BranchLSimple(nn.Module):
         ])
         self.refine_norm = LayerNorm2d(channels)
 
-        # 低分辨率光照图预测 (零初始化 → 初始 sigmoid(0)=0.5)
+        # 光照图预测 (零初始化 → 初始 sigmoid(0)=0.5, 即初始 L_t ≡ 0.5)
         self.illum_head = nn.Sequential(
             nn.Conv2d(channels, channels // 2, 3, 1, 1, bias=True),
             nn.GELU(),
@@ -60,19 +72,19 @@ class BranchLSimple(nn.Module):
         nn.init.zeros_(self.residual_conv.bias)
 
     def forward(self, F_L: torch.Tensor, X_t: torch.Tensor) -> dict:
-        B, C, H_ds, W_ds = F_L.shape
+        # 输出分辨率取中心帧原图; at_f1=True 时 F_L 的分辨率与它相同 (都是 F1)
         H, W = X_t.shape[-2:]
 
         x = self.refine_norm(self.refine_blocks(F_L))
 
-        # 低分辨率光照图
-        L_ds = torch.sigmoid(self.illum_head(x))  # [B,1,H/2,W/2]
+        # 光照图: 分辨率随输入 —— at_f1=True 时即 [B,1,H,W] 全分辨率
+        L_map = torch.sigmoid(self.illum_head(x))
 
-        # 上采样特征 (F1 模式直接用全分辨率特征)
+        # 特征上采样 (F1 模式直接用全分辨率特征)
         x_up = x if self.at_f1 else self.upsample(x)
 
-        # 全分辨率光照 (直接 bilinear, 无 illum_refine)
-        L_t = F.interpolate(L_ds, size=(H, W), mode='bilinear', align_corners=False)
+        # 对齐到输出分辨率: at_f1=True 时输入已是 H×W, 此处是恒等空操作
+        L_t = F.interpolate(L_map, size=(H, W), mode='bilinear', align_corners=False)
 
         # Retinex
         eps = 1e-4
@@ -86,10 +98,14 @@ class BranchLSimple(nn.Module):
 
 
 if __name__ == '__main__':
-    m = BranchLSimple(channels=128, num_blocks=2)
+    m = LBranch(channels=128, num_blocks=2)
     F_L = torch.randn(2, 128, 32, 32)
     X_t = torch.rand(2, 3, 64, 64)
     out = m(F_L, X_t)
-    print(f"BranchLSimple: F_L={F_L.shape}, X_t={X_t.shape}")
+    print(f"LBranch: F_L={F_L.shape}, X_t={X_t.shape}")
     print(f"  Y_L={out['Y_L'].shape}, L_t={out['L_t'].shape}, R_t={out['R_t'].shape}")
     print(f"  params={sum(p.numel() for p in m.parameters())/1e3:.1f}K")
+
+
+# 旧名别名: 历史 run 与文档记为 BranchLSimple。
+BranchLSimple = LBranch

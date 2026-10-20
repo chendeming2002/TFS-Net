@@ -11,9 +11,12 @@ from .matrix_rwkv import MatrixRWKVTimeMix, ReLUSquaredMLP, MatrixRWKVBlock
 from .spatial_summary import SpatialSummary
 from .context_decomp import ContextDecomposition, BranchFiLM
 from .triple_query_tca import TripleQueryTCA
-from .branch_n_simple import BranchNSimple
-from .branch_l_simple import BranchLSimple
-from .branch_m_simple import BranchMSimple
+from .triple_query_tca_v9 import TaskQueryAttention, TripleQueryTCAv9
+from .spatial_summary_unet import TemporalAggregator
+from .cross_rwkv_head_v8 import CrossRWKVHeadV8
+from .branch_n_simple import NBranch, BranchNSimple
+from .branch_l_simple import LBranch, BranchLSimple
+from .branch_m_simple import MBranch, BranchMSimple
 from .fusion_v7r import V7RFusion
 from .loss import GolfV7RLoss, SimpleLoss
 
@@ -29,9 +32,15 @@ __all__ = [
     'ContextDecomposition',
     'BranchFiLM',
     'TripleQueryTCA',
+    'TaskQueryAttention',
+    'TemporalAggregator',
+    'CrossRWKVHeadV8',
     'BranchNSimple',
+    'NBranch',
     'BranchLSimple',
+    'LBranch',
     'BranchMSimple',
+    'MBranch',
     'V7RFusion',
     'GolfV7RLoss',
     'SimpleLoss',

@@ -95,7 +95,7 @@ class TemporalWeighting(nn.Module):
         return aggregated, weights
 
 
-class SpatialSummaryUNet(nn.Module):
+class TemporalAggregator(nn.Module):
     """自上而下的空间聚合 (F3 → F2 → F1), 同时给出单帧旁路特征。
 
     Args:
@@ -194,7 +194,7 @@ if __name__ == '__main__':
     B, T = 2, 5
     ch = [32, 64, 128]
     dev = 'cuda' if _t.cuda.is_available() else 'cpu'
-    net = SpatialSummaryUNet(ch, num_frames=T).to(dev)
+    net = TemporalAggregator(ch, num_frames=T).to(dev)
     f1 = _t.randn(B, T, ch[0], 32, 32, device=dev)
     f2 = _t.randn(B, T, ch[1], 16, 16, device=dev)
     f3 = _t.randn(B, T, ch[2], 8, 8, device=dev)
@@ -204,3 +204,7 @@ if __name__ == '__main__':
     print(f"  params = {sum(p.numel() for p in net.parameters())/1e6:.3f}M")
     out["F1_multi"].sum().backward()
     print("  反传正常")
+
+
+# 旧名别名: 历史文档与实验记录使用 SpatialSummaryUNet。
+SpatialSummaryUNet = TemporalAggregator

@@ -39,6 +39,9 @@ def build_model(name, model_kwargs=None):
     elif name == 'v7r_v3':
         from models.golf_v7r import GolfNet_v7r_v3 as M
         return M(**model_kwargs)
+    elif name == 'v8':
+        from models.golf_v7r import GolfNet_v8 as M
+        return M(**model_kwargs)
     elif name == 'r2':
         from models.golf import GolfNet as M
         return M(**model_kwargs)
@@ -48,7 +51,7 @@ def build_model(name, model_kwargs=None):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--ckpt', required=True)
-    p.add_argument('--model', choices=['v7', 'v7r', 'v7r_v3', 'r2'], required=True)
+    p.add_argument('--model', choices=['v7', 'v7r', 'v7r_v3', 'v8', 'r2'], required=True)
     p.add_argument('--tag', default=None, help='结果标签, 默认用 model+epoch')
     p.add_argument('--lpips_net', default='vgg', choices=['vgg', 'alex', 'squeeze'])
     p.add_argument('--out_json', default='outputs/eval_metrics.json',
@@ -84,6 +87,9 @@ def main():
 
     # ---- model ----
     model = build_model(args.model, model_kwargs).to(device).eval()
+    if model_kwargs.get('wkv_mode', 'single_norm') == 'single_norm':
+        from models.modules.cuda_wkv import backend_report
+        print(backend_report(require_cuda=(device == 'cuda')), flush=True)
     ck = torch.load(args.ckpt, map_location=device, weights_only=False)
     state = ck.get('model_state_dict', ck.get('model'))
     model.load_state_dict(state)

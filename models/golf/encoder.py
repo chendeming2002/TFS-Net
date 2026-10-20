@@ -16,7 +16,7 @@ from typing import List, Tuple
 from models.modules.blocks import NAFBlock, LayerNorm2d
 
 
-class SharedEncoder(nn.Module):
+class FrameEncoder(nn.Module):
     """Shared Encoder — 3-scale pyramid
 
     Args:
@@ -101,3 +101,7 @@ class SharedEncoder(nn.Module):
         f3 = self.norm3(self.scale3_blocks(self.down2(f2)))
         
         return f1, f2, f3
+
+
+# 旧名别名: 其他历史模型 (golf_v7 / golf_r3 / foxtrot 等) 仍以 SharedEncoder 引用本类。
+SharedEncoder = FrameEncoder

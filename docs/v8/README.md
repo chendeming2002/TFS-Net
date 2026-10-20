@@ -14,6 +14,7 @@
 | `05-UNet重构设计.md` | SpatialSummary + TripleQueryTCA 重构为 U-Net 式聚合; 单模块循环 M 次; F1 尺度三源查询 |
 | `06-CrossRWKVGate-Q重构设计.md` | 按论文 2411.05636 式 (2)–(8) 把任务 Q 重构为 Cross RWKV gate 的 R/G 双查询; Q-Shift 用 OmniShift; 配套设计 |
 | `07-KV全带与输出侧频带约束设计.md` | 取消 K/V 上的固定滤波, 频带分工移到输出侧; 三种输出约束方案与三组实验编排 (待决策) |
+| `08-命名对照.md` | 部件名与 RWKV 块名的术语表 (FrameEncoder / TemporalAggregator / TaskQueryAttention / N·L·M Branch / SGRF); 五处待裁决的对齐问题 |
 
 ## 一句话概括本版本
 
@@ -25,7 +26,7 @@ v7.5 已定稿三分支的**融合方式与监督目标**; v8 处理它上游的
 | # | 内容 | 关键点 |
 |:--:|------|--------|
 | 1 | 整理简化 RWKV 基线 | 以 Vision-RWKV / Restore-RWKV 为主要参考; 用 Omni-Shift 替代当前的"无局部上下文" |
-| 2 | 探索 RWKV 编码器 | 把 `SharedEncoder` 内部的 NAFBlock 换成 RWKV block |
+| 2 | 探索 RWKV 编码器 | 把 `FrameEncoder` 内部的 NAFBlock 换成 RWKV block |
 | 3 | 引入 RWKV-7 与 Value Residual | 先期直接搬运原始实现, 不做小修小改 |
 | 4 | 厘清"只有 Spatial Mix"的原因 | 结论: 历史沿革造成, 无技术理由, 应当补回 Channel Mix |
 
@@ -83,6 +84,13 @@ BranchM 修复、phase1 探针、R1 归因补测都已跑完。裁决写在 `01-
 三路都有结构, 但融合结果几乎全部来自 L 路 (置零 L 掉 15.9 dB, 置零 N 或 M 只掉约 0.3 dB);
 N、M 与自身频带目标的相对误差约 0.7 至 0.9, 学得不充分。扰动测试显示 L 对压暗、M 对运动模糊
 有方向性的响应, N 对噪声的专属性不成立。详见 `02-实验计划.md` 的 U-Net 最终结果一节。
+
+**KV 全带 15ep 已完成** (`configs/v8/fullkv_15ep.yaml`): 取消 K/V 上的固定滤波,
+N 的 K/V 取多帧聚合, L 与 M 取中心帧, L 的残差基同步改为中心帧。验证 PSNR 24.36 dB
+(第 10 轮, 第 15 轮 24.03), LPIPS 0.4101, 是三次 15 轮实验里最好的一次;
+N 路的置零代价从 +0.02 dB 变为 −0.62 dB, 加噪 σ=0.05 时 N 的变化量重新成为三路最大,
+噪声专属性第一次成立。但 N、M 与自身目标的相对误差仍在 0.71 附近, 没有达到 0.5 的判据。
+详见 `07-KV全带与输出侧频带约束设计.md` 第九节。
 
 **Cross RWKV Gate 15ep 已完成**: 验证 PSNR 23.32 dB, 比 U-Net 基线低 0.80 dB。
 第 10 到 15 轮只涨 0.13 dB (基线同期涨 1.00 dB), 训练损失在第 5 轮出现一次明显

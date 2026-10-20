@@ -8,7 +8,7 @@
 | 帧级摘要 | `SpatialSummary` 把 F2 池化成 [B,T,D] token | 删除; U-Net 内逐帧 RWKV 直接处理空间特征 |
 | 时序建模 | `MatrixRWKVBlock` 堆 2 个, 只给 KV 做门控 | 单模块**循环 M 次**, 用于 U-Net 的帧间加权聚合 |
 | 像素对齐 | `PixelTemporalAttentionSimple` (F2) | 删除; 由 U-Net 的加权聚合替代 |
-| 三源解耦 | `TripleQueryTCA` 在 F2, 三路共用一张特征图 | `TripleQueryTCAv9` 在 F1, N/L 用多帧、M 用单帧 |
+| 三源解耦 | `TripleQueryTCA` 在 F2, 三路共用一张特征图 | `TaskQueryAttention` 在 F1, N/L 用多帧、M 用单帧 |
 | 分支输入 | F2 (H/2), 需 2 倍上采样 | F1 (H), 直接输出 |
 | 编码器 block | NAFBlock (v7r-v3) / RWKV block 堆叠 | RWKV block **循环 M 次** |
 
@@ -22,14 +22,14 @@
 
 ```
 x [B,T,3,H,W]
- ├─ SharedEncoder (逐帧, RWKV block 循环 M 次)
+ ├─ FrameEncoder (逐帧, RWKV block 循环 M 次)
  │     → f1_seq [B,T,C1,H,W], f2_seq [B,T,C2,H/2,W/2], f3_seq [B,T,C3,H/4,W/4]
- ├─ SpatialSummaryUNet
+ ├─ TemporalAggregator
  │     → F1_multi  (多帧完整聚合, N/L 用)
  │     → F1_single (中心帧旁路, M 用)
  │     → F2_single (中心帧 F2, 仅供 BranchM 的跨帧对齐模式)
- ├─ TripleQueryTCAv9(F1_multi, F1_single) → F_N, F_L, F_M (均 F1 尺度)
- ├─ BranchN(F_N) / BranchL(F_L, X_center) / BranchM(F_M, ...)
+ ├─ TaskQueryAttention(F1_multi, F1_single) → F_N, F_L, F_M (均 F1 尺度)
+ ├─ NBranch(F_N) / LBranch(F_L, X_center) / MBranch(F_M, ...)
  └─ V7RFusion → final
 ```
 """
@@ -40,13 +40,13 @@ from typing import Dict
 import torch
 import torch.nn as nn
 
-from models.golf.encoder import SharedEncoder
-from models.golf_v7r.spatial_summary_unet import SpatialSummaryUNet
-from models.golf_v7r.triple_query_tca_v9 import TripleQueryTCAv9
+from models.golf.encoder import FrameEncoder
+from models.golf_v7r.spatial_summary_unet import TemporalAggregator
+from models.golf_v7r.triple_query_tca_v9 import TaskQueryAttention
 from models.golf_v7r.fusion_v7r import V7RFusion
-from models.golf_v7r.branch_n_simple import BranchNSimple
-from models.golf_v7r.branch_l_simple import BranchLSimple
-from models.golf_v7r.branch_m_simple import BranchMSimple
+from models.golf_v7r.branch_n_simple import NBranch
+from models.golf_v7r.branch_l_simple import LBranch
+from models.golf_v7r.branch_m_simple import MBranch
 
 
 class GolfNet_v8(nn.Module):
@@ -94,7 +94,7 @@ class GolfNet_v8(nn.Module):
         # 每尺度只有 1 个 RWKVEncoderBlock, 用它的 num_loops 控制循环次数 M。
         # 这样 M 只增加计算量、不增加参数量 (Re-WKV 的做法);
         # 若改为"每尺度堆 M 个独立 block", 参数与计算都会 ×M, 与设计意图不符。
-        self.encoder = SharedEncoder(
+        self.encoder = FrameEncoder(
             in_channels=3,
             out_channels_list=list(encoder_channels),
             num_blocks_per_scale=[1, 1, 1],
@@ -104,13 +104,13 @@ class GolfNet_v8(nn.Module):
         )
 
         # ---------- Stage 2: U-Net 式空间聚合 (替代 SpatialSummary + PixelTemporal) ----------
-        self.summary = SpatialSummaryUNet(
+        self.summary = TemporalAggregator(
             list(encoder_channels), num_frames=num_frames,
             num_loops=temporal_loops, wkv_mode=wkv_mode,
         )
 
         # ---------- Stage 3: F1 尺度三源查询 TCA ----------
-        self.tca = TripleQueryTCAv9(
+        self.tca = TaskQueryAttention(
             feat_dim=self.C1, spatial_head=spatial_head, wkv_mode=wkv_mode,
             lowpass_kernel=lowpass_kernel, channel_mix_rate=channel_mix_rate,
             use_omni_shift=use_omni_shift, use_channel_mix=use_channel_mix,
@@ -118,11 +118,11 @@ class GolfNet_v8(nn.Module):
         )
 
         # ---------- Stage 4: 三分支 (F1 尺度直出, 不再上采样) ----------
-        self.branch_N = BranchNSimple(channels=self.branch_channels,
+        self.branch_N = NBranch(channels=self.branch_channels,
                                       num_blocks=branch_blocks, at_f1=True)
-        self.branch_L = BranchLSimple(channels=self.branch_channels,
+        self.branch_L = LBranch(channels=self.branch_channels,
                                       num_blocks=branch_blocks, at_f1=True)
-        self.branch_M = BranchMSimple(channels=self.branch_channels,
+        self.branch_M = MBranch(channels=self.branch_channels,
                                       enc_channels=self.C2,
                                       num_frames=num_frames,
                                       num_blocks=branch_blocks,

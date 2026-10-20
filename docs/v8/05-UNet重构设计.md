@@ -32,17 +32,17 @@
 
 ```
 x [B,T,3,H,W]
- ├─ SharedEncoder (逐帧, 每尺度 1 个 RWKV block, block 内循环 M 次)
+ ├─ FrameEncoder (逐帧, 每尺度 1 个 RWKV block, block 内循环 M 次)
  │     → f1_seq [B,T,C1,H,W]   f2_seq [B,T,C2,H/2,W/2]   f3_seq [B,T,C3,H/4,W/4]
  │
- ├─ SpatialSummaryUNet  (自上而下聚合, F3 → F2 → F1)
+ ├─ TemporalAggregator  (自上而下聚合, F3 → F2 → F1)
  │     · 逐帧 RWKV block 处理 F3 → 每帧描述子
  │     · 帧级 RWKV (循环 M 次) → 每帧权重 (softmax)
  │     · 按权重聚合 F3 → F3_agg
  │     · F3_agg ↑ F2_center → 融合 → F2_agg ↑ F1_center → 融合 → F1_multi
  │     · 旁路: F1_single = f1_center,  F2_single = f2_center
  │
- ├─ TripleQueryTCAv9 (F1 尺度)
+ ├─ TaskQueryAttention (F1 尺度)
  │     Q_N, Q_L ← F1_multi        KV_N ← 低通(F1_multi)        KV_L ← 更强低通(F1_multi)
  │     Q_M     ← F1_single       KV_M ← 高频残差(F1_single)
  │
@@ -147,8 +147,8 @@ CUDA WKV 的**反向**内核在栈上开了三个 `IDEAL_T_LEN` 数组 (`Tmax/32
 
 | 文件 | 内容 |
 |------|------|
-| `models/golf_v7r/spatial_summary_unet.py` | `SpatialSummaryUNet` + `TemporalWeighting` |
-| `models/golf_v7r/triple_query_tca_v9.py` | `TripleQueryTCAv9` (F1 尺度, 按支路分流) |
+| `models/golf_v7r/spatial_summary_unet.py` | `TemporalAggregator` + `TemporalWeighting` |
+| `models/golf_v7r/triple_query_tca_v9.py` | `TaskQueryAttention` (F1 尺度, 按支路分流) |
 | `models/golf_v7r/golfnet_v8.py` | `GolfNet_v8` 主网络 |
 | `models/golf/encoder.py` | 新增 `block_loops` (单模块循环) |
 | `models/golf_v7r/branch_{n,l,m}_simple.py` | 新增 `at_f1` (全分辨率直出) |

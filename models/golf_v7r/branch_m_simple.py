@@ -5,12 +5,16 @@ Branch-M (简化版): 运动补偿
 与 Golf R2 的差异:
   - FlowEstimator 只用中心帧 ±1 两帧 (而非全部 4 相邻帧)
   - 2×NAFBlock (vs 3)
-  - Upsample3x3 (vs UpsampleBlock + F1 skip)
+  - Upsample3x3 (仅 at_f1=False 时使用; v8 的 at_f1=True 下不建立)
   - 保留 confidence gating (已验证有效) ⭐
   - 保留 flow-based deformable alignment ⭐
 
-Input:  F_M     [B, 128, H/2, W/2]          (矩阵 RWKV 注入的运动上下文)
-        F2_seq  [B, T, 64, H/2, W/2]        (encoder 全部帧特征)
+⚠️ 上面两条 (flow 估计 / confidence gating) 只在 `single_frame=False` 时存在。
+v8 默认 `single_frame=True`, 此时 FlowEstimator / DeformableAlign / ConfidenceEstimator
+三个模块都不建立 (见类文档)。
+
+Input:  F_M     [B, C, H, W]           (矩阵 RWKV 注入的运动上下文; C = channels, v8 用 32)
+        F2_seq  [B, T, C_enc, H/2, W/2] (encoder 全部帧特征; single_frame=True 时不使用)
 Output: Y_M, flow_vis, conf_map
 """
 import torch
@@ -84,7 +88,7 @@ class ConfidenceEstimator(nn.Module):
         return self.conv(torch.cat([warped, center], dim=1))
 
 
-class BranchMSimple(nn.Module):
+class MBranch(nn.Module):
     """Branch-M (简化): 运动补偿
 
     Args:
@@ -195,10 +199,14 @@ class BranchMSimple(nn.Module):
 
 
 if __name__ == '__main__':
-    m = BranchMSimple(channels=128, enc_channels=64, num_frames=5, num_blocks=2)
+    m = MBranch(channels=128, enc_channels=64, num_frames=5, num_blocks=2)
     F_M = torch.randn(2, 128, 32, 32)
     F2_seq = torch.randn(2, 5, 64, 32, 32)
     out = m(F_M, F2_seq)
-    print(f"BranchMSimple: F_M={F_M.shape}, F2_seq={F2_seq.shape}")
+    print(f"MBranch: F_M={F_M.shape}, F2_seq={F2_seq.shape}")
     print(f"  Y_M={out['Y_M'].shape}, flow={out['flow_vis'].shape}, conf={out['conf_map'].shape}")
     print(f"  params={sum(p.numel() for p in m.parameters())/1e3:.1f}K")
+
+
+# 旧名别名: 历史 run 与文档记为 BranchMSimple。
+BranchMSimple = MBranch

@@ -37,7 +37,7 @@ from models.golf_v7r.spatial_rwkv_head_v8 import SpatialRWKVHeadV8
 from models.golf_v7r.cross_rwkv_head_v8 import CrossRWKVHeadV8
 
 
-class TripleQueryTCAv9(nn.Module):
+class TaskQueryAttention(nn.Module):
     """F1 尺度三源查询 TCA: 多帧 (N、L) + 单帧 (M)。
 
     Args:
@@ -200,7 +200,7 @@ if __name__ == '__main__':
     import torch as _t
     dev = 'cuda' if _t.cuda.is_available() else 'cpu'
     B, C, H, W = 2, 32, 64, 64
-    tca = TripleQueryTCAv9(C).to(dev)
+    tca = TaskQueryAttention(C).to(dev)
     multi = _t.randn(B, C, H, W, device=dev)
     single = _t.randn(B, C, H, W, device=dev)
     F_N, F_L, F_M, ortho = tca(multi, single)
@@ -208,3 +208,7 @@ if __name__ == '__main__':
     print(f"params = {sum(p.numel() for p in tca.parameters())/1e6:.3f}M")
     (F_N.sum() + F_L.sum() + F_M.sum() + ortho).backward()
     print("反传正常")
+
+
+# 旧名别名: 本类在历史 run 与文档中记为 TripleQueryTCAv9。
+TripleQueryTCAv9 = TaskQueryAttention

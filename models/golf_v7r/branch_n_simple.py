@@ -5,11 +5,11 @@ Branch-N (简化版): 成像噪声去除
 与 Golf R2 的差异:
   - 去掉 var_map 通路 (矩阵 RWKV 的 Noise 头已捕捉噪声统计)
   - 2×NAFBlock (vs 3)
-  - Upsample3x3 (vs UpsampleBlock + F1 skip)
+  - Upsample3x3 (仅 at_f1=False 时使用; v8 的 at_f1=True 下不建立)
   - 保留 ChannelAttention (SE-like) 提升通道选择能力
 
-Input:  F_N  [B, 128, H/2, W/2]  (矩阵 RWKV 注入的噪声上下文)
-Output: Y_N  [B, 3, H, W]
+Input:  F_N  [B, C, H, W]   (矩阵 RWKV 注入的噪声上下文; C = channels, v8 用 32)
+Output: Y_N  [B, 3, H, W]   (at_f1=True 时与输入同分辨率, 不做上采样)
 """
 import torch
 import torch.nn as nn
@@ -35,7 +35,7 @@ class ChannelAttention(nn.Module):
         return x * self.fc(self.avg_pool(x))
 
 
-class BranchNSimple(nn.Module):
+class NBranch(nn.Module):
     """Branch-N (简化): Imaging Noise Denoising"""
 
     def __init__(self, channels: int = 128, num_blocks: int = 2,
@@ -76,8 +76,12 @@ class BranchNSimple(nn.Module):
 
 
 if __name__ == '__main__':
-    m = BranchNSimple(channels=128, num_blocks=2)
+    m = NBranch(channels=128, num_blocks=2)
     x = torch.randn(2, 128, 32, 32)
     out = m(x)
-    print(f"BranchNSimple: {x.shape} → {out['Y_N'].shape}, "
+    print(f"NBranch: {x.shape} → {out['Y_N'].shape}, "
           f"params={sum(p.numel() for p in m.parameters())/1e3:.1f}K")
+
+
+# 旧名别名: 历史 run 与文档记为 BranchNSimple。
+BranchNSimple = NBranch

@@ -42,6 +42,23 @@ _TMAX = 65536        # 反向核用它开栈上数组 (IDEAL_T_LEN = Tmax/32), �
                      # 注意这不是序列长度上限: 核内部按 TOKEN_SPLIT 分块, 任意 L 都能处理。
 
 
+def _prepare_build_env():
+    """补齐 torch.utils.cpp_extension 需要的编译环境。
+
+    训练脚本在启动时会 export CUDA_HOME / CC / CXX, 但评估、推理、诊断脚本是独立进程,
+    不会继承这些变量。缺 CUDA_HOME 时 nvcc 路径查不到, 缺 CC/CXX 时 PyTorch 会去调
+    系统默认 g++, 本机默认版本与 torch 2.2.2 不兼容, 两种情况都会编译失败并静默退回
+    纯 PyTorch 实现。而纯 PyTorch 版是 O(L²) 内存, 1080p 下无法运行。
+
+    因此在这里按本机实际路径补齐: 已设置的环境变量优先, 不覆盖用户的显式选择。
+    """
+    if "CUDA_HOME" not in os.environ and os.path.isdir("/usr/local/cuda"):
+        os.environ["CUDA_HOME"] = "/usr/local/cuda"
+    for var, candidate in (("CC", "/usr/bin/gcc-9"), ("CXX", "/usr/bin/g++-9")):
+        if var not in os.environ and os.path.isfile(candidate):
+            os.environ[var] = candidate
+
+
 def _load_kernel():
     """惰性编译并加载 WKV CUDA 算子。失败时返回 None 并记录原因。"""
     global _KERNEL, _KERNEL_ERROR
@@ -49,6 +66,7 @@ def _load_kernel():
         return _KERNEL
     try:
         from torch.utils.cpp_extension import load
+        _prepare_build_env()
         here = os.path.dirname(os.path.abspath(__file__))
         src = os.path.join(here, "cuda_kernels")
         _KERNEL = load(
@@ -73,6 +91,22 @@ def cuda_available() -> bool:
 
 def kernel_error() -> str | None:
     return _KERNEL_ERROR
+
+
+def backend_report(require_cuda: bool = False) -> str:
+    """报告当前进程实际使用的 WKV 后端, 供评估/推理脚本在开头打印。
+
+    require_cuda=True 时, 若退回纯 PyTorch 实现直接报错。纯 PyTorch 版是 O(L²) 内存,
+    整图推理必然显存不足; 静默退回会让推理看起来"卡住", 而不是明确失败。
+    """
+    ok = cuda_available()
+    text = "WKV 后端: CUDA 核" if ok else "WKV 后端: 纯 PyTorch (O(L²))"
+    if not ok:
+        err = (kernel_error() or "未知原因").splitlines()[0][:200]
+        text += f" | 编译失败: {err}"
+    if require_cuda and not ok:
+        raise RuntimeError(text + " —— 整图推理需要 CUDA 核")
+    return text
 
 
 class _WKVFunction(torch.autograd.Function):

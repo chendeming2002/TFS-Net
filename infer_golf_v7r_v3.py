@@ -20,8 +20,23 @@ from models.golf_v7r import GolfNet_v7r_v3
 from datasets import SDSDDataset
 
 
-def load_model(ckpt_path, device='cuda'):
-    model = GolfNet_v7r_v3().to(device).eval()
+def load_model(ckpt_path, device='cuda', config=None):
+    """加载模型。传 config 时按配置的 model 段重建 (支持 arch=v8 与 wkv_mode)。"""
+    if config:
+        import yaml
+        with open(config) as f:
+            kwargs = (yaml.safe_load(f) or {}).get('model', {}) or {}
+        arch = kwargs.pop('arch', 'v7r_v3')
+        if arch == 'v8':
+            from models.golf_v7r import GolfNet_v8 as M
+        else:
+            from models.golf_v7r import GolfNet_v7r_v3 as M
+        model = M(**kwargs).to(device).eval()
+        if kwargs.get('wkv_mode', 'single_norm') == 'single_norm':
+            from models.modules.cuda_wkv import backend_report
+            print(backend_report(require_cuda=(device == 'cuda')), flush=True)
+    else:
+        model = GolfNet_v7r_v3().to(device).eval()
     ck = torch.load(ckpt_path, map_location=device, weights_only=False)
     model.load_state_dict(ck['model_state_dict'])
     print(f"Loaded {ckpt_path} | epoch {ck.get('epoch', '?')}", flush=True)
@@ -52,13 +67,15 @@ def main():
     p.add_argument('--max_frames', type=int, default=None)
     p.add_argument('--pairing', default='name', choices=['name', 'position'],
                    help='LQ/GT 配对方式: name=文件名交集(历史), position=sorted 位置(官方约定)')
+    p.add_argument('--config', default=None,
+                   help='训练配置; 用于按 model 段重建 (arch=v8 / wkv_mode 等)')
     p.add_argument('--amp', action='store_true',
                    help='fp16 autocast 推理 (全 1080p 显存 ~7.5GB, 可与训练进程共存)')
     args = p.parse_args()
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     os.makedirs(args.out_dir, exist_ok=True)
-    model = load_model(args.ckpt, device)
+    model = load_model(args.ckpt, device, config=args.config)
 
     window = 5
     half = window // 2
