@@ -138,8 +138,6 @@ class _WKVFunction(torch.autograd.Function):
         kernel.backward(B, T, C, w.float().contiguous(), u.float().contiguous(),
                         k.float().contiguous(), v.float().contiguous(),
                         gy.float().contiguous(), gw, gu, gk, gv)
-        gw = torch.sum(gw, dim=0)
-        gu = torch.sum(gu, dim=0)
         return (None, None, None, gw, gu, gk, gv)
 
 
@@ -179,6 +177,11 @@ class CudaBiWKV(nn.Module):
     def forward(self, k: torch.Tensor, v: torch.Tensor,
                 total_tokens: int) -> torch.Tensor:
         B, L, C = k.shape
+        if not k.is_cuda:
+            # 输入在 CPU 上 (例如单测里在 CPU 上构建模型) 时回退到纯 PyTorch 实现,
+            # 否则会把 CPU 指针交给 CUDA 内核。
+            return _single_norm_torch(k.float(), v.float(), self.spatial_decay,
+                                      self.spatial_first, total_tokens)
         # 与 BiWKV 一致的预处理: fp32、clamp、强制 decay<0
         k = k.float().clamp(-8, 8)
         v = v.float().clamp(-8, 8)
@@ -200,8 +203,10 @@ class CudaBiWKV(nn.Module):
         # 而我们的衰减因子是 exp(w/T·距离) (w<0), 故 w_kernel = -w/T。
         # 若直接传 w/T (负值), 指数会发散 (实测相对误差 1.0)。
         # 奖励项: 核用 exp(u_kernel + k), 我们等价于 exp(u/T)·exp(k), 故 u_kernel = u/T。
-        w_kernel = -w / total_tokens
-        u_kernel = u / total_tokens
+        w_kernel = (-w / total_tokens).expand(B, C).contiguous()
+        u_kernel = (u / total_tokens).expand(B, C).contiguous()
+        # 核按 (batch, channel) 寻址参数, 因此 B>1 时要广播成 (B, C);
+        # B=1 时退化为原来的 (C,), 数值完全相同。
         # 单次调用即得到双向结果 (核内已含前向 + 后向 + 自项的单归一化)
         return _WKVFunction.apply(B, L, C, w_kernel, u_kernel, k, v)
 

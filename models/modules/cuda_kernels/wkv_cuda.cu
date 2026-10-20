@@ -20,8 +20,11 @@ __global__ void kernel_forward(const int B, const int T, const int C,
     const int _t = _T * token_id;
     const int _offset = _b * T * C + _c;
     const int _tokenLength = min(T - _t, _T);
-    F u = _u[_c];
-    F w = _w[_c];
+    // 衰减与奖励参数按 (batch, channel) 寻址, 支持把多个独立扫描堆到 batch 维一次算完。
+    // B=1 时与原来的 _u[_c] 完全等价。
+    const int _bc = _b * C + _c;
+    F u = _u[_bc];
+    F w = _w[_bc];
     const F *__restrict__ const k = _k + _offset;
     const F *__restrict__ const v = _v + _offset;
     F *__restrict__ const y = _y + _offset;
@@ -118,8 +121,11 @@ __global__ void kernel_backward(const int B, const int T, const int C,
     const int _t = _T * token_id;
     const int _offset = _b * T * C + _c;
     const int _tokenLength = min(T - _t, _T);
-    F u = _u[_c];
-    F w = _w[_c];
+    // 衰减与奖励参数按 (batch, channel) 寻址, 支持把多个独立扫描堆到 batch 维一次算完。
+    // B=1 时与原来的 _u[_c] 完全等价。
+    const int _bc = _b * C + _c;
+    F u = _u[_bc];
+    F w = _w[_bc];
     const F *__restrict__ const k = _k + _offset;
     const F *__restrict__ const v = _v + _offset;
     const F *__restrict__ const gy = _gy + _offset;
@@ -329,17 +335,29 @@ __global__ void kernel_backward(const int B, const int T, const int C,
     }
 }
 
+// 网格计算说明:
+//   每个线程块覆盖 CHANNEL_SPLIT 个通道的一条 column, 通道总数是 B*C。
+//   线程块的 x 维取 min(CHANNEL_SPLIT, C), 但当 B*C 不能被它整除时 (例如 B=1, C=8,
+//   CHANNEL_SPLIT=16), 整除会把网格算成 0 个块 —— 一个块都不启动, 后续读取就越界。
+//   因此这里把通道分组宽度往下调整到能整除 B*C 的值 (最坏退到 1), 保证网格精确覆盖。
+static dim3 grid_for(int B, int C, dim3 &threadsPerBlock) {
+    int x = min(CHANNEL_SPLIT, C);
+    // 网格必须精确整除, 不能向上取整: 多出来的线程会越界读取, 而提前 return 又会在
+    // __syncthreads() 之前造成块内线程分歧。这里退回到能整除的通道分组宽度。
+    const int total = B * C;
+    while (x > 1 && total % x != 0) x >>= 1;
+    threadsPerBlock = dim3(x, TOKEN_SPLIT);
+    return dim3(total / x);
+}
+
 void cuda_forward(int B, int T, int C, float *w, float *u, float *k, float *v, float *y) {
-    // 1024 threads per plock
-    dim3 threadsPerBlock(min(CHANNEL_SPLIT, C), TOKEN_SPLIT); // requires --maxrregcount 60 for optimal performance
-    assert(B * C % threadsPerBlock.x == 0);
-    dim3 numBlocks(B * C / threadsPerBlock.x);
+    dim3 threadsPerBlock;
+    dim3 numBlocks = grid_for(B, C, threadsPerBlock);
     kernel_forward<<<numBlocks, threadsPerBlock>>>(B, T, C, w, u, k, v, y);
 }
 
 void cuda_backward(int B, int T, int C, float *w, float *u, float *k, float *v, float *gy, float *gw, float *gu, float *gk, float *gv) {
-    dim3 threadsPerBlock(min(CHANNEL_SPLIT, C), TOKEN_SPLIT); // requires --maxrregcount 60 for optimal performance
-    assert(B * C % threadsPerBlock.x == 0);
-    dim3 numBlocks(B * C / threadsPerBlock.x);
+    dim3 threadsPerBlock;
+    dim3 numBlocks = grid_for(B, C, threadsPerBlock);
     kernel_backward<<<numBlocks, threadsPerBlock>>>(B, T, C, w, u, k, v, gy, gw, gu, gk, gv);
 }

@@ -42,6 +42,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.golf_v7r.spatial_rwkv_head_v8 import OmniShift, SpatialRWKVHeadV8
+from models.modules.batched_wkv import batched_scan
 
 
 class CrossRWKVHeadV8(SpatialRWKVHeadV8):
@@ -142,14 +143,20 @@ class CrossRWKVHeadV8(SpatialRWKVHeadV8):
         r = r.view(B, H * W, D, hd)
         g = torch.nn.functional.silu(g.view(B, H * W, D, hd))
 
-        heads = []
-        for i, scan_fn in enumerate(self._scan_fns()):
+        # 四个方向合并成一次扫描算子调用 (见 models/modules/batched_wkv.py)
+        scan_fns = self._scan_fns()
+        k_list, v_list = [], []
+        for i, scan_fn in enumerate(scan_fns):
             k_2d = k[:, :, i * hd:(i + 1) * hd].transpose(1, 2).reshape(B, hd, H, W)
             v_2d = v[:, :, i * hd:(i + 1) * hd].transpose(1, 2).reshape(B, hd, H, W)
-            wkv_seq = self.bi_wkv_list[i](scan_fn(k_2d), scan_fn(v_2d),
-                                          total_tokens=H * W)
-            wkv_i = wkv_seq[:, self._inv_index(scan_fn, B, hd, H, W,
-                                               center_feat.device)]
+            k_list.append(scan_fn(k_2d))
+            v_list.append(scan_fn(v_2d))
+        wkv_list = batched_scan(self.bi_wkv_list, k_list, v_list, total_tokens=H * W)
+
+        heads = []
+        for i, scan_fn in enumerate(scan_fns):
+            wkv_i = wkv_list[i][:, self._inv_index(scan_fn, B, hd, H, W,
+                                                   center_feat.device)]
             # 论文式 (4): R 先乘, 再逐头归一化, 最后由 SiLU(G) 门控
             heads.append(g[:, :, i] * self.head_norm(r[:, :, i] * wkv_i))
         out = torch.cat(heads, dim=-1)          # (B, N, C)

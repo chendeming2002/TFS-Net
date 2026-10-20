@@ -42,6 +42,7 @@ import torch.nn as nn
 
 from models.golf.encoder import FrameEncoder
 from models.golf_v7r.spatial_summary_unet import TemporalAggregator
+from models.golf_v7r.temporal_aggregator_lite import TemporalAggregatorLite
 from models.golf_v7r.triple_query_tca_v9 import TaskQueryAttention
 from models.golf_v7r.fusion_v7r import V7RFusion
 from models.golf_v7r.branch_n_simple import NBranch
@@ -64,6 +65,9 @@ class GolfNet_v8(nn.Module):
         kv_mode: 供 TripletQueryTCAv9 使用的 KV 来源 ("split" 为本设计的按支路分流)
         q_mode: "receptance" (旧的 sigmoid(Q) 门控) 或 "cross_rwkv"
             (Cross RWKV Gate, R/G 双查询; 见 docs/v8/06-CrossRWKVGate-Q重构设计.md)
+        summary_type: "full" 为原 TemporalAggregator (学习式帧权重);
+            "lite" 为 v8.5 A 方案 (非中心帧均值 + Conv/PixelShuffle 上采样),
+            见 models/golf_v7r/temporal_aggregator_lite.py
     """
 
     def __init__(self,
@@ -83,7 +87,8 @@ class GolfNet_v8(nn.Module):
                  fusion_weight_floor: float = 0.1,
                  fusion_residual_freeze: bool = True,
                  branch_m_single_frame: bool = True,
-                 q_mode: str = "receptance"):
+                 q_mode: str = "receptance",
+                 summary_type: str = "full"):
         super().__init__()
         self.num_frames = num_frames
         self.C1, self.C2, self.C3 = encoder_channels
@@ -104,10 +109,19 @@ class GolfNet_v8(nn.Module):
         )
 
         # ---------- Stage 2: U-Net 式空间聚合 (替代 SpatialSummary + PixelTemporal) ----------
-        self.summary = TemporalAggregator(
-            list(encoder_channels), num_frames=num_frames,
-            num_loops=temporal_loops, wkv_mode=wkv_mode,
-        )
+        if summary_type not in ("full", "lite"):
+            raise ValueError(
+                f"summary_type 必须是 'full' 或 'lite', 收到 {summary_type!r}")
+        self.summary_type = summary_type
+        if summary_type == "lite":
+            self.summary = TemporalAggregatorLite(
+                list(encoder_channels), num_frames=num_frames, wkv_mode=wkv_mode,
+            )
+        else:
+            self.summary = TemporalAggregator(
+                list(encoder_channels), num_frames=num_frames,
+                num_loops=temporal_loops, wkv_mode=wkv_mode,
+            )
 
         # ---------- Stage 3: F1 尺度三源查询 TCA ----------
         self.tca = TaskQueryAttention(
@@ -175,7 +189,7 @@ class GolfNet_v8(nn.Module):
             "branch_N": out_N,
             "branch_L": out_L,
             "branch_M": out_M,
-            "frame_weights": summary["frame_weights"],
+            "frame_weights": summary.get("frame_weights", None),
             "ortho_loss": ortho,
             "fusion_weights": fusion_out["weights"],
         }
@@ -208,7 +222,8 @@ if __name__ == "__main__":
         o = m(x)
     print(f"final: {tuple(o['final'].shape)}")
     print(f"bstd: {o['branch_N'].std():.4f}/{o['branch_L'].std():.4f}/{o['branch_M'].std():.4f}")
-    print(f"frame_weights: {o['frame_weights'].mean(0).tolist()}")
+    fw = o['frame_weights']
+    print(f"frame_weights: {'无 (lite)' if fw is None else fw.mean(0).tolist()}")
     t0 = time.time()
     with torch.no_grad():
         for _ in range(3):

@@ -32,6 +32,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.golf_r4.tca_rwkv import FastBiWKV
+from models.modules.batched_wkv import batched_scan
 
 
 class OmniShift(nn.Module):
@@ -59,19 +60,34 @@ class OmniShift(nn.Module):
             nn.init.kaiming_normal_(conv.weight, mode="fan_out", nonlinearity="linear")
         with torch.no_grad():
             self.alpha.fill_(1.0 / math.sqrt(4.0))
-        self.reparam_ready = False
+        # 推理期使用的等价单分支卷积, 首次推理时生成 (见 reparameterize)
+        self.conv_merged = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 训练用四分支; 推理用合并后的单卷积 (与 Restore-RWKV 的做法一致)
+        if not self.training:
+            if self.conv_merged is None:
+                self.reparameterize()
+            return self.conv_merged(x)
         return (self.alpha[0] * x
                 + self.alpha[1] * self.conv1x1(x)
                 + self.alpha[2] * self.conv3x3(x)
                 + self.alpha[3] * self.conv5x5(x))
 
+    def train(self, mode: bool = True):
+        """切回训练模式时丢弃合并卷积, 保证权重更新后不会用到过期的合并结果。"""
+        super().train(mode)
+        if mode:
+            self.conv_merged = None
+        return self
+
     @torch.no_grad()
     def reparameterize(self):
         """把四个分支合并为单个 5×5 depthwise 卷积 (推理加速, 输出等价)。
 
-        不做这一步也不影响正确性; 训练阶段保持多分支即可。
+        与 Restore-RWKV (reference_repos/EvRWKV/egllie/models/Cross_Restore_RWKV.py:126)
+        的 reparam_5x5 做法相同: 把 1×1、3×3 的核用零填充到 5×5, 与恒等分支、5×5 分支
+        按 alpha 加权求和, 得到一个等价核。之后每次推理只需一次卷积。
         """
         w1 = F.pad(self.conv1x1.weight, (2, 2, 2, 2))
         w3 = F.pad(self.conv3x3.weight, (1, 1, 1, 1))
@@ -81,7 +97,9 @@ class OmniShift(nn.Module):
         conv = nn.Conv2d(self.conv5x5.in_channels, self.conv5x5.out_channels,
                          5, 1, 2, groups=self.conv5x5.groups, bias=False)
         conv.weight.copy_(combined)
-        self.reparam_ready = True
+        conv = conv.to(device=self.conv5x5.weight.device,
+                       dtype=self.conv5x5.weight.dtype)
+        self.conv_merged = conv
         return conv
 
 
@@ -237,15 +255,21 @@ class SpatialRWKVHeadV8(nn.Module):
         k = self.proj_k(kv_tokens)
         v = self.proj_v(kv_tokens)
 
-        heads = []
-        for i, scan_fn in enumerate(self._scan_fns()):
+        # 四个方向各自展开后, 合并成一次扫描算子调用 (见 models/modules/batched_wkv.py)
+        scan_fns = self._scan_fns()
+        k_list, v_list = [], []
+        for i, scan_fn in enumerate(scan_fns):
             c0, c1 = i * self.head_dim, (i + 1) * self.head_dim
             k_2d = k[:, :, c0:c1].transpose(1, 2).reshape(B, self.head_dim, H, W)
             v_2d = v[:, :, c0:c1].transpose(1, 2).reshape(B, self.head_dim, H, W)
-            wkv_seq = self.bi_wkv_list[i](scan_fn(k_2d), scan_fn(v_2d),
-                                          total_tokens=H * W)
-            heads.append(wkv_seq[:, self._inv_index(scan_fn, B, self.head_dim, H, W,
-                                                    center_feat.device)])
+            k_list.append(scan_fn(k_2d))
+            v_list.append(scan_fn(v_2d))
+        wkv_list = batched_scan(self.bi_wkv_list, k_list, v_list, total_tokens=H * W)
+
+        heads = []
+        for i, scan_fn in enumerate(scan_fns):
+            heads.append(wkv_list[i][:, self._inv_index(
+                scan_fn, B, self.head_dim, H, W, center_feat.device)])
         wkv = torch.cat(heads, dim=-1)          # (B, N, C)
 
         out = torch.sigmoid(q) * wkv            # 三路 Q 门控 (我们的创新点)
