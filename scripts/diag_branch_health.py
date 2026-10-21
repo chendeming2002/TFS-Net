@@ -25,6 +25,7 @@ import sys
 import numpy as np
 import torch
 from PIL import Image
+from utils.io import load_state_dict_compat
 
 
 def read_image(path, crop=None):
@@ -69,7 +70,7 @@ def main():
     dev = args.device if torch.cuda.is_available() else "cpu"
     model = model_cls(**model_kwargs).to(dev).eval()
     ck = torch.load(args.ckpt, map_location=dev, weights_only=False)
-    model.load_state_dict(ck["model_state_dict"])
+    load_state_dict_compat(model, ck['model_state_dict'])
     print(f"RESULT loaded epoch {ck.get('epoch')} arch={arch}", flush=True)
 
     names = sorted(os.listdir(args.seq_root),

@@ -66,7 +66,8 @@ class GolfNet_v8(nn.Module):
         q_mode: "receptance" (旧的 sigmoid(Q) 门控) 或 "cross_rwkv"
             (Cross RWKV Gate, R/G 双查询; 见 docs/v8/06-CrossRWKVGate-Q重构设计.md)
         summary_type: "full" 为原 TemporalAggregator (学习式帧权重);
-            "lite" 为 v8.5 A 方案 (非中心帧均值 + Conv/PixelShuffle 上采样),
+            "lite" 为 v8.5 A 方案 (非中心帧均值 + Conv/PixelShuffle 上采样);
+            "lite_interp" 与 "lite" 相同, 但上采样用原项目的 Conv3x3 + 双线性插值。
             见 models/golf_v7r/temporal_aggregator_lite.py
     """
 
@@ -109,13 +110,16 @@ class GolfNet_v8(nn.Module):
         )
 
         # ---------- Stage 2: U-Net 式空间聚合 (替代 SpatialSummary + PixelTemporal) ----------
-        if summary_type not in ("full", "lite"):
+        if summary_type not in ("full", "lite", "lite_interp"):
             raise ValueError(
-                f"summary_type 必须是 'full' 或 'lite', 收到 {summary_type!r}")
+                f"summary_type 必须是 'full' / 'lite' / 'lite_interp', "
+                f"收到 {summary_type!r}")
         self.summary_type = summary_type
-        if summary_type == "lite":
+        if summary_type in ("lite", "lite_interp"):
+            up = "shuffle" if summary_type == "lite" else "interp"
             self.summary = TemporalAggregatorLite(
                 list(encoder_channels), num_frames=num_frames, wkv_mode=wkv_mode,
+                upsample_type=up,
             )
         else:
             self.summary = TemporalAggregator(
@@ -157,11 +161,22 @@ class GolfNet_v8(nn.Module):
         X_center = x[:, center]
 
         # ---------- Stage 1: 逐帧编码 ----------
-        # 编码器对每帧独立、权重共享, 因此把 T 帧拼成一个 batch 一次前向。
-        # 逐帧循环 (T 次 batch=1) 与这里结果完全相同, 但每次只有一个样本, GPU
-        # 利用率低: 实测 256×256 下 5 次 batch=1 约 120 ms, 一次 batch=5 约 36 ms。
-        f1_all, f2_all, f3_all = self.encoder(
-            x.reshape(B * T, x.shape[2], H, W))
+        # 编码器对每帧独立、权重共享, 因此把多帧拼成一个 batch 前向, 结果与逐帧循环完全相同。
+        # 小图 (训练裁剪 256×256) 一次处理全部 T 帧, GPU 利用率最高: 实测 5 次 batch=1
+        # 约 120 ms, 一次 batch=5 约 36 ms。整图 (验证 1080p) 若一次处理全部帧, 编码器
+        # 中间激活会同时持有 T 份全分辨率特征, 超出显存; 因此按像素总量分块, 每块不超过
+        # 训练裁剪时一次前向的像素量。
+        flat = x.reshape(B * T, x.shape[2], H, W)
+        max_pixels = 5 * 2 * 256 * 256
+        chunk = max(1, max_pixels // (H * W))
+        if chunk >= flat.shape[0]:
+            f1_all, f2_all, f3_all = self.encoder(flat)
+        else:
+            parts = [self.encoder(flat[i:i + chunk])
+                     for i in range(0, flat.shape[0], chunk)]
+            f1_all = torch.cat([p[0] for p in parts], dim=0)
+            f2_all = torch.cat([p[1] for p in parts], dim=0)
+            f3_all = torch.cat([p[2] for p in parts], dim=0)
         f1_seq = f1_all.reshape(B, T, *f1_all.shape[1:])
         f2_seq = f2_all.reshape(B, T, *f2_all.shape[1:])
         f3_seq = f3_all.reshape(B, T, *f3_all.shape[1:])

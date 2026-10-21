@@ -18,6 +18,7 @@ import torchvision.transforms.functional as TF
 
 from models.golf_v7r import GolfNet_v7r_v3
 from datasets import SDSDDataset
+from utils.io import load_state_dict_compat
 
 
 def load_model(ckpt_path, device='cuda', config=None):
@@ -38,7 +39,7 @@ def load_model(ckpt_path, device='cuda', config=None):
     else:
         model = GolfNet_v7r_v3().to(device).eval()
     ck = torch.load(ckpt_path, map_location=device, weights_only=False)
-    model.load_state_dict(ck['model_state_dict'])
+    load_state_dict_compat(model, ck['model_state_dict'])
     print(f"Loaded {ckpt_path} | epoch {ck.get('epoch', '?')}", flush=True)
     return model
 

@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 
 from datasets import SDSDDataset
 from models.golf_v7r import GolfNet_v7r_v3, GolfV7RLoss
-from utils.io import save_checkpoint
+from utils.io import save_checkpoint, load_state_dict_compat
 from utils.misc import seed_everything
 from utils.metrics import tensor_psnr, tensor_ssim, LPIPSMetric
 import logging
@@ -177,7 +177,7 @@ def main():
     resume = args.resume if args.resume is not None else cfg['train'].get('resume')
     if resume:
         ck = torch.load(resume, map_location=device, weights_only=False)
-        model.load_state_dict(ck['model_state_dict'])
+        load_state_dict_compat(model, ck['model_state_dict'])
         if 'optimizer_state_dict' in ck:
             optimizer.load_state_dict(ck['optimizer_state_dict'])
         if 'scheduler_state_dict' in ck:

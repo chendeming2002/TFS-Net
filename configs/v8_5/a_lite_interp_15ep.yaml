@@ -1,0 +1,68 @@
+## v8.5 A 方案 (插值上采样版): TemporalAggregator 轻量化 (15 epoch)
+##
+## 相对 configs/v8/fullkv_15ep.yaml 只有 model.summary_type 一项不同:
+##   full → lite_interp
+## lite 的改动:
+##   1. 删除学习式帧权重 (temporal / to_token / descriptor), 改为非中心帧 F3 均值聚合;
+##   2. 保留 frame_encoder;
+##   3. 跨尺度上采样沿用原项目的 Conv3x3 + 双线性插值 (与 a_lite 的 PixelShuffle 版对照);
+##   4. F1_single / F1_multi 接口与 TCA 三路接线、full-band K/V 全部不动。
+## 详见 models/golf_v7r/temporal_aggregator_lite.py 与 docs/v8/09-A方案轻量聚合设计.md
+seed: 42
+output_dir: outputs/v8_5_a_lite_interp_15ep
+dataset:
+  train_input_root: /home/a1005/yzy/dataset/SDSD/indoor/input
+  train_target_root: /home/a1005/yzy/dataset/SDSD/indoor/GT
+  val_input_root: /home/a1005/yzy/dataset/SDSD/test/low-light
+  val_target_root: /home/a1005/yzy/dataset/SDSD/test/GT
+  window_size: 5
+  crop_size: 256
+  num_workers: 6
+  pairing: position
+  branch_target_kernel_low: 31
+  branch_target_kernel_high: 5
+  branch_target_motion_share_mid: 0.5
+  branch_target_motion_share_high: 0.2
+model:
+  arch: v8
+  num_frames: 5
+  encoder_channels:
+  - 32
+  - 64
+  - 128
+  encoder_loops: 2
+  temporal_loops: 2
+  spatial_head: v8
+  wkv_mode: single_norm
+  channel_mix_rate: 4
+  use_omni_shift: true
+  use_channel_mix: true
+  lowpass_kernel: 9
+  branch_blocks: 2
+  fusion_mode: additive
+  fusion_weight_floor: 0.1
+  fusion_residual_freeze: true
+  branch_m_single_frame: true
+  q_mode: cross_rwkv
+  summary_type: lite_interp
+train:
+  batch_size: 2
+  epochs: 15
+  lr: 0.0005657
+  weight_decay: 0.01
+  log_interval: 100
+  val_interval: 5
+  grad_clip: 1.0
+  ckpt_interval: 500
+  lpips_net: vgg
+loss:
+  w_branch_N: 0.3
+  w_branch_L: 0.3
+  w_branch_M: 0.3
+  lambda_ortho: 0.01
+  w_ssim: 0.0
+  branch_warmup_epochs: 5
+  use_lowfreq_L: false
+  lowfreq_kernel: 16
+  branch_specific_targets: true
+  branch_target_normalize: true

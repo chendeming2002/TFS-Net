@@ -37,6 +37,8 @@ RWKV 编码 (`frame_encoder`) 的非线性, 本实现保留了这个编码, 只�
 """
 from __future__ import annotations
 
+import sys
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -71,10 +73,12 @@ class TemporalAggregatorLite(nn.Module):
         encoder_channels: [C1, C2, C3] 三层金字塔通道数
         num_frames: 帧数 T
         wkv_mode: 仅传递给 `frame_encoder`, 与原实现一致
+        upsample_type: "shuffle" 为 Conv + PixelShuffle; "interp" 为原项目的
+            `Conv3x3` + `F.interpolate` 双线性插值实现 (与 `TemporalAggregator` 相同)
     """
 
     def __init__(self, encoder_channels, num_frames: int = 5,
-                 wkv_mode: str = "single_norm"):
+                 wkv_mode: str = "single_norm", upsample_type: str = "shuffle"):
         super().__init__()
         C1, C2, C3 = encoder_channels
         self.C1, self.C2, self.C3 = C1, C2, C3
@@ -84,14 +88,25 @@ class TemporalAggregatorLite(nn.Module):
         from models.golf_v7r.rwkv_encoder_block import RWKVEncoderBlock
         self.frame_encoder = RWKVEncoderBlock(C3, wkv_mode=wkv_mode)
 
-        # 自顶向下融合: 尺度变换改为 Conv + PixelShuffle
-        self.up3_to_2 = UpsampleConvShuffle(C3, C2)
+        if upsample_type not in ("shuffle", "interp"):
+            raise ValueError(
+                f"upsample_type 必须是 'shuffle' 或 'interp', 收到 {upsample_type!r}")
+        self.upsample_type = upsample_type
+
+        # 自顶向下融合: 尺度变换可选 Conv+PixelShuffle 或插值
+        if upsample_type == "shuffle":
+            self.up3_to_2 = UpsampleConvShuffle(C3, C2)
+        else:
+            self.up3_to_2 = nn.Conv2d(C3, C2, 3, 1, 1, bias=False)
         self.fuse2 = nn.Sequential(
             nn.Conv2d(C2 * 2, C2, 3, 1, 1, bias=True),
             LayerNorm2d(C2),
             nn.SiLU(inplace=True),
         )
-        self.up2_to_1 = UpsampleConvShuffle(C2, C1)
+        if upsample_type == "shuffle":
+            self.up2_to_1 = UpsampleConvShuffle(C2, C1)
+        else:
+            self.up2_to_1 = nn.Conv2d(C2, C1, 3, 1, 1, bias=False)
         self.fuse1 = nn.Sequential(
             nn.Conv2d(C1 * 2, C1, 3, 1, 1, bias=True),
             LayerNorm2d(C1),
@@ -129,8 +144,14 @@ class TemporalAggregatorLite(nn.Module):
 
         # 自顶向下融合: 与原来相同的拼接顺序与通道设计
         up2 = self.up3_to_2(f3_agg)
+        if self.upsample_type == "interp":
+            up2 = F.interpolate(up2, size=f2_seq.shape[-2:],
+                                mode="bilinear", align_corners=False)
         F2_multi = self.fuse2(torch.cat([up2, f2_seq[:, center]], dim=1))
         up1 = self.up2_to_1(F2_multi)
+        if self.upsample_type == "interp":
+            up1 = F.interpolate(up1, size=f1_seq.shape[-2:],
+                                mode="bilinear", align_corners=False)
         F1_multi = self.fuse1(torch.cat([up1, f1_seq[:, center]], dim=1))
 
         # 单帧旁路: 与原来相同, 不经任何跨帧运算
@@ -147,7 +168,8 @@ class TemporalAggregatorLite(nn.Module):
 if __name__ == '__main__':
     dev = 'cuda' if torch.cuda.is_available() else 'cpu'
     B, T, ch = 2, 5, [32, 64, 128]
-    net = TemporalAggregatorLite(ch, num_frames=T).to(dev)
+    up = sys.argv[1] if len(sys.argv) > 1 else "shuffle"
+    net = TemporalAggregatorLite(ch, num_frames=T, upsample_type=up).to(dev)
     f1 = torch.randn(B, T, ch[0], 32, 32, device=dev)
     f2 = torch.randn(B, T, ch[1], 16, 16, device=dev)
     f3 = torch.randn(B, T, ch[2], 8, 8, device=dev)

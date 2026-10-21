@@ -20,6 +20,7 @@ from torch.utils.data import DataLoader
 
 from datasets import SDSDDataset
 from utils.metrics import tensor_psnr, tensor_ssim
+from utils.io import load_state_dict_compat
 
 try:
     import lpips
@@ -68,7 +69,9 @@ def main():
     if args.config:
         import yaml
         with open(args.config) as f:
-            model_kwargs = (yaml.safe_load(f) or {}).get('model', {}) or {}
+            model_kwargs = dict((yaml.safe_load(f) or {}).get('model', {}) or {})
+        # arch 是训练脚本用来选择模型类的键, 不是模型构造参数
+        model_kwargs.pop('arch', None)
         print(f'Model kwargs from {args.config}: '
               f'motion_aware_diff={model_kwargs.get("motion_aware_diff", False)}, '
               f'diff_smooth_kernel={model_kwargs.get("diff_smooth_kernel", 5)}', flush=True)
@@ -92,7 +95,7 @@ def main():
         print(backend_report(require_cuda=(device == 'cuda')), flush=True)
     ck = torch.load(args.ckpt, map_location=device, weights_only=False)
     state = ck.get('model_state_dict', ck.get('model'))
-    model.load_state_dict(state)
+    load_state_dict_compat(model, state)
     epoch = ck.get('epoch', -1)
     n_params = sum(p.numel() for p in model.parameters())
     tag = args.tag or f'{args.model}-ep{epoch}'

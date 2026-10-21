@@ -34,6 +34,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from datasets.branch_targets import build_branch_targets
+from utils.io import load_state_dict_compat
 
 CONDITIONS = [
     ("clean", 0.0),
@@ -128,7 +129,7 @@ def main():
     dev = args.device if torch.cuda.is_available() else "cpu"
     model = GolfNet_v8(**model_kwargs).to(dev).eval()
     ck = torch.load(args.ckpt, map_location=dev, weights_only=False)
-    model.load_state_dict(ck["model_state_dict"])
+    load_state_dict_compat(model, ck['model_state_dict'])
     if getattr(model.fusion, "mode", "") != "additive":
         raise SystemExit("本脚本的置零消融只适用于 additive 融合")
     print(f"RESULT loaded epoch {ck.get('epoch')}, fusion=additive, "

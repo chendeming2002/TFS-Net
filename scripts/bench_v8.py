@@ -24,6 +24,31 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+def _count_macs(model, x):
+    """统计一次前向中卷积与线性层的乘加次数 (与 thop 的口径相同)。"""
+    total = [0]
+
+    def conv_hook(m, inp, out):
+        out_elems = out.numel()
+        k = m.kernel_size[0] * m.kernel_size[1]
+        total[0] += out_elems * (m.in_channels // m.groups) * k
+
+    def linear_hook(m, inp, out):
+        total[0] += m.in_features * m.out_features * (out.numel() // m.out_features)
+
+    handles = []
+    for m in model.modules():
+        if isinstance(m, torch.nn.Conv2d):
+            handles.append(m.register_forward_hook(conv_hook))
+        elif isinstance(m, torch.nn.Linear):
+            handles.append(m.register_forward_hook(linear_hook))
+    with torch.no_grad():
+        model(x)
+    for h in handles:
+        h.remove()
+    return float(total[0])
+
+
 def wkv_flops(model, H, W):
     """按线性复杂度折算 WKV 扫描的浮点运算量。
 
@@ -92,9 +117,15 @@ def main():
     n_params = sum(q.numel() for q in model.parameters())
 
     # ---------- FLOPs ----------
-    import thop
+    # 用 hook 统计卷积与线性层的乘加次数。thop 对 PixelShuffle 这类无参数重排操作
+    # 会残留错误的属性, 在 v8.5 的 lite 聚合器上直接报错, 因此这里自己统计。
+    # 训练形态 (OmniShift 四分支) 与推理形态 (重参数化后单卷积) 的乘加次数不同,
+    # 这里都报告: 前者用于与训练成本比较, 后者用于推理部署。
+    macs_train_form = _count_macs(model, x)
+    model.eval()                     # 触发 OmniShift 自动重参数化
     with torch.no_grad():
-        macs, _ = thop.profile(model, inputs=(x,), verbose=False)
+        model(x)
+    macs = _count_macs(model, x)
     # thop 返回的是乘加次数 (MAC)。一次乘加计两次浮点运算。
     conv_macs = macs
     conv_flops = 2.0 * conv_macs
@@ -137,6 +168,7 @@ def main():
         "flops_G": round(total_flops / 1e9, 2),
         "flops_conv_G": round(conv_flops / 1e9, 2),
         "macs_G": round(conv_macs / 1e9, 2),
+        "flops_train_form_G": round((2 * macs_train_form + wkv) / 1e9, 2),
         "flops_wkv_G": round(wkv / 1e9, 3),
         "memory_GB": round(mem_peak, 3),
         "latency_mean_ms": round(mean_ms, 2),

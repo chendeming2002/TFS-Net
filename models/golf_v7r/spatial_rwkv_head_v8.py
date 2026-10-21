@@ -60,15 +60,17 @@ class OmniShift(nn.Module):
             nn.init.kaiming_normal_(conv.weight, mode="fan_out", nonlinearity="linear")
         with torch.no_grad():
             self.alpha.fill_(1.0 / math.sqrt(4.0))
-        # 推理期使用的等价单分支卷积, 首次推理时生成 (见 reparameterize)
-        self.conv_merged = None
+        # 推理期使用的等价单分支卷积, 首次推理时生成 (见 reparameterize)。
+        # 放在列表里而不是直接赋值: 直接赋一个 Module 会被注册成子模块, 它的权重
+        # 会出现在 state_dict 里, 使推理过的 checkpoint 无法被未推理的进程加载。
+        self._merged_cache = [None]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # 训练用四分支; 推理用合并后的单卷积 (与 Restore-RWKV 的做法一致)
         if not self.training:
-            if self.conv_merged is None:
+            if self._merged_cache[0] is None:
                 self.reparameterize()
-            return self.conv_merged(x)
+            return self._merged_cache[0](x)
         return (self.alpha[0] * x
                 + self.alpha[1] * self.conv1x1(x)
                 + self.alpha[2] * self.conv3x3(x)
@@ -78,7 +80,7 @@ class OmniShift(nn.Module):
         """切回训练模式时丢弃合并卷积, 保证权重更新后不会用到过期的合并结果。"""
         super().train(mode)
         if mode:
-            self.conv_merged = None
+            self._merged_cache[0] = None
         return self
 
     @torch.no_grad()
@@ -99,7 +101,7 @@ class OmniShift(nn.Module):
         conv.weight.copy_(combined)
         conv = conv.to(device=self.conv5x5.weight.device,
                        dtype=self.conv5x5.weight.dtype)
-        self.conv_merged = conv
+        self._merged_cache[0] = conv
         return conv
 
 

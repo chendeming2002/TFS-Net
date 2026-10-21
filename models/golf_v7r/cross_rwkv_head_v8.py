@@ -75,6 +75,9 @@ class CrossRWKVHeadV8(SpatialRWKVHeadV8):
         del self.proj_q
         del self.channel_mix
         self.channel_mix = None
+        # 基类的 omni_shift 只服务于它自己的单路前向 (K/V 共用一份 Q-Shift)。
+        # 本类的四个投影各有独立的 Q-Shift, 那份不会进入任何计算, 删掉以免留下死参数。
+        del self.omni_shift
 
         # ---------- 四个 Q-Shift (论文式 2、3 各有两处) ----------
         if self.use_omni_shift:

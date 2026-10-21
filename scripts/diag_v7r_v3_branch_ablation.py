@@ -25,6 +25,7 @@ import torch
 from PIL import Image
 
 from models.golf_v7r import GolfNet_v7r_v3, GolfNet_v8
+from utils.io import load_state_dict_compat
 
 
 def read_image(path):
@@ -62,7 +63,7 @@ def main():
     model_cls = GolfNet_v8 if arch == "v8" else GolfNet_v7r_v3
     model = model_cls(**model_kwargs).to(dev).eval()
     ck = torch.load(args.ckpt, map_location=dev, weights_only=False)
-    model.load_state_dict(ck["model_state_dict"])
+    load_state_dict_compat(model, ck['model_state_dict'])
     print(f"RESULT loaded epoch {ck.get('epoch')} from {args.ckpt}", flush=True)
     print(f"RESULT fusion mode={getattr(model.fusion, 'mode', 'softmax')}, "
           f"residual_freeze={bool(getattr(model.fusion, 'residual_freeze', False))} "
