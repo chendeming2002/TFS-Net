@@ -130,10 +130,15 @@ def main():
     model = GolfNet_v8(**model_kwargs).to(dev).eval()
     ck = torch.load(args.ckpt, map_location=dev, weights_only=False)
     load_state_dict_compat(model, ck['model_state_dict'])
-    if getattr(model.fusion, "mode", "") != "additive":
-        raise SystemExit("本脚本的置零消融只适用于 additive 融合")
-    print(f"RESULT loaded epoch {ck.get('epoch')}, fusion=additive, "
-          f"residual_freeze={model.fusion.residual_freeze}", flush=True)
+    is_sgrf = getattr(model, "sgrf", None) is not None
+    if not is_sgrf and getattr(model.fusion, "mode", "") != "additive":
+        raise SystemExit("本脚本的置零消融只适用于 additive 融合或 SGRFv8")
+    if is_sgrf:
+        print(f"RESULT loaded epoch {ck.get('epoch')}, fusion=sgrf "
+              f"(order={model.sgrf.stage_order})", flush=True)
+    else:
+        print(f"RESULT loaded epoch {ck.get('epoch')}, fusion=additive, "
+              f"residual_freeze={model.fusion.residual_freeze}", flush=True)
 
     tgt_cfg = {
         "kernel_low": int(cfg["dataset"].get("branch_target_kernel_low", 31)),
@@ -184,14 +189,28 @@ def main():
                         mean_abs(branch[b] - clean_branch[b]) / max(mean_abs(targets[b]), 1e-8))
                     row[f"rel_{b}"].append(
                         mean_abs(branch[b] - targets[b]) / max(mean_abs(targets[b]), 1e-8))
-                    row[f"w_{b}"].append(weights[:, BRANCH_KEYS.index(b)].mean().item())
 
-                base = psnr(compose(model, branch, weights, x_center), gt)
-                for drop_idx, b in enumerate(BRANCH_KEYS):
-                    w = weights.clone()
-                    w[:, drop_idx:drop_idx + 1] = 0.0
-                    dropped = compose(model, branch, w, x_center)
-                    row[f"drop_{b}"].append(psnr(dropped, gt) - base)
+                if is_sgrf:
+                    # 串接融合没有逐像素权重, 这一列改报各段的缩放系数;
+                    # 置零代价用真实前向测量: 跳过某一段后, 后续各段的输入也随之改变,
+                    # 这正是串接结构下"去掉一段"的真实代价。
+                    scales = model.sgrf._scale_all()
+                    order = model.sgrf.stage_order
+                    for b in BRANCH_KEYS:
+                        row[f"w_{b}"].append(float(scales[order.index(b)]))
+                    base = psnr(final, gt)
+                    for b in BRANCH_KEYS:
+                        dropped = model(clip.unsqueeze(0), zero_stage=b)["final"]
+                        row[f"drop_{b}"].append(psnr(dropped, gt) - base)
+                else:
+                    for b in BRANCH_KEYS:
+                        row[f"w_{b}"].append(weights[:, BRANCH_KEYS.index(b)].mean().item())
+                    base = psnr(compose(model, branch, weights, x_center), gt)
+                    for drop_idx, b in enumerate(BRANCH_KEYS):
+                        w = weights.clone()
+                        w[:, drop_idx:drop_idx + 1] = 0.0
+                        dropped = compose(model, branch, w, x_center)
+                        row[f"drop_{b}"].append(psnr(dropped, gt) - base)
 
     print(f"RESULT {len(seqs)} sequences, crop={args.crop}", flush=True)
     header = (f"{'条件':<12}{'PSNR':>8}  {'变化 N/L/M':>22}  {'相对误差 N/L/M':>24}  "

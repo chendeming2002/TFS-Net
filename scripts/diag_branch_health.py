@@ -113,9 +113,17 @@ def main():
             acc["fstd"].append(final.std().item())
 
             w = out.get("fusion_weights")
-            if w is not None:
+            if getattr(model, "sgrf", None) is not None:
+                # 串接融合没有逐像素权重, 记录各段缩放系数 (按 N/L/M 顺序)
+                sc = model.sgrf._scale_all()
+                order = model.sgrf.stage_order
+                acc["wN"].append(float(sc[order.index("N")]))
+                acc["wL"].append(float(sc[order.index("L")]))
+                acc["wM"].append(float(sc[order.index("M")]))
+            elif w is not None:
                 # additive 模式是三路独立权重; gated 模式只有一个逐通道门, 记为 wT
-                if getattr(model.fusion, "mode", "") == "gated":
+                if getattr(model, "fusion", None) is not None and \
+                        getattr(model.fusion, "mode", "") == "gated":
                     acc["wT"].append(w.mean().item())
                 else:
                     acc["wN"].append(w[:, 0].mean().item())

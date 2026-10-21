@@ -45,6 +45,7 @@ from models.golf_v7r.spatial_summary_unet import TemporalAggregator
 from models.golf_v7r.temporal_aggregator_lite import TemporalAggregatorLite
 from models.golf_v7r.triple_query_tca_v9 import TaskQueryAttention
 from models.golf_v7r.fusion_v7r import V7RFusion
+from models.golf_v7r.sgrf_v8 import SGRFv8
 from models.golf_v7r.branch_n_simple import NBranch
 from models.golf_v7r.branch_l_simple import LBranch
 from models.golf_v7r.branch_m_simple import MBranch
@@ -65,6 +66,8 @@ class GolfNet_v8(nn.Module):
         kv_mode: 供 TripletQueryTCAv9 使用的 KV 来源 ("split" 为本设计的按支路分流)
         q_mode: "receptance" (旧的 sigmoid(Q) 门控) 或 "cross_rwkv"
             (Cross RWKV Gate, R/G 双查询; 见 docs/v8/06-CrossRWKVGate-Q重构设计.md)
+        fusion_mode: 除 V7RFusion 的四种模式外, "sgrf" 表示用 SGRFv8 分阶段串接融合
+            (N → L → M 加性累加, 每级输入上一级输出; 见 models/golf_v7r/sgrf_v8.py)
         summary_type: "full" 为原 TemporalAggregator (学习式帧权重);
             "lite" 为 v8.5 A 方案 (非中心帧均值 + Conv/PixelShuffle 上采样);
             "lite_interp" 与 "lite" 相同, 但上采样用原项目的 Conv3x3 + 双线性插值。
@@ -148,13 +151,23 @@ class GolfNet_v8(nn.Module):
                                       at_f1=True)
 
         # ---------- Stage 5: 融合 ----------
-        self.fusion = V7RFusion(in_channels=3, hidden_channels=32,
-                                num_blocks=2, mode=fusion_mode,
-                                weight_floor=fusion_weight_floor,
-                                residual_freeze=fusion_residual_freeze)
+        if fusion_mode == "sgrf":
+            self.fusion = None
+            self.sgrf = SGRFv8(channels=self.branch_channels)
+        else:
+            self.fusion = V7RFusion(in_channels=3, hidden_channels=32,
+                                    num_blocks=2, mode=fusion_mode,
+                                    weight_floor=fusion_weight_floor,
+                                    residual_freeze=fusion_residual_freeze)
+            self.sgrf = None
 
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """x: [B, T, 3, H, W]"""
+    def forward(self, x: torch.Tensor,
+                zero_stage: str | None = None) -> Dict[str, torch.Tensor]:
+        """x: [B, T, 3, H, W]
+
+        zero_stage: 仅 fusion_mode="sgrf" 时有效, 把指定段 (N/L/M) 的缩放置零,
+            用于诊断每段的实际贡献。
+        """
         B, T, _, H, W = x.shape
         assert T == self.num_frames, f"expect T={self.num_frames}, got {T}"
         center = T // 2
@@ -190,14 +203,22 @@ class GolfNet_v8(nn.Module):
         # ---------- Stage 3: F1 三源查询 ----------
         F_N, F_L, F_M, ortho = self.tca(F1_multi, F1_single)
 
-        # ---------- Stage 4: 三分支 ----------
-        out_N = self.branch_N(F_N)["Y_N"]
-        out_L = self.branch_L(F_L, X_center)["Y_L"]
-        # BranchM 在单帧模式下只用 F_M; 传 F2_single 仅为保持接口一致
-        out_M = self.branch_M(F_M, F2_single.unsqueeze(1))["Y_M"]
-
-        # ---------- Stage 5: 融合 ----------
-        fusion_out = self.fusion(out_N, out_L, out_M, X_center)
+        # ---------- Stage 4–5: 三分支与融合 ----------
+        if self.sgrf is not None:
+            # 分阶段串接: 每一段的分支以上一段的累加结果为条件
+            fusion_out = self.sgrf(
+                {"N": F_N, "L": F_L, "M": F_M}, X_center,
+                self.branch_N, self.branch_L, self.branch_M, F2_single,
+                zero_stage=zero_stage)
+            out_N, out_L, out_M = fusion_out["Y_N"], fusion_out["Y_L"], fusion_out["Y_M"]
+            weights = None
+        else:
+            out_N = self.branch_N(F_N)["Y_N"]
+            out_L = self.branch_L(F_L, X_center)["Y_L"]
+            # BranchM 在单帧模式下只用 F_M; 传 F2_single 仅为保持接口一致
+            out_M = self.branch_M(F_M, F2_single.unsqueeze(1))["Y_M"]
+            fusion_out = self.fusion(out_N, out_L, out_M, X_center)
+            weights = fusion_out["weights"]
 
         return {
             "final": fusion_out["O_t"],
@@ -206,7 +227,7 @@ class GolfNet_v8(nn.Module):
             "branch_M": out_M,
             "frame_weights": summary.get("frame_weights", None),
             "ortho_loss": ortho,
-            "fusion_weights": fusion_out["weights"],
+            "fusion_weights": weights,
         }
 
 
@@ -218,7 +239,7 @@ def count_params(model):
     stats["branch_N"] = sum(p.numel() for p in model.branch_N.parameters())
     stats["branch_L"] = sum(p.numel() for p in model.branch_L.parameters())
     stats["branch_M"] = sum(p.numel() for p in model.branch_M.parameters())
-    stats["fusion"] = sum(p.numel() for p in model.fusion.parameters())
+    stats["fusion"] = sum(p.numel() for p in (model.fusion or model.sgrf).parameters())
     stats["total"] = sum(stats.values())
     return stats
 

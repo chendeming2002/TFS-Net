@@ -13,7 +13,7 @@
 | `04-训练加速调研.md` | 单步慢的定位、WKV 双向定义的修正、CUDA 算子接入与实测收益 |
 | `05-UNet重构设计.md` | SpatialSummary + TripleQueryTCA 重构为 U-Net 式聚合; 单模块循环 M 次; F1 尺度三源查询 |
 | `06-CrossRWKVGate-Q重构设计.md` | 按论文 2411.05636 式 (2)–(8) 把任务 Q 重构为 Cross RWKV gate 的 R/G 双查询; Q-Shift 用 OmniShift; 配套设计 |
-| `09-A方案轻量聚合设计.md` | v8.5 A 方案: 删除学习式帧权重, 非中心帧均值聚合, Conv+PixelShuffle 上采样 |
+| `09-A方案轻量聚合设计.md` | v8.5 A 方案: 删除学习式帧权重, 非中心帧均值聚合; PixelShuffle 与插值两个上采样版本及最终对比 |
 | `07-KV全带与输出侧频带约束设计.md` | 取消 K/V 上的固定滤波, 频带分工移到输出侧; 三种输出约束方案与三组实验编排 (待决策) |
 | `08-命名对照.md` | 部件名与 RWKV 块名的术语表 (FrameEncoder / TemporalAggregator / TaskQueryAttention / N·L·M Branch / SGRF); 五处待裁决的对齐问题 |
 
