@@ -103,7 +103,8 @@ class SGRFv9(nn.Module):
     """
 
     def __init__(self, feat_channels: int = 32, stage_order: str = "NLM",
-                 clamp_output: bool = True, delta_bound: float = 0.5):
+                 clamp_output: bool = True,
+                 delta_bound=None, amp_range=None):
         super().__init__()
         if sorted(stage_order) != ["L", "M", "N"]:
             raise ValueError(
@@ -140,13 +141,27 @@ class SGRFv9(nn.Module):
         # to_rgb 是普通卷积, 输出幅度不受控。实测冒烟 6 步内 M 段增量从 0.024 涨到
         # 0.431 而 L 段收缩, 会重现阶段失衡。这里对每段修正量做软限幅, 使其在
         # |Δ| << bound 时近似恒等, 超出后饱和, 从而避免某一段独占更新。
-        self.delta_bound = float(delta_bound)
+        # 逐段限幅与幅度范围, 取值按三段目标的实测量级设定
+        # (L 0.500 / N 0.197 / M 0.054)。限幅只用于 N 与 M, L 段由 Retinex 内部
+        # 的 clamp(0,1) 约束, 再限幅会把亮区压住 (SGRFv9 的失败原因)。
+        # 幅度 r_k/2 是 tanh 的半幅: s_k = 1 + (r_k/2)·tanh(a_k)。
+        # L 段的范围更宽, 因为它的目标量级大; N、M 幅度小, 给窄范围。
+        if delta_bound is None:
+            delta_bound = {"N": 0.60, "L": None, "M": 0.16}
+        if amp_range is None:
+            amp_range = {"N": 0.5, "L": 0.8, "M": 0.5}
+        self.delta_bound = dict(delta_bound)
+        self.amp_range = dict(amp_range)
 
     def _amp(self, idx: int) -> torch.Tensor:
-        return 1.0 + 0.5 * torch.tanh(self.stage_amp[idx])
+        name = self.stage_order[idx]
+        r = self.amp_range[name] * 0.5
+        return 1.0 + r * torch.tanh(self.stage_amp[idx])
 
     def _amp_all(self) -> torch.Tensor:
-        return 1.0 + 0.5 * torch.tanh(self.stage_amp)
+        r = torch.tensor([self.amp_range[n] * 0.5 for n in self.stage_order],
+                         device=self.stage_amp.device)
+        return 1.0 + r * torch.tanh(self.stage_amp)
 
     def forward(self, feats: Dict[str, torch.Tensor], X_t: torch.Tensor,
                 branch_N: nn.Module, branch_L: nn.Module, branch_M: nn.Module,
@@ -181,8 +196,10 @@ class SGRFv9(nn.Module):
                 delta = branches["M"](feat, F2_single.unsqueeze(1))["Y_M"]
                 delta = self.lift_M(delta)
 
-            # 软限幅: |Δ| << bound 时近似恒等, 超出后饱和到 ±bound
-            delta_b = self.delta_bound * torch.tanh(delta / self.delta_bound)
+            # 软限幅: |Δ| << δ 时近似恒等, 超出后饱和到 ±δ。
+            # L 段跳过 (db is None): 其输出是完整图像, Retinex 内部已 clamp(0,1)。
+            db = self.delta_bound.get(name)
+            delta_b = delta if db is None else db * torch.tanh(delta / db)
 
             g = self.gate[name](x, feat)
             amp = self._amp(k)
@@ -204,12 +221,16 @@ class SGRFv9(nn.Module):
             # 限幅前后的幅度: 用于判断限幅是否压制了该段真正需要的修正。
             # 压缩比例 = 进入明显非线性区 (|Δ| > 0.5·δ) 的元素占比
             d = delta.detach()
-            db = delta_b.detach()
+            d_bounded = delta_b.detach()
+            bound = self.delta_bound.get(name)
             stats[f"rms_pre_{name}"] = d.pow(2).mean().sqrt()
-            stats[f"rms_post_{name}"] = db.pow(2).mean().sqrt()
+            stats[f"rms_post_{name}"] = d_bounded.pow(2).mean().sqrt()
             stats[f"absmax_pre_{name}"] = d.abs().max()
-            stats[f"absmax_post_{name}"] = db.abs().max()
-            stats[f"frac_compress_{name}"] = (d.abs() > 0.5 * self.delta_bound).float().mean()
+            stats[f"absmax_post_{name}"] = d_bounded.abs().max()
+            if bound is None:
+                stats[f"frac_compress_{name}"] = d.new_zeros(())
+            else:
+                stats[f"frac_compress_{name}"] = (d.abs() > 0.5 * bound).float().mean()
 
         out = x.clamp(0.0, 1.0) if self.clamp_output else x
         return {"O_t": out, "stages": {},

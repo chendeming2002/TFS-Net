@@ -43,6 +43,7 @@ import torch.nn as nn
 from models.golf.encoder import FrameEncoder
 from models.golf_v7r.spatial_summary_unet import TemporalAggregator
 from models.golf_v7r.temporal_aggregator_lite import TemporalAggregatorLite
+from models.golf_v7r.temporal_aggregator_g import TemporalAggregator_G
 from models.golf_v7r.triple_query_tca_v9 import TaskQueryAttention
 from models.golf_v7r.fusion_v7r import V7RFusion
 from models.golf_v7r.sgrf_v8 import SGRFv8
@@ -73,8 +74,10 @@ class GolfNet_v8(nn.Module):
             见 models/golf_v7r/sgrf_v9.py)
         summary_type: "full" 为原 TemporalAggregator (学习式帧权重);
             "lite" 为 v8.5 A 方案 (非中心帧均值 + Conv/PixelShuffle 上采样);
-            "lite_interp" 与 "lite" 相同, 但上采样用原项目的 Conv3x3 + 双线性插值。
-            见 models/golf_v7r/temporal_aggregator_lite.py
+            "lite_interp" 与 "lite" 相同, 但上采样用原项目的 Conv3x3 + 双线性插值;
+            "g" 为 TemporalAggregator_G (双流共享 top-down, 全帧均值含中心帧,
+            F1_single 由同一组参数产出; 见 models/golf_v7r/temporal_aggregator_g.py)。
+            见 models/golf_v7r/temporal_aggregator_lite.py 与 08 设计文档
     """
 
     def __init__(self,
@@ -116,9 +119,9 @@ class GolfNet_v8(nn.Module):
         )
 
         # ---------- Stage 2: U-Net 式空间聚合 (替代 SpatialSummary + PixelTemporal) ----------
-        if summary_type not in ("full", "lite", "lite_interp"):
+        if summary_type not in ("full", "lite", "lite_interp", "g"):
             raise ValueError(
-                f"summary_type 必须是 'full' / 'lite' / 'lite_interp', "
+                f"summary_type 必须是 'full' / 'lite' / 'lite_interp' / 'g', "
                 f"收到 {summary_type!r}")
         self.summary_type = summary_type
         if summary_type in ("lite", "lite_interp"):
@@ -126,6 +129,10 @@ class GolfNet_v8(nn.Module):
             self.summary = TemporalAggregatorLite(
                 list(encoder_channels), num_frames=num_frames, wkv_mode=wkv_mode,
                 upsample_type=up,
+            )
+        elif summary_type == "g":
+            self.summary = TemporalAggregator_G(
+                list(encoder_channels), num_frames=num_frames, wkv_mode=wkv_mode,
             )
         else:
             self.summary = TemporalAggregator(
