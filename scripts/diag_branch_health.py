@@ -115,7 +115,8 @@ def main():
             w = out.get("fusion_weights")
             if getattr(model, "sgrf", None) is not None:
                 # 串接融合没有逐像素权重, 记录各段缩放系数 (按 N/L/M 顺序)
-                sc = model.sgrf._scale_all()
+                sc = (model.sgrf._amp_all() if hasattr(model.sgrf, "_amp_all")
+                      else model.sgrf._scale_all())
                 order = model.sgrf.stage_order
                 acc["wN"].append(float(sc[order.index("N")]))
                 acc["wL"].append(float(sc[order.index("L")]))

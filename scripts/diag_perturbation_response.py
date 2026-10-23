@@ -194,7 +194,8 @@ def main():
                     # 串接融合没有逐像素权重, 这一列改报各段的缩放系数;
                     # 置零代价用真实前向测量: 跳过某一段后, 后续各段的输入也随之改变,
                     # 这正是串接结构下"去掉一段"的真实代价。
-                    scales = model.sgrf._scale_all()
+                    scales = (model.sgrf._amp_all() if hasattr(model.sgrf, "_amp_all")
+                              else model.sgrf._scale_all())
                     order = model.sgrf.stage_order
                     for b in BRANCH_KEYS:
                         row[f"w_{b}"].append(float(scales[order.index(b)]))

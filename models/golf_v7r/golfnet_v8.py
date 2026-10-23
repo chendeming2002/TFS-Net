@@ -46,6 +46,7 @@ from models.golf_v7r.temporal_aggregator_lite import TemporalAggregatorLite
 from models.golf_v7r.triple_query_tca_v9 import TaskQueryAttention
 from models.golf_v7r.fusion_v7r import V7RFusion
 from models.golf_v7r.sgrf_v8 import SGRFv8
+from models.golf_v7r.sgrf_v9 import SGRFv9
 from models.golf_v7r.branch_n_simple import NBranch
 from models.golf_v7r.branch_l_simple import LBranch
 from models.golf_v7r.branch_m_simple import MBranch
@@ -67,7 +68,9 @@ class GolfNet_v8(nn.Module):
         q_mode: "receptance" (旧的 sigmoid(Q) 门控) 或 "cross_rwkv"
             (Cross RWKV Gate, R/G 双查询; 见 docs/v8/06-CrossRWKVGate-Q重构设计.md)
         fusion_mode: 除 V7RFusion 的四种模式外, "sgrf" 表示用 SGRFv8 分阶段串接融合
-            (N → L → M 加性累加, 每级输入上一级输出; 见 models/golf_v7r/sgrf_v8.py)
+            (N → L → M 加性累加, 每级输入上一级输出; 见 models/golf_v7r/sgrf_v8.py);
+            "sgrf_v9" 表示 SGRFv9 门控渐进式恢复 (每段空间自适应门控 + 有界幅度校准;
+            见 models/golf_v7r/sgrf_v9.py)
         summary_type: "full" 为原 TemporalAggregator (学习式帧权重);
             "lite" 为 v8.5 A 方案 (非中心帧均值 + Conv/PixelShuffle 上采样);
             "lite_interp" 与 "lite" 相同, 但上采样用原项目的 Conv3x3 + 双线性插值。
@@ -151,9 +154,12 @@ class GolfNet_v8(nn.Module):
                                       at_f1=True)
 
         # ---------- Stage 5: 融合 ----------
-        if fusion_mode == "sgrf":
+        if fusion_mode in ("sgrf", "sgrf_v9"):
             self.fusion = None
-            self.sgrf = SGRFv8(channels=self.branch_channels)
+            if fusion_mode == "sgrf":
+                self.sgrf = SGRFv8(channels=self.branch_channels)
+            else:
+                self.sgrf = SGRFv9(feat_channels=self.branch_channels)
         else:
             self.fusion = V7RFusion(in_channels=3, hidden_channels=32,
                                     num_blocks=2, mode=fusion_mode,
@@ -212,6 +218,9 @@ class GolfNet_v8(nn.Module):
                 zero_stage=zero_stage)
             out_N, out_L, out_M = fusion_out["Y_N"], fusion_out["Y_L"], fusion_out["Y_M"]
             weights = None
+            self._last_stage_stats = fusion_out.get("stage_stats")
+            gate_reg = fusion_out.get("gate_reg")
+            self._last_gate_reg = gate_reg
         else:
             out_N = self.branch_N(F_N)["Y_N"]
             out_L = self.branch_L(F_L, X_center)["Y_L"]
@@ -228,6 +237,8 @@ class GolfNet_v8(nn.Module):
             "frame_weights": summary.get("frame_weights", None),
             "ortho_loss": ortho,
             "fusion_weights": weights,
+            "stage_stats": getattr(self, "_last_stage_stats", None),
+            "gate_reg": getattr(self, "_last_gate_reg", None),
         }
 
 

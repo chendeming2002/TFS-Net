@@ -36,6 +36,7 @@ class GolfV7RLoss(nn.Module):
                  w_branch_M: float = 0.1,
                  lambda_ortho: float = 0.01,
                  w_ssim: float = 0.0,
+                 w_gate_reg: float = 0.0,
                  branch_warmup_epochs: int = 5,
                  use_lowfreq_L: bool = False,
                  lowfreq_kernel: int = 16,
@@ -73,6 +74,7 @@ class GolfV7RLoss(nn.Module):
         self.w_branch_M = w_branch_M
         self.lambda_ortho = lambda_ortho
         self.w_ssim = w_ssim
+        self.w_gate_reg = float(w_gate_reg)
         self.branch_warmup_epochs = branch_warmup_epochs
         self.use_lowfreq_L = use_lowfreq_L
         self.lowfreq_kernel = int(lowfreq_kernel) if lowfreq_kernel else 16
@@ -261,6 +263,11 @@ class GolfV7RLoss(nn.Module):
                     loss_dict[key] = bl
 
         # 正交约束 (作用在【特征层】F_*)
+        # 阶段门控正则 (SGRFv9): 防止门饱和后该段失去调节能力
+        if output_dict.get('gate_reg') is not None and self.w_gate_reg > 0:
+            loss = loss + self.w_gate_reg * output_dict['gate_reg']
+            loss_dict['gate_reg'] = output_dict['gate_reg']
+
         if 'ortho_loss' in output_dict and self.lambda_ortho > 0:
             ol = output_dict['ortho_loss']
             loss = loss + self.lambda_ortho * ol
