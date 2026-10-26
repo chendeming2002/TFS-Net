@@ -1,0 +1,64 @@
+## QRB 变体单变量对照: q_mode=cross_rwkv (30 epoch)
+##
+## 相对 configs/v8_5/g_sgrf10_30ep.yaml 只改 q_mode 与输出目录,
+## 上游 (TemporalAggregator_G)、融合 (SGRFv10)、数据、优化器、学习率、seed、验证全部相同。
+seed: 42
+output_dir: outputs/v8_5_g_sgrf10_qrb_cross_rwkv_30ep
+dataset:
+  train_input_root: /home/a1005/yzy/dataset/SDSD/indoor/input
+  train_target_root: /home/a1005/yzy/dataset/SDSD/indoor/GT
+  val_input_root: /home/a1005/yzy/dataset/SDSD/test/low-light
+  val_target_root: /home/a1005/yzy/dataset/SDSD/test/GT
+  window_size: 5
+  crop_size: 256
+  num_workers: 6
+  pairing: position
+  branch_target_kernel_low: 31
+  branch_target_kernel_high: 5
+  branch_target_motion_share_mid: 0.5
+  branch_target_motion_share_high: 0.2
+model:
+  arch: v8
+  num_frames: 5
+  encoder_channels:
+  - 32
+  - 64
+  - 128
+  encoder_loops: 2
+  temporal_loops: 2
+  spatial_head: v8
+  wkv_mode: single_norm
+  channel_mix_rate: 4
+  use_omni_shift: true
+  use_channel_mix: true
+  lowpass_kernel: 9
+  branch_blocks: 2
+  fusion_mode: sgrf_v9
+  fusion_weight_floor: 0.1
+  fusion_residual_freeze: true
+  branch_m_single_frame: true
+  q_mode: cross_rwkv
+  summary_type: g
+train:
+  batch_size: 2
+  epochs: 30
+  lr: 0.0005657
+  weight_decay: 0.01
+  log_interval: 100
+  val_interval: 5
+  grad_clip: 1.0
+  ckpt_interval: 500
+  lpips_net: vgg
+loss:
+  w_branch_N: 0.3
+  w_branch_L: 0.3
+  w_branch_M: 0.3
+  lambda_ortho: 0.01
+  # 门控正则: 防止某段门饱和到 0/1 后失去调节能力 (SGRFv9 专用, 其余融合模式自动忽略)
+  w_gate_reg: 0.05
+  w_ssim: 0.0
+  branch_warmup_epochs: 5
+  use_lowfreq_L: false
+  lowfreq_kernel: 16
+  branch_specific_targets: true
+  branch_target_normalize: true

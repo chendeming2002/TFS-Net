@@ -35,6 +35,8 @@ from models.modules.blocks import LayerNorm2d
 from models.golf_r4.tca_rwkv import RWKVSpatialHead
 from models.golf_v7r.spatial_rwkv_head_v8 import SpatialRWKVHeadV8
 from models.golf_v7r.cross_rwkv_head_v8 import CrossRWKVHeadV8
+from models.golf_v7r.qrb_variants import (
+    CrossRWKVHeadKvMod, CrossRWKVHeadQPath, CrossRWKVHeadGateCtx)
 
 
 class TaskQueryAttention(nn.Module):
@@ -47,7 +49,9 @@ class TaskQueryAttention(nn.Module):
         lowpass_kernel: 低频分离用的平均池化核 (M 的高频残差与 L 的低频趋势共用)
         q_mode: "receptance" 为旧的 sigmoid(q) 门控; "cross_rwkv" 使用
             CrossRWKVHeadV8, R/G 直接接收特征图 (N/L 传多帧聚合, M 传中心帧),
-            不再经过 query_* 卷积。见 docs/v8/06-CrossRWKVGate-Q重构设计.md
+            不再经过 query_* 卷积。见 docs/v8/06-CrossRWKVGate-Q重构设计.md。
+            另支持三个单变量变体, 见 docs/v8/12-QRB改进方向评估.md:
+            "kvmod"  Q 条件化 K 调制; "qpath"  受控 Q 内容支路; "gatectx" R/G 局部上下文
     """
 
     def __init__(self, feat_dim: int = 32, spatial_head: str = "v8",
@@ -60,9 +64,10 @@ class TaskQueryAttention(nn.Module):
         self.lowpass_kernel = int(lowpass_kernel)
         if spatial_head not in ("legacy", "v8"):
             raise ValueError(f"spatial_head 必须是 'legacy' 或 'v8', 收到 {spatial_head!r}")
-        if q_mode not in ("receptance", "cross_rwkv"):
-            raise ValueError(f"q_mode 必须是 'receptance' 或 'cross_rwkv', 收到 {q_mode!r}")
-        if q_mode == "cross_rwkv" and spatial_head != "v8":
+        if q_mode not in ("receptance", "cross_rwkv", "kvmod", "qpath", "gatectx"):
+            raise ValueError(
+                f"q_mode 必须是 receptance/cross_rwkv/kvmod/qpath/gatectx, 收到 {q_mode!r}")
+        if q_mode != "receptance" and spatial_head != "v8":
             raise ValueError("cross_rwkv 查询只实现于 spatial_head='v8'")
         self.spatial_head_kind = spatial_head
         self.q_mode = q_mode
@@ -98,7 +103,10 @@ class TaskQueryAttention(nn.Module):
                            "use_channel_mix": use_channel_mix,
                            "num_directions": num_directions,
                            "wkv_mode": wkv_mode}
-            head_cls = CrossRWKVHeadV8 if q_mode == "cross_rwkv" else SpatialRWKVHeadV8
+            head_cls = {"cross_rwkv": CrossRWKVHeadV8,
+                        "kvmod": CrossRWKVHeadKvMod,
+                        "qpath": CrossRWKVHeadQPath,
+                        "gatectx": CrossRWKVHeadGateCtx}.get(q_mode, SpatialRWKVHeadV8)
         else:
             head_kwargs = {"num_directions": num_directions, "wkv_mode": wkv_mode}
             head_cls = RWKVSpatialHead
@@ -136,7 +144,7 @@ class TaskQueryAttention(nn.Module):
         #   N: 单帧减多帧聚合。这个差值就是帧间不一致量, 物理上对应成像噪声:
         #      场景结构在帧间稳定, 相减后保留下来的是各帧独立的噪声及其相位,
         #      而多帧聚合本身已经把噪声平均掉, 用它做查询等于问一个看不到噪声的信号。
-        if self.q_mode == "cross_rwkv":
+        if self.q_mode != "receptance":
             noise_query = F1_single - F1_multi
             Q_N, Q_L, Q_M = noise_query, F1_multi, F1_single
         else:
@@ -151,7 +159,7 @@ class TaskQueryAttention(nn.Module):
         #   L: 中心帧。光照是当前帧自身的属性, 多帧平均会把曝光变化抹平,
         #      与要预测的中心帧光照图错位。R/G 仍取多帧聚合, 提供跨帧结构参照。
         #   M: 中心帧。与它不引入跨帧运算的约定一致。
-        if self.q_mode == "cross_rwkv":
+        if self.q_mode != "receptance":
             kv_N = self.kv_proj_N(F1_multi)
             kv_L = self.kv_proj_L(F1_single)
             kv_M = self.kv_proj_M(F1_single)
@@ -175,7 +183,7 @@ class TaskQueryAttention(nn.Module):
         #   L: 全带 KV 时以中心帧为基。注意力在中心帧的光照内容上检索, 结果应加回
         #      同一来源, 否则等于把中心帧的光照修正量叠加到多帧平均上, 两处位移不一致。
         #   M: 以单帧为基, 避免"注意力算的是单帧、残差却加多帧"的混用。
-        L_base = F1_single if self.q_mode == "cross_rwkv" else F1_multi
+        L_base = F1_single if self.q_mode != "receptance" else F1_multi
         F_N = self.out_norm_N(F1_multi + attn_N * self.scale_N)
         F_L = self.out_norm_L(L_base + attn_L * self.scale_L)
         F_M = self.out_norm_M(F1_single + attn_M * self.scale_M)
