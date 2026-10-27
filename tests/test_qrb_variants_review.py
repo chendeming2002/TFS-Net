@@ -132,10 +132,10 @@ def test_gatectx_isolation():
         assert torch.allclose(v_a, v_b, atol=0), "ctx 不应影响 V 投影"
     print("  [ok] K/V 投影不受 ctx 影响 (逐元素相同)")
 
-    # R/G 经 ctx 后与不经 ctx 应不同
+    # R/G 经 ctx 后与不经 ctx 应不同 (基类路径 vs gatectx 路径, ctx 零初始化)
     with torch.no_grad():
-        r0 = m._project(c, m.shift_r, m.proj_r, None)
-        r1 = m._project(c, m.shift_r, m.proj_r, m.ctx_r)
+        r0 = CrossRWKVHeadV8._make_r(m, c)   # 无 ctx 的基类路径
+        r1 = m._make_r(c)                    # gatectx 路径 (ctx 零初始化)
     d = (r0 - r1).abs().mean().item()
     # 零初始化时 ctx 输出为零, R 投影应与不加 ctx 时一致
     assert d == 0.0, f"零初始化后 ctx 仍改变 R 投影 (差 {d:.2e})"

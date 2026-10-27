@@ -12,7 +12,8 @@
 - **方案 C (门控局部上下文)**: R/G 的投影之前各加一次 3×3 深度卷积的局部上下文,
   测试门控表达能力是否是瓶颈。
 
-三个变体都只继承 `CrossRWKVHeadV8` 的扫描与初始化, 不重复实现 WKV 逻辑。
+三个变体都只重写基类的钩子 (`_make_r` / `_make_g` / `_modulate_k`), 不复制前向;
+基类后续的结构演进 (残差、SPAB 等) 自动作用于全部变体。
 """
 from __future__ import annotations
 
@@ -58,49 +59,9 @@ class CrossRWKVHeadKvMod(CrossRWKVHeadV8):
         }
         return k_tokens * scale.unsqueeze(1) + shift.unsqueeze(1)
 
-    def forward(self, center_feat: torch.Tensor,
-                context_feat: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = center_feat.shape
-        r = self._project(center_feat, self.shift_r, self.proj_r)
-        g = self._project(center_feat, self.shift_g, self.proj_g)
-        k = self._project(context_feat, self.shift_k, self.proj_k)
-        k = self._modulate_k(center_feat, k)                # 方案 A 的唯一改动
-        v = self._project(context_feat, self.shift_v, self.proj_v)
-
-        D, hd = self.num_dirs, self.head_dim
-        r = r.view(B, H * W, D, hd)
-        g = torch.nn.functional.silu(g.view(B, H * W, D, hd))
-
-        scan_fns = self._scan_fns()
-        k_list, v_list = [], []
-        for i, scan_fn in enumerate(scan_fns):
-            k_2d = k[:, :, i * hd:(i + 1) * hd].transpose(1, 2).reshape(B, hd, H, W)
-            v_2d = v[:, :, i * hd:(i + 1) * hd].transpose(1, 2).reshape(B, hd, H, W)
-            k_list.append(scan_fn(k_2d))
-            v_list.append(scan_fn(v_2d))
-        from models.modules.batched_wkv import batched_scan
-        wkv_list = batched_scan(self.bi_wkv_list, k_list, v_list, total_tokens=H * W)
-
-        heads = []
-        for i, scan_fn in enumerate(scan_fns):
-            wkv_i = wkv_list[i][:, self._inv_index(scan_fn, B, hd, H, W,
-                                                   center_feat.device)]
-            heads.append(g[:, :, i] * self.head_norm(r[:, :, i] * wkv_i))
-        out = torch.cat(heads, dim=-1)
-        out = self.proj_out(out)
-        out = out.transpose(1, 2).reshape(B, C, H, W)
-
-        if self.use_channel_mix:
-            a = self.post_norm(out.flatten(2).transpose(1, 2))
-            r2 = self.cm_r(a)
-            k2 = self.cm_k(a)
-            if self.cm_act == "relu_sq":
-                v2 = torch.relu(k2).pow(2)
-            else:
-                v2 = torch.nn.functional.leaky_relu(k2, 0.01).pow(2)
-            a2 = torch.sigmoid(r2) * self.cm_v(v2)
-            out = out + self.cm_out(a2).transpose(1, 2).reshape(B, C, H, W)
-        return out
+    # 前向完全继承基类: 基类 forward 在 K 投影后调用 _modulate_k 钩子。
+    # 不允许在此复制前向 —— 1027 之后基类加了输入残差与 R 路径 SPAB,
+    # 拷贝会让变体静默落后于基线结构, 单变量对照失效 (审查发现的回归, 已删除)。
 
 
 class CrossRWKVHeadQPath(CrossRWKVHeadV8):
@@ -160,57 +121,21 @@ class CrossRWKVHeadGateCtx(CrossRWKVHeadV8):
         else:
             self.ctx_r = self.ctx_g = None
 
-    def _project(self, x_2d, shift, proj, ctx=None):
-        """Q-Shift → 局部上下文 (可选) → 归一化 → 线性投影。"""
-        if shift is not None:
-            x_2d = shift(x_2d)
-        if ctx is not None:
-            x_2d = x_2d + ctx(x_2d)          # 残差注入, 保留原路径
-        tokens = self.pre_norm(x_2d.flatten(2).transpose(1, 2))
-        return proj(tokens)
+    def _make_r(self, center_feat: torch.Tensor) -> torch.Tensor:
+        """基类 R 路径 + 局部上下文残差 (ctx 零初始化 → 起步与基类一致)。"""
+        if self.spab_r is not None:
+            r_in = self.shift_r(center_feat)
+            r_in = self.spab_r(r_in)[0]
+            r_in = r_in + self.ctx_r(r_in)          # 局部上下文, 保留原路径
+            r_in = self.pre_norm(r_in.flatten(2).transpose(1, 2))
+            return self.proj_r(r_in)
+        return super()._make_r(center_feat)         # use_omni_shift=False 时 ctx 本为 None
 
-    def forward(self, center_feat: torch.Tensor,
-                context_feat: torch.Tensor) -> torch.Tensor:
-        r = self._project(center_feat, self.shift_r, self.proj_r, self.ctx_r)
-        g = self._project(center_feat, self.shift_g, self.proj_g, self.ctx_g)
-        k = self._project(context_feat, self.shift_k, self.proj_k)
-        v = self._project(context_feat, self.shift_v, self.proj_v)
-        return self._finish(center_feat, r, g, k, v)
+    def _make_g(self, center_feat: torch.Tensor) -> torch.Tensor:
+        if self.ctx_g is not None:
+            g_in = self.shift_g(center_feat)
+            g_in = g_in + self.ctx_g(g_in)
+            tokens = self.pre_norm(g_in.flatten(2).transpose(1, 2))
+            return self.proj_g(tokens)
+        return super()._make_g(center_feat)
 
-    def _finish(self, center_feat, r, g, k, v):
-        """与原 forward 相同的后半段, 从扫描开始。"""
-        B, C, H, W = center_feat.shape
-        D, hd = self.num_dirs, self.head_dim
-        r = r.view(B, H * W, D, hd)
-        g = torch.nn.functional.silu(g.view(B, H * W, D, hd))
-
-        scan_fns = self._scan_fns()
-        k_list, v_list = [], []
-        for i, scan_fn in enumerate(scan_fns):
-            k_2d = k[:, :, i * hd:(i + 1) * hd].transpose(1, 2).reshape(B, hd, H, W)
-            v_2d = v[:, :, i * hd:(i + 1) * hd].transpose(1, 2).reshape(B, hd, H, W)
-            k_list.append(scan_fn(k_2d))
-            v_list.append(scan_fn(v_2d))
-        from models.modules.batched_wkv import batched_scan
-        wkv_list = batched_scan(self.bi_wkv_list, k_list, v_list, total_tokens=H * W)
-
-        heads = []
-        for i, scan_fn in enumerate(scan_fns):
-            wkv_i = wkv_list[i][:, self._inv_index(scan_fn, B, hd, H, W,
-                                                   center_feat.device)]
-            heads.append(g[:, :, i] * self.head_norm(r[:, :, i] * wkv_i))
-        out = torch.cat(heads, dim=-1)
-        out = self.proj_out(out)
-        out = out.transpose(1, 2).reshape(B, C, H, W)
-
-        if self.use_channel_mix:
-            a = self.post_norm(out.flatten(2).transpose(1, 2))
-            r2 = self.cm_r(a)
-            k2 = self.cm_k(a)
-            if self.cm_act == "relu_sq":
-                v2 = torch.relu(k2).pow(2)
-            else:
-                v2 = torch.nn.functional.leaky_relu(k2, 0.01).pow(2)
-            a2 = torch.sigmoid(r2) * self.cm_v(v2)
-            out = out + self.cm_out(a2).transpose(1, 2).reshape(B, C, H, W)
-        return out

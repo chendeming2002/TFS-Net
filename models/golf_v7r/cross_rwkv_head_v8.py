@@ -42,6 +42,29 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.golf_v7r.spatial_rwkv_head_v8 import OmniShift, SpatialRWKVHeadV8
+
+
+class SPAB(nn.Module):
+    """SPAN (CVPR 2024) 的参数无关注意力块, 搬运自 hongyuanyu/SPAN。
+
+    与原始实现的差别: 只用它的特征提取与对称激活部分, 不返回中间量;
+    末层 bias 初始化为 1, 保证初始时 sigmoid(out3) - 0.5 在 0 附近对称。
+    """
+    def __init__(self, channels: int):
+        super().__init__()
+        self.c1 = nn.Conv2d(channels, channels, 3, 1, 1, bias=True)
+        self.c2 = nn.Conv2d(channels, channels, 3, 1, 1, bias=True)
+        self.c3 = nn.Conv2d(channels, channels, 3, 1, 1, bias=True)
+        self.act = nn.SiLU(inplace=True)
+        nn.init.constant_(self.c3.bias, 1.0)
+
+    def forward(self, x):
+        o1 = self.act(self.c1(x))
+        o2 = self.act(self.c2(o1))
+        o3 = self.c3(o2)
+        sim_att = torch.sigmoid(o3) - 0.5
+        return (o3 + x) * sim_att, o1, sim_att
+
 from models.modules.batched_wkv import batched_scan
 
 
@@ -89,8 +112,14 @@ class CrossRWKVHeadV8(SpatialRWKVHeadV8):
             self.shift_r = self.shift_g = self.shift_k = self.shift_v = None
 
         # ---------- R/G 双查询 ----------
+        # R 的生成: OmniShift → SPAB → proj_r (SPAB 提供局部特征提取与残差引导)
+        # G 的生成: 保持 shift_g → proj_g 不变
         self.proj_r = nn.Linear(channels, channels, bias=False)
         self.proj_g = nn.Linear(channels, channels, bias=True)
+        if self.use_omni_shift:
+            self.spab_r = SPAB(channels)
+        else:
+            self.spab_r = None
 
         # ---------- 逐头 LayerNorm ----------
         self.head_norm = nn.LayerNorm(self.head_dim)
@@ -131,6 +160,23 @@ class CrossRWKVHeadV8(SpatialRWKVHeadV8):
         tokens = self.pre_norm(x_2d.flatten(2).transpose(1, 2))
         return proj(tokens)
 
+    def _make_r(self, center_feat: torch.Tensor) -> torch.Tensor:
+        """R 的生成。QRB 变体 (gatectx) 重写此钩子注入局部上下文。"""
+        if self.spab_r is not None:
+            r_in = self.shift_r(center_feat)
+            r_in = self.spab_r(r_in)[0]             # SPAB 返回 (out, out1, sim_att)
+            r_in = self.pre_norm(r_in.flatten(2).transpose(1, 2))
+            return self.proj_r(r_in)
+        return self._project(center_feat, self.shift_r, self.proj_r)
+
+    def _make_g(self, center_feat: torch.Tensor) -> torch.Tensor:
+        """G 的生成。"""
+        return self._project(center_feat, self.shift_g, self.proj_g)
+
+    def _modulate_k(self, center_feat: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+        """K 在进入扫描前的钩子, 基类恒等 (QRB 变体 kvmod 在此注入调制)。"""
+        return k
+
     def forward(self, center_feat: torch.Tensor,
                 context_feat: torch.Tensor) -> torch.Tensor:
         """center_feat 生成 R/G, context_feat 生成 K/V。两者均为 (B, C, H, W)。"""
@@ -138,9 +184,10 @@ class CrossRWKVHeadV8(SpatialRWKVHeadV8):
         D = self.num_dirs
         hd = self.head_dim
 
-        r = self._project(center_feat, self.shift_r, self.proj_r)
-        g = self._project(center_feat, self.shift_g, self.proj_g)
+        r = self._make_r(center_feat)
+        g = self._make_g(center_feat)
         k = self._project(context_feat, self.shift_k, self.proj_k)
+        k = self._modulate_k(center_feat, k)
         v = self._project(context_feat, self.shift_v, self.proj_v)
 
         r = r.view(B, H * W, D, hd)
@@ -166,6 +213,10 @@ class CrossRWKVHeadV8(SpatialRWKVHeadV8):
 
         out = self.proj_out(out)
         out = out.transpose(1, 2).reshape(B, C, H, W)
+
+        # Spatial Mix 的残差从 Q 输入出发 (与 Restore-RWKV 的 Block 一致):
+        # Q 决定读取方式, 读取结果与 Q 自身的特征相加, 保证 Q 的内容不被扫描抹掉。
+        out = out + center_feat
 
         if self.use_channel_mix:
             a = self.post_norm(out.flatten(2).transpose(1, 2))   # (B, N, C)

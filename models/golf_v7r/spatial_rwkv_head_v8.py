@@ -278,6 +278,9 @@ class SpatialRWKVHeadV8(nn.Module):
         out = self.proj_out(out)
         out = out.transpose(1, 2).reshape(B, C, H, W)
 
+        # Spatial Mix 的残差: 与 Restore-RWKV 的 Block 一致 (x + att(LN(x)))
+        out = out + center_feat
+
         # Channel Mix: 逐位置跨通道变换 (末层零初始化 → 初始恒等, 梯度可达)
         if self.use_channel_mix:
             cm = self.channel_mix(self.post_norm(out.flatten(2).transpose(1, 2)))
