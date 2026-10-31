@@ -58,7 +58,8 @@ class TaskQueryAttention(nn.Module):
                  wkv_mode: str = "single_norm", lowpass_kernel: int = 9,
                  num_directions: int = 4, channel_mix_rate: int = 4,
                  use_omni_shift: bool = True, use_channel_mix: bool = True,
-                 q_mode: str = "receptance"):
+                 q_mode: str = "receptance",
+                 q_shift_share: str = "none", cm_shift: bool = False):
         super().__init__()
         self.feat_dim = feat_dim
         self.lowpass_kernel = int(lowpass_kernel)
@@ -103,6 +104,11 @@ class TaskQueryAttention(nn.Module):
                            "use_channel_mix": use_channel_mix,
                            "num_directions": num_directions,
                            "wkv_mode": wkv_mode}
+            # v8.8 的 QRB 内部结构开关, 只对 cross 系列头有意义 (基类
+            # SpatialRWKVHeadV8 与 RWKVSpatialHead 不接受这两个参数)
+            if q_mode != "receptance":
+                head_kwargs["shift_share"] = q_shift_share
+                head_kwargs["cm_shift"] = cm_shift
             head_cls = {"cross_rwkv": CrossRWKVHeadV8,
                         "kvmod": CrossRWKVHeadKvMod,
                         "qpath": CrossRWKVHeadQPath,

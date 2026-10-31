@@ -38,7 +38,7 @@ class FrameEncoder(nn.Module):
                  num_blocks_per_scale: List[int] = None,
                  block_type: str = "naf",
                  wkv_mode: str = "legacy",
-                 block_loops: int = 1):
+                 block_loops: int = 1, cm_shift: bool = False):
         super().__init__()
         if out_channels_list is None:
             out_channels_list = [32, 64, 128]
@@ -59,7 +59,8 @@ class FrameEncoder(nn.Module):
             # 与 num_blocks_per_scale (堆几个独立 block, 参数 ×N) 是两个不同维度。
             from models.golf_v7r.rwkv_encoder_block import RWKVEncoderBlock
             return nn.Sequential(*[RWKVEncoderBlock(channels, wkv_mode=wkv_mode,
-                                                    num_loops=block_loops)
+                                                    num_loops=block_loops,
+                                                    cm_shift=cm_shift)
                                    for _ in range(count)])
 
         # 入口 conv: RGB → C1

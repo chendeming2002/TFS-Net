@@ -77,8 +77,10 @@ class LBranch(nn.Module):
 
         x = self.refine_norm(self.refine_blocks(F_L))
 
-        # 光照图: 分辨率随输入 —— at_f1=True 时即 [B,1,H,W] 全分辨率
-        L_map = torch.sigmoid(self.illum_head(x))
+        # 光照图: 对数域预测, 避免 sigmoid 在两端饱和
+        # exp(0) = 1, 与 sigmoid 的初始 0.5 不同, 但 R_t = X_t / L_t 在 L_t=1 时
+        # 给出 R_t = X_t, 是恒等起点。clamp 到 [-3, 3] 限制范围在 [0.05, 20]。
+        L_map = torch.exp(torch.clamp(self.illum_head(x), -3.0, 3.0))
 
         # 特征上采样 (F1 模式直接用全分辨率特征)
         x_up = x if self.at_f1 else self.upsample(x)

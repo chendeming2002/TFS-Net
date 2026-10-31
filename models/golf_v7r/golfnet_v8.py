@@ -98,7 +98,9 @@ class GolfNet_v8(nn.Module):
                  fusion_residual_freeze: bool = True,
                  branch_m_single_frame: bool = True,
                  q_mode: str = "receptance",
-                 summary_type: str = "full"):
+                 summary_type: str = "full",
+                 q_shift_share: str = "none", cm_shift: bool = False,
+                 enc_cm_shift: bool = False):
         super().__init__()
         self.num_frames = num_frames
         self.C1, self.C2, self.C3 = encoder_channels
@@ -116,6 +118,7 @@ class GolfNet_v8(nn.Module):
             block_type="rwkv",
             wkv_mode=wkv_mode,
             block_loops=encoder_loops,
+            cm_shift=enc_cm_shift,
         )
 
         # ---------- Stage 2: U-Net 式空间聚合 (替代 SpatialSummary + PixelTemporal) ----------
@@ -145,7 +148,7 @@ class GolfNet_v8(nn.Module):
             feat_dim=self.C1, spatial_head=spatial_head, wkv_mode=wkv_mode,
             lowpass_kernel=lowpass_kernel, channel_mix_rate=channel_mix_rate,
             use_omni_shift=use_omni_shift, use_channel_mix=use_channel_mix,
-            q_mode=q_mode,
+            q_mode=q_mode, q_shift_share=q_shift_share, cm_shift=cm_shift,
         )
 
         # ---------- Stage 4: 三分支 (F1 尺度直出, 不再上采样) ----------
@@ -229,7 +232,7 @@ class GolfNet_v8(nn.Module):
             gate_reg = fusion_out.get("gate_reg")
             self._last_gate_reg = gate_reg
         else:
-            out_N = self.branch_N(F_N)["Y_N"]
+            out_N = self.branch_N(F_N, X_center)["Y_N"]
             out_L = self.branch_L(F_L, X_center)["Y_L"]
             # BranchM 在单帧模式下只用 F_M; 传 F2_single 仅为保持接口一致
             out_M = self.branch_M(F_M, F2_single.unsqueeze(1))["Y_M"]

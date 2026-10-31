@@ -121,7 +121,7 @@ class SpatialRWKVHeadV8(nn.Module):
 
     def __init__(self, channels: int, num_directions: int = 4, hidden_rate: int = 4,
                  use_omni_shift: bool = True, use_channel_mix: bool = True,
-                 wkv_mode: str = "legacy"):
+                 wkv_mode: str = "legacy", cm_shift: bool = False):
         super().__init__()
         assert channels % num_directions == 0, \
             f"channels({channels}) 必须能被 num_directions({num_directions}) 整除"
@@ -172,6 +172,19 @@ class SpatialRWKVHeadV8(nn.Module):
             )
         else:
             self.channel_mix = None
+
+        # Channel Mix 的 Token Shift (v8.8): 对照 Restore-RWKV 的 VRWKV_ChannelMix,
+        # 其输入先过 omni_shift 再进投影。此前我们只给 Spatial Mix 配了 Shift,
+        # Channel Mix 一直是素输入, 属于 v8 整理时漏掉的迁移项。
+        # 恒等初始化 (alpha=[1,0,0,0] → 初始输出 = x): 初始行为与无 Shift 完全一致,
+        # 性能变化只来自训练中 Shift 学到的东西。
+        if cm_shift and self.use_channel_mix:
+            self.cm_shift = OmniShift(channels)
+            with torch.no_grad():
+                self.cm_shift.alpha.fill_(0.0)
+                self.cm_shift.alpha[0].fill_(1.0)
+        else:
+            self.cm_shift = None
 
         self._init_weights()
         self._idx_cache: dict = {}
@@ -283,7 +296,8 @@ class SpatialRWKVHeadV8(nn.Module):
 
         # Channel Mix: 逐位置跨通道变换 (末层零初始化 → 初始恒等, 梯度可达)
         if self.use_channel_mix:
-            cm = self.channel_mix(self.post_norm(out.flatten(2).transpose(1, 2)))
+            cm_in = self.cm_shift(out) if self.cm_shift is not None else out
+            cm = self.channel_mix(self.post_norm(cm_in.flatten(2).transpose(1, 2)))
             out = out + cm.transpose(1, 2).reshape(B, C, H, W)
 
         return out

@@ -127,7 +127,7 @@ class SGRFv8(nn.Module):
                 f_in = f_in + proj(prev)
 
             if name == "N":
-                y_new = branches["N"](f_in)["Y_N"]
+                y_new = branches["N"](f_in, X_t)["Y_N"]
             elif name == "L":
                 y_new = branches["L"](f_in, X_t)["Y_L"]
             else:

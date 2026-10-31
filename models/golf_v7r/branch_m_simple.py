@@ -136,6 +136,14 @@ class MBranch(nn.Module):
             nn.Conv2d(channels * num_inputs, channels, 1, bias=True),
             LayerNorm2d(channels),
         )
+        # 多尺度局部去模糊: 三路膨胀深度卷积, 并行后 1×1 融合, 零初始化残差注入。
+        # 不引入光流, 不跨帧, 只在空间域扩展局部感受野。
+        self.ms_conv1 = nn.Conv2d(channels, channels, 3, 1, 1, groups=channels, bias=False)
+        self.ms_conv2 = nn.Conv2d(channels, channels, 3, 1, 2, groups=channels, bias=False, dilation=2)
+        self.ms_conv3 = nn.Conv2d(channels, channels, 3, 1, 3, groups=channels, bias=False, dilation=3)
+        self.ms_fuse = nn.Conv2d(channels * 3, channels, 1, bias=True)
+        nn.init.zeros_(self.ms_fuse.weight)
+        nn.init.zeros_(self.ms_fuse.bias)
         self.refine_blocks = nn.Sequential(*[
             NAFBlock(channels) for _ in range(num_blocks)
         ])
@@ -190,6 +198,10 @@ class MBranch(nn.Module):
             conf_map = torch.ones(B, 1, H, W, device=F_M.device, dtype=F_M.dtype)
         else:
             aggregated, flow_vis, conf_map = self._align_and_aggregate(F_M, F2_seq)
+        ms = torch.cat([self.ms_conv1(aggregated),
+                        self.ms_conv2(aggregated),
+                        self.ms_conv3(aggregated)], dim=1)
+        aggregated = aggregated + self.ms_fuse(ms)
         x = self.refine_blocks(aggregated)
         if not self.at_f1:
             x = self.upsample(x)

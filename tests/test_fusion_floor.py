@@ -99,7 +99,11 @@ def test_backward_compat():
     if os.path.exists(ckpt):
         ck = torch.load(ckpt, map_location="cpu", weights_only=False)
         r = GolfNet_v7r_v3().load_state_dict(ck["model_state_dict"], strict=False)
-        allowed_missing = {"branch_M.to_rgb_norm.weight", "branch_M.to_rgb_norm.bias"}
+        allowed_missing = {"branch_M.to_rgb_norm.weight", "branch_M.to_rgb_norm.bias",
+                           # v8.7 的 MBranch 多尺度局部去模糊模块 (ms_conv1/2/3, ms_fuse)
+                           "branch_M.ms_conv1.weight", "branch_M.ms_conv2.weight",
+                           "branch_M.ms_conv3.weight", "branch_M.ms_fuse.weight",
+                           "branch_M.ms_fuse.bias"}
         unexpected_missing = set(r.missing_keys) - allowed_missing
         assert not unexpected_missing, f"出现预期外的缺失键: {unexpected_missing}"
         assert not r.unexpected_keys, f"出现多余键: {r.unexpected_keys}"

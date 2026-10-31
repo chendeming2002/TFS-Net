@@ -84,7 +84,8 @@ class CrossRWKVHeadV8(SpatialRWKVHeadV8):
 
     def __init__(self, channels: int, num_directions: int = 4, hidden_rate: int = 4,
                  use_omni_shift: bool = True, use_channel_mix: bool = True,
-                 wkv_mode: str = "legacy", cm_act: str = "leaky_sq"):
+                 wkv_mode: str = "legacy", cm_act: str = "leaky_sq",
+                 shift_share: str = "none", cm_shift: bool = False):
         super().__init__(channels, num_directions=num_directions,
                          hidden_rate=hidden_rate,
                          use_omni_shift=use_omni_shift,
@@ -102,12 +103,22 @@ class CrossRWKVHeadV8(SpatialRWKVHeadV8):
         # 本类的四个投影各有独立的 Q-Shift, 那份不会进入任何计算, 删掉以免留下死参数。
         del self.omni_shift
 
-        # ---------- 四个 Q-Shift (论文式 2、3 各有两处) ----------
+        # ---------- Q-Shift (论文式 2、3 各有两处) ----------
+        # shift_share="none": 四份独立 (R/G/K/V 各一, 与论文式 2-3 一致);
+        # shift_share="by_source": 按来源共享成两份 —— R/G 共用一份, K/V 共用一份
+        #   (同一 Module 对象赋给两个属性, 梯度自然从两条路径汇入同一组参数;
+        #    state_dict 里会出现两套同值键, 加载兼容)。
+        if shift_share not in ("none", "by_source"):
+            raise ValueError(f"shift_share 必须是 'none' 或 'by_source', 收到 {shift_share!r}")
         if self.use_omni_shift:
-            self.shift_r = OmniShift(channels)
-            self.shift_g = OmniShift(channels)
-            self.shift_k = OmniShift(channels)
-            self.shift_v = OmniShift(channels)
+            if shift_share == "by_source":
+                self.shift_r = self.shift_g = OmniShift(channels)
+                self.shift_k = self.shift_v = OmniShift(channels)
+            else:
+                self.shift_r = OmniShift(channels)
+                self.shift_g = OmniShift(channels)
+                self.shift_k = OmniShift(channels)
+                self.shift_v = OmniShift(channels)
         else:
             self.shift_r = self.shift_g = self.shift_k = self.shift_v = None
 
@@ -123,6 +134,20 @@ class CrossRWKVHeadV8(SpatialRWKVHeadV8):
 
         # ---------- 逐头 LayerNorm ----------
         self.head_norm = nn.LayerNorm(self.head_dim)
+
+        # ---------- Channel Mix Shift (v8.8 Exp-B) ----------
+        # 在 Channel Mix 输入前注入局部空间上下文。恒等初始化: alpha=[1,0,0,0]
+        # → 初始输出 = x, 不改变 Channel Mix 的初始行为, 使性能变化只来自
+        # "Shift 的学习" 而非 "初始分布被扰动"。conv 分支首步梯度为零 (乘 alpha=0),
+        # alpha 自身有梯度, 第二步起 conv 开始学习 —— 与 channel_mix 末层零初始化
+        # 同为已验证的两步起步模式, 非死锁。
+        if cm_shift and self.use_channel_mix:
+            self.cm_shift = OmniShift(channels)
+            with torch.no_grad():
+                self.cm_shift.alpha.fill_(0.0)
+                self.cm_shift.alpha[0].fill_(1.0)
+        else:
+            self.cm_shift = None
 
         # ---------- Channel Mix: 式 (6)–(8) ----------
         hidden = channels * hidden_rate
@@ -219,7 +244,8 @@ class CrossRWKVHeadV8(SpatialRWKVHeadV8):
         out = out + center_feat
 
         if self.use_channel_mix:
-            a = self.post_norm(out.flatten(2).transpose(1, 2))   # (B, N, C)
+            cm_in = self.cm_shift(out) if self.cm_shift is not None else out
+            a = self.post_norm(cm_in.flatten(2).transpose(1, 2))  # (B, N, C)
             r2 = self.cm_r(a)
             k2 = self.cm_k(a)
             if self.cm_act == "relu_sq":

@@ -66,13 +66,22 @@ class NBranch(nn.Module):
                 nn.Conv2d(32, out_channels, 3, 1, 1, bias=True),
             )
 
-    def forward(self, F_N: torch.Tensor) -> dict:
+    def forward(self, F_N: torch.Tensor, X_t: torch.Tensor = None) -> dict:
+        """F_N: 噪声特征 [B,C,H,W]; X_t: 中心帧图像 [B,3,H,W]。
+
+        残差去噪形式: 预测噪声分量并从锚点减去。
+        X_anchor 取 X_t (中心帧); 若未提供 (旧接口), 退化为直接预测图像。
+        """
         x = self.denoise_blocks(F_N)
         x = self.channel_attn(x)
         if not self.at_f1:
             x = self.upsample(x)      # [B, 64, H, W]
-        Y_N = self.to_rgb(x)
-        return {"Y_N": Y_N}
+        n_hat = self.to_rgb(x)
+        if X_t is not None:
+            Y_N = (X_t - n_hat).clamp(0.0, 1.0)
+        else:
+            Y_N = n_hat
+        return {"Y_N": Y_N, "n_hat": n_hat}
 
 
 if __name__ == '__main__':

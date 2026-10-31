@@ -268,6 +268,10 @@ def main():
 
         # Validate
         if epoch % val_interval == 0:
+            # 验证跑整图 (1080p), 释放训练阶段积累的缓存碎片, 否则在前向
+            # Channel Mix 处可能越界 (实测 v8.7-ssim 在 ep15 验证时 OOM)。
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
             model.eval()
             psnr_list, ssim_list, lpips_list = [], [], []
             with torch.no_grad():
