@@ -23,8 +23,8 @@
 | `17-v8.7-nl结果.md` | v8.7-nl: 纯 L1+MS-SSIM 对照 — 感知/鲁棒性最好, 但分支分工崩溃 |
 | `18-v8.7-ssim设计.md` | v8.7-ssim 系列: 0.1 权重版已验证 (感知双最); 0.2 权重 + 90ep 训练中 |
 | `19-v8.8计划.md` | v8.8: Shift 共享 + 双侧 Channel Mix Shift — 26.05 dB 当前最佳 + Shift 置零消融 |
-| `20-v8.8N-RLKTS设计.md` | v8.8N: RLK-TS 统一 TokenShift — 已实施, SM+CM 全换 30ep 训练中 |
-| `21-CrossAttention-RWKV论文全景.md` | 文献调查 (三轮: 原始 + 逐篇核实 + 引文滚雪球): Cross-Attention + RWKV 全景 — 机制级 (CrossWKV, 无 first 自称/零引用) / 算子替代 (RrmTrack TMM-B、IESS-FusionNet 等 4 实例) / 混合 / 应用四层; 06 号来源论文 Video RWKV (LCR) 已归位; 第三轮新增约 25 篇 (高相关 12: Learning to Prefer/Information Fusion 14.7、TemLo/TMM、ChangeRWKV/AAAI-A、C2F-VRWKV/TGRS 等); 空白收窄: CCF A 已有跨时相/跨视图二次型 CA×RWKV, **WKV 递归内部 delta-rule 式 cross-attention 发 CCF A 仍空缺且无人认领** |
+| `20-v8.8N-RLKTS设计.md` | v8.8N: RLK-TS 统一 TokenShift — 三项判据不通过, 不采用 |
+| `21-CrossAttention-RWKV论文全景.md` | 文献调查 (三轮核实后按**类型**重组): ①WKV 内部跨流交叉 (CrossWKV/LCR/OTN-RWKV/CVPR-A/EvRWKV/X2Bone + 设计空间表: 各工作从另一路取 {R,K,V,w} 的哪些) / ②RWKV 充当交互算子 (RrmTrack 等 7 篇) / ③RWKV+显式 CA 混合 (20 篇, 含 AAAI/IJCAI 两 A 类) / ④特征级交叉 / 对照组; EvRWKV 经本仓库代码核实归① (K 跨流); 空白四格: delta-rule 式、同模态统计源、任务分解多查询、复原稠密域 |
 
 | `09-A方案轻量聚合设计.md` | v8.5 A 方案: 删除学习式帧权重, 非中心帧均值聚合; PixelShuffle 与插值两个上采样版本及最终对比 |
 | `07-KV全带与输出侧频带约束设计.md` | 取消 K/V 上的固定滤波, 频带分工移到输出侧; 三种输出约束方案与三组实验编排 (待决策) |
