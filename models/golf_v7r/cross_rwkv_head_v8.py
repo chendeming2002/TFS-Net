@@ -42,6 +42,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.golf_v7r.spatial_rwkv_head_v8 import OmniShift, SpatialRWKVHeadV8
+from models.golf_v7r.rlk_ts import RLKTS
 
 
 class SPAB(nn.Module):
@@ -85,7 +86,8 @@ class CrossRWKVHeadV8(SpatialRWKVHeadV8):
     def __init__(self, channels: int, num_directions: int = 4, hidden_rate: int = 4,
                  use_omni_shift: bool = True, use_channel_mix: bool = True,
                  wkv_mode: str = "legacy", cm_act: str = "leaky_sq",
-                 shift_share: str = "none", cm_shift: bool = False):
+                 shift_share: str = "none", cm_shift: bool = False,
+                 shift_kind: str = "omni"):
         super().__init__(channels, num_directions=num_directions,
                          hidden_rate=hidden_rate,
                          use_omni_shift=use_omni_shift,
@@ -110,8 +112,21 @@ class CrossRWKVHeadV8(SpatialRWKVHeadV8):
         #    state_dict 里会出现两套同值键, 加载兼容)。
         if shift_share not in ("none", "by_source"):
             raise ValueError(f"shift_share 必须是 'none' 或 'by_source', 收到 {shift_share!r}")
+        if shift_kind not in ("omni", "rlk"):
+            raise ValueError(f"shift_kind 必须是 'omni' 或 'rlk', 收到 {shift_kind!r}")
+        # shift_kind="rlk" (v8.8N): SM 的 Shift 换成 RLK-TS (残差大核, 初始恒等)。
+        # R/G 与 K/V 的共享关系不变, 只是算子类不同。
         if self.use_omni_shift:
-            if shift_share == "by_source":
+            if shift_kind == "rlk":
+                if shift_share == "by_source":
+                    self.shift_r = self.shift_g = RLKTS(channels)
+                    self.shift_k = self.shift_v = RLKTS(channels)
+                else:
+                    self.shift_r = RLKTS(channels)
+                    self.shift_g = RLKTS(channels)
+                    self.shift_k = RLKTS(channels)
+                    self.shift_v = RLKTS(channels)
+            elif shift_share == "by_source":
                 self.shift_r = self.shift_g = OmniShift(channels)
                 self.shift_k = self.shift_v = OmniShift(channels)
             else:
@@ -142,10 +157,14 @@ class CrossRWKVHeadV8(SpatialRWKVHeadV8):
         # alpha 自身有梯度, 第二步起 conv 开始学习 —— 与 channel_mix 末层零初始化
         # 同为已验证的两步起步模式, 非死锁。
         if cm_shift and self.use_channel_mix:
-            self.cm_shift = OmniShift(channels)
-            with torch.no_grad():
-                self.cm_shift.alpha.fill_(0.0)
-                self.cm_shift.alpha[0].fill_(1.0)
+            if shift_kind == "rlk":
+                # v8.8N 的 CM Shift: RLK-TS 本身就是恒等初始化, 直接用
+                self.cm_shift = RLKTS(channels)
+            else:
+                self.cm_shift = OmniShift(channels)
+                with torch.no_grad():
+                    self.cm_shift.alpha.fill_(0.0)
+                    self.cm_shift.alpha[0].fill_(1.0)
         else:
             self.cm_shift = None
 

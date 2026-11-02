@@ -59,7 +59,8 @@ class TaskQueryAttention(nn.Module):
                  num_directions: int = 4, channel_mix_rate: int = 4,
                  use_omni_shift: bool = True, use_channel_mix: bool = True,
                  q_mode: str = "receptance",
-                 q_shift_share: str = "none", cm_shift: bool = False):
+                 q_shift_share: str = "none", cm_shift: bool = False,
+                 shift_kind: str = "omni"):
         super().__init__()
         self.feat_dim = feat_dim
         self.lowpass_kernel = int(lowpass_kernel)
@@ -109,6 +110,7 @@ class TaskQueryAttention(nn.Module):
             if q_mode != "receptance":
                 head_kwargs["shift_share"] = q_shift_share
                 head_kwargs["cm_shift"] = cm_shift
+                head_kwargs["shift_kind"] = shift_kind
             head_cls = {"cross_rwkv": CrossRWKVHeadV8,
                         "kvmod": CrossRWKVHeadKvMod,
                         "qpath": CrossRWKVHeadQPath,

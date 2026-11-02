@@ -32,6 +32,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.golf_r4.tca_rwkv import FastBiWKV
+from models.golf_v7r.rlk_ts import RLKTS
 from models.modules.batched_wkv import batched_scan
 
 
@@ -121,7 +122,8 @@ class SpatialRWKVHeadV8(nn.Module):
 
     def __init__(self, channels: int, num_directions: int = 4, hidden_rate: int = 4,
                  use_omni_shift: bool = True, use_channel_mix: bool = True,
-                 wkv_mode: str = "legacy", cm_shift: bool = False):
+                 wkv_mode: str = "legacy", cm_shift: bool = False,
+                 shift_kind: str = "omni"):
         super().__init__()
         assert channels % num_directions == 0, \
             f"channels({channels}) 必须能被 num_directions({num_directions}) 整除"
@@ -136,7 +138,13 @@ class SpatialRWKVHeadV8(nn.Module):
         self.wkv_mode = wkv_mode
 
         # ---------- 局部上下文 (可选) ----------
-        self.omni_shift = OmniShift(channels) if self.use_omni_shift else None
+        # shift_kind="rlk" (v8.8N): 换成 RLK-TS (残差大核, 初始恒等)
+        if shift_kind not in ("omni", "rlk"):
+            raise ValueError(f"shift_kind 必须是 'omni' 或 'rlk', 收到 {shift_kind!r}")
+        if self.use_omni_shift:
+            self.omni_shift = RLKTS(channels) if shift_kind == "rlk" else OmniShift(channels)
+        else:
+            self.omni_shift = None
 
         # ---------- Q/K/V 投影 ----------
         self.proj_q = nn.Linear(channels, channels, bias=False)
@@ -179,10 +187,13 @@ class SpatialRWKVHeadV8(nn.Module):
         # 恒等初始化 (alpha=[1,0,0,0] → 初始输出 = x): 初始行为与无 Shift 完全一致,
         # 性能变化只来自训练中 Shift 学到的东西。
         if cm_shift and self.use_channel_mix:
-            self.cm_shift = OmniShift(channels)
-            with torch.no_grad():
-                self.cm_shift.alpha.fill_(0.0)
-                self.cm_shift.alpha[0].fill_(1.0)
+            if shift_kind == "rlk":
+                self.cm_shift = RLKTS(channels)
+            else:
+                self.cm_shift = OmniShift(channels)
+                with torch.no_grad():
+                    self.cm_shift.alpha.fill_(0.0)
+                    self.cm_shift.alpha[0].fill_(1.0)
         else:
             self.cm_shift = None
 

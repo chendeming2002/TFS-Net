@@ -38,9 +38,9 @@ def _spatial_probe_module(head):
     """返回接收 Spatial Mix 输出的子模块, 用 forward pre-hook 截取其输入。"""
     if hasattr(head, "cm_r"):            # CrossRWKVHeadV8: post_norm 的输入
         return head.post_norm
-    if head.channel_mix is not None:      # SpatialRWKVHeadV8: channel_mix 的输入
+    if getattr(head, "channel_mix", None) is not None:   # SpatialRWKVHeadV8
         return head.channel_mix
-    return None
+    return None                           # 外部适配块 (如 VRT): 无探针, 退化为 Q+KV
 
 
 def _force_cpu_wkv(head):
