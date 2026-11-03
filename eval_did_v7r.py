@@ -27,19 +27,29 @@ from PIL import Image
 from utils.metrics import tensor_psnr, tensor_ssim, LPIPSMetric
 
 
-def build_model(name):
+def build_model(name, config=None):
+    if name == 'v8':
+        import yaml
+        from models.golf_v7r import GolfNet_v8 as M
+        from utils.io import load_state_dict_compat
+        if config is None:
+            raise SystemExit('--model v8 必须传 --config')
+        with open(config) as f:
+            mk = dict((yaml.safe_load(f) or {}).get('model', {}) or {})
+        mk.pop('arch', None)
+        return M(**mk), load_state_dict_compat
     if name == 'v7':
         from models.golf_v7 import GolfNet_v7 as M
-        return M()
+        return M(), None
     elif name == 'v7r':
         from models.golf_v7r import GolfNet_v7r as M
-        return M()
+        return M(), None
     elif name == 'v7r_v3':
         from models.golf_v7r import GolfNet_v7r_v3 as M
-        return M()
+        return M(), None
     elif name == 'r2':
         from models.golf import GolfNet as M
-        return M()
+        return M(), None
     raise ValueError(name)
 
 
@@ -53,8 +63,10 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument('--ckpt', required=True)
     p.add_argument('--model', default='v7r_v3',
-                   choices=['v7', 'v7r', 'v7r_v3', 'r2'],
+                   choices=['v7', 'v7r', 'v7r_v3', 'r2', 'v8'],
                    help='模型类型 (与 eval_checkpoint.py 同口径)')
+    p.add_argument('--config', default=None,
+                   help='v8 必传: 训练配置 (按 model 段重建模型)')
     p.add_argument('--tag', default=None)
     p.add_argument('--did_root', default='/home/a1005/yzy/dataset/DID/test')
     p.add_argument('--out_json', default='outputs/did_metrics.json')
@@ -67,10 +79,14 @@ def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     half = 2  # window = 5
 
-    model = build_model(args.model).to(device).eval()
+    model, loader_compat = build_model(args.model, args.config)
+    model = model.to(device).eval()
     ck = torch.load(args.ckpt, map_location=device, weights_only=False)
     state = ck.get('model_state_dict', ck.get('model'))
-    model.load_state_dict(state)
+    if loader_compat is not None:
+        loader_compat(model, state)
+    else:
+        model.load_state_dict(state)
     epoch = ck.get('epoch', -1)
     tag = args.tag or '{}-ep{}-DID'.format(args.model, epoch)
     print('Loaded {} | model {} | epoch {} | tag={}'.format(
