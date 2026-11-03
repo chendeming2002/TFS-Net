@@ -221,6 +221,36 @@ class CrossRWKVHeadV8(SpatialRWKVHeadV8):
         """K 在进入扫描前的钩子, 基类恒等 (QRB 变体 kvmod 在此注入调制)。"""
         return k
 
+    def _prepare_cross_context(self, center_feat: torch.Tensor,
+                               context_feat: torch.Tensor):
+        """为查询—上下文联合建模预留的钩子。
+
+        基类不构造成对关系, 保持 Video RWKV 的 R/G 读出形态。需要利用
+        同网格特征的子类可以返回任意上下文对象, 并在下方三个钩子中消费。
+        """
+        return None
+
+    def _make_r_with_context(self, center_feat: torch.Tensor, cross_context):
+        """关系感知 R 钩子; 基类退化为原 `_make_r`。"""
+        return self._make_r(center_feat)
+
+    def _make_g_with_context(self, center_feat: torch.Tensor, cross_context):
+        """关系感知 G 钩子; 基类退化为原 `_make_g`。"""
+        return self._make_g(center_feat)
+
+    def _modulate_k_with_context(self, center_feat: torch.Tensor,
+                                 context_feat: torch.Tensor,
+                                 k: torch.Tensor, cross_context):
+        """关系感知 K 钩子; 保留旧变体的 `_modulate_k` 扩展点。"""
+        return self._modulate_k(center_feat, k)
+
+    def _mix_cross_head(self, r_i: torch.Tensor, g_i: torch.Tensor,
+                        wkv_i: torch.Tensor, value_i: torch.Tensor,
+                        direction: int, cross_context) -> torch.Tensor:
+        """单方向读出钩子; 基类严格保持原 R/G 双门计算。"""
+        del value_i, direction, cross_context
+        return g_i * self.head_norm(r_i * wkv_i)
+
     def forward(self, center_feat: torch.Tensor,
                 context_feat: torch.Tensor) -> torch.Tensor:
         """center_feat 生成 R/G, context_feat 生成 K/V。两者均为 (B, C, H, W)。"""
@@ -228,10 +258,12 @@ class CrossRWKVHeadV8(SpatialRWKVHeadV8):
         D = self.num_dirs
         hd = self.head_dim
 
-        r = self._make_r(center_feat)
-        g = self._make_g(center_feat)
+        cross_context = self._prepare_cross_context(center_feat, context_feat)
+        r = self._make_r_with_context(center_feat, cross_context)
+        g = self._make_g_with_context(center_feat, cross_context)
         k = self._project(context_feat, self.shift_k, self.proj_k)
-        k = self._modulate_k(center_feat, k)
+        k = self._modulate_k_with_context(
+            center_feat, context_feat, k, cross_context)
         v = self._project(context_feat, self.shift_v, self.proj_v)
 
         r = r.view(B, H * W, D, hd)
@@ -251,8 +283,12 @@ class CrossRWKVHeadV8(SpatialRWKVHeadV8):
         for i, scan_fn in enumerate(scan_fns):
             wkv_i = wkv_list[i][:, self._inv_index(scan_fn, B, hd, H, W,
                                                    center_feat.device)]
-            # 论文式 (4): R 先乘, 再逐头归一化, 最后由 SiLU(G) 门控
-            heads.append(g[:, :, i] * self.head_norm(r[:, :, i] * wkv_i))
+            # 基类为论文式 (4): R 先乘, 再逐头归一化, 最后由
+            # SiLU(G) 门控。子类可在此融合同位置 Value 与全局状态读出。
+            value_i = v[:, :, i * hd:(i + 1) * hd]
+            heads.append(self._mix_cross_head(
+                r[:, :, i], g[:, :, i], wkv_i, value_i,
+                i, cross_context))
         out = torch.cat(heads, dim=-1)          # (B, N, C)
 
         out = self.proj_out(out)

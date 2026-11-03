@@ -66,8 +66,9 @@ class GolfNet_v8(nn.Module):
         fusion_mode: "additive" / "gated" / "softmax" / "floored"
         fusion_residual_freeze: 是否冻结中心帧残差门
         kv_mode: 供 TripletQueryTCAv9 使用的 KV 来源 ("split" 为本设计的按支路分流)
-        q_mode: "receptance" (旧的 sigmoid(Q) 门控) 或 "cross_rwkv"
-            (Cross RWKV Gate, R/G 双查询; 见 docs/v8/06-CrossRWKVGate-Q重构设计.md)
+        q_mode: "receptance" (旧的 sigmoid(Q) 门控), "cross_rwkv"
+            (Cross RWKV Gate, R/G 双查询), 或 "coreg" (同网格关系条件化
+            CoReg-QRB; 先建模成对关系, 再调制写入/读取/输出)。
         fusion_mode: 除 V7RFusion 的四种模式外, "sgrf" 表示用 SGRFv8 分阶段串接融合
             (N → L → M 加性累加, 每级输入上一级输出; 见 models/golf_v7r/sgrf_v8.py);
             "sgrf_v9" 表示 SGRFv9 门控渐进式恢复 (每段空间自适应门控 + 有界幅度校准;
@@ -251,6 +252,7 @@ class GolfNet_v8(nn.Module):
             "fusion_weights": weights,
             "stage_stats": getattr(self, "_last_stage_stats", None),
             "gate_reg": getattr(self, "_last_gate_reg", None),
+            "coreg_stats": getattr(self.tca, "_last_coreg_stats", None),
         }
 
 

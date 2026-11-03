@@ -241,6 +241,18 @@ def main():
                     msg += (f" | gate={output_dict['inject_stat']['gate'].item():.4f}"
                             f" (N/L/M={gk[0].item():.3f}/"
                             f"{gk[1].item():.3f}/{gk[2].item():.3f})")
+                coreg = output_dict.get('coreg_stats')
+                if coreg:
+                    keys = ('write_scale', 'read_scale', 'gate_scale',
+                            'aligned_scale', 'aligned_rho_mean')
+                    means = {
+                        key: sum(coreg[branch][key].item()
+                                 for branch in ('N', 'L', 'M')) / 3.0
+                        for key in keys
+                    }
+                    msg += (f" | coreg(K/R/G/A)={means['write_scale']:.3f}/"
+                            f"{means['read_scale']:.3f}/{means['gate_scale']:.3f}/"
+                            f"{means['aligned_scale']:.3f} rho={means['aligned_rho_mean']:.3f}")
                 logger.info(msg)
 
             # 断电保护: epoch 中途落盘 (默认关闭)
