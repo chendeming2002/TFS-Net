@@ -67,8 +67,10 @@ class GolfNet_v8(nn.Module):
         fusion_residual_freeze: 是否冻结中心帧残差门
         kv_mode: 供 TripletQueryTCAv9 使用的 KV 来源 ("split" 为本设计的按支路分流)
         q_mode: "receptance" (旧的 sigmoid(Q) 门控), "cross_rwkv"
-            (Cross RWKV Gate, R/G 双查询), 或 "coreg" (同网格关系条件化
-            CoReg-QRB; 先建模成对关系, 再调制写入/读取/输出)。
+            (Cross RWKV Gate, R/G 双查询), "coreg" (历史 CoReg-QRB),
+            或 "core" (无 Spatial-Mix G 的精简 Core-QRB)。
+        q_mixer: 仅 q_mode="core" 生效; 查询侧局部混合为
+            "current" / "omni" / "span" / "wt"。
         fusion_mode: 除 V7RFusion 的四种模式外, "sgrf" 表示用 SGRFv8 分阶段串接融合
             (N → L → M 加性累加, 每级输入上一级输出; 见 models/golf_v7r/sgrf_v8.py);
             "sgrf_v9" 表示 SGRFv9 门控渐进式恢复 (每段空间自适应门控 + 有界幅度校准;
@@ -101,7 +103,8 @@ class GolfNet_v8(nn.Module):
                  q_mode: str = "receptance",
                  summary_type: str = "full",
                  q_shift_share: str = "none", cm_shift: bool = False,
-                 enc_cm_shift: bool = False, shift_kind: str = "omni"):
+                 enc_cm_shift: bool = False, shift_kind: str = "omni",
+                 q_mixer: str = "current"):
         super().__init__()
         self.num_frames = num_frames
         self.C1, self.C2, self.C3 = encoder_channels
@@ -151,7 +154,7 @@ class GolfNet_v8(nn.Module):
             lowpass_kernel=lowpass_kernel, channel_mix_rate=channel_mix_rate,
             use_omni_shift=use_omni_shift, use_channel_mix=use_channel_mix,
             q_mode=q_mode, q_shift_share=q_shift_share, cm_shift=cm_shift,
-            shift_kind=shift_kind,
+            shift_kind=shift_kind, q_mixer=q_mixer,
         )
 
         # ---------- Stage 4: 三分支 (F1 尺度直出, 不再上采样) ----------
@@ -253,6 +256,7 @@ class GolfNet_v8(nn.Module):
             "stage_stats": getattr(self, "_last_stage_stats", None),
             "gate_reg": getattr(self, "_last_gate_reg", None),
             "coreg_stats": getattr(self.tca, "_last_coreg_stats", None),
+            "core_stats": getattr(self.tca, "_last_core_stats", None),
         }
 
 

@@ -253,6 +253,16 @@ def main():
                     msg += (f" | coreg(K/R/G/A)={means['write_scale']:.3f}/"
                             f"{means['read_scale']:.3f}/{means['gate_scale']:.3f}/"
                             f"{means['aligned_scale']:.3f} rho={means['aligned_rho_mean']:.3f}")
+                core = output_dict.get('core_stats')
+                if core:
+                    a_abs = sum(core[branch]['align_abs_mean'].item()
+                                for branch in ('N', 'L', 'M')) / 3.0
+                    a_mean = sum(core[branch]['align_mean'].item()
+                                 for branch in ('N', 'L', 'M')) / 3.0
+                    k_ratio = sum(core[branch]['kq_to_kx'].item()
+                                  for branch in ('N', 'L', 'M')) / 3.0
+                    msg += (f" | core(A/|A|/Kq:Kx)={a_mean:.3f}/"
+                            f"{a_abs:.3f}/{k_ratio:.3f}")
                 logger.info(msg)
 
             # 断电保护: epoch 中途落盘 (默认关闭)

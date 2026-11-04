@@ -36,6 +36,7 @@ from models.golf_r4.tca_rwkv import RWKVSpatialHead
 from models.golf_v7r.spatial_rwkv_head_v8 import SpatialRWKVHeadV8
 from models.golf_v7r.cross_rwkv_head_v8 import CrossRWKVHeadV8
 from models.golf_v7r.coreg_query_rwkv import CoRegisteredQueryRWKVHead
+from models.golf_v7r.core_query_rwkv import CoreQueryRWKVHead
 from models.golf_v7r.qrb_variants import (
     CrossRWKVHeadKvMod, CrossRWKVHeadQPath, CrossRWKVHeadGateCtx)
 
@@ -51,8 +52,10 @@ class TaskQueryAttention(nn.Module):
         q_mode: "receptance" 为旧的 sigmoid(q) 门控; "cross_rwkv" 使用
             CrossRWKVHeadV8, R/G 直接接收特征图 (N/L 传多帧聚合, M 传中心帧),
             不再经过 query_* 卷积。见 docs/v8/06-CrossRWKVGate-Q重构设计.md。
-            "coreg" 使用 CoReg-QRB, 利用 Q/Context 同网格关系条件化
+            "coreg" 使用历史 CoReg-QRB, 利用 Q/Context 同网格关系条件化
             WKV 写入、R/G 读出以及同位置/全局状态双路读取。
+            "core" 使用精简 Core-QRB: 删除 Spatial-Mix G 和成对关系 MLP,
+            只保留 Q 对 R、K 写入和有符号同位置修正 A 的作用。
             另支持三个单变量变体, 见 docs/v8/12-QRB改进方向评估.md:
             "kvmod"  Q 条件化 K 调制; "qpath"  受控 Q 内容支路; "gatectx" R/G 局部上下文
     """
@@ -63,22 +66,23 @@ class TaskQueryAttention(nn.Module):
                  use_omni_shift: bool = True, use_channel_mix: bool = True,
                  q_mode: str = "receptance",
                  q_shift_share: str = "none", cm_shift: bool = False,
-                 shift_kind: str = "omni"):
+                 shift_kind: str = "omni", q_mixer: str = "current"):
         super().__init__()
         self.feat_dim = feat_dim
         self.lowpass_kernel = int(lowpass_kernel)
         if spatial_head not in ("legacy", "v8"):
             raise ValueError(f"spatial_head 必须是 'legacy' 或 'v8', 收到 {spatial_head!r}")
         if q_mode not in (
-                "receptance", "cross_rwkv", "coreg", "kvmod", "qpath", "gatectx"):
+                "receptance", "cross_rwkv", "coreg", "core", "kvmod", "qpath", "gatectx"):
             raise ValueError(
-                "q_mode 必须是 receptance/cross_rwkv/coreg/kvmod/qpath/gatectx, "
+                "q_mode 必须是 receptance/cross_rwkv/coreg/core/kvmod/qpath/gatectx, "
                 f"收到 {q_mode!r}")
         if q_mode != "receptance" and spatial_head != "v8":
             raise ValueError("cross_rwkv 查询只实现于 spatial_head='v8'")
         self.spatial_head_kind = spatial_head
         self.q_mode = q_mode
         self._last_coreg_stats = None
+        self._last_core_stats = None
 
         # ---------- 三路 Query: N/L 来自多帧, M 来自单帧 ----------
         # cross_rwkv 模式下 R/G 直接接收特征图, 由 CrossRWKVHeadV8 内部的 Q-Shift 处理,
@@ -117,8 +121,11 @@ class TaskQueryAttention(nn.Module):
                 head_kwargs["shift_share"] = q_shift_share
                 head_kwargs["cm_shift"] = cm_shift
                 head_kwargs["shift_kind"] = shift_kind
+            if q_mode == "core":
+                head_kwargs["query_mixer"] = q_mixer
             head_cls = {"cross_rwkv": CrossRWKVHeadV8,
                         "coreg": CoRegisteredQueryRWKVHead,
+                        "core": CoreQueryRWKVHead,
                         "kvmod": CrossRWKVHeadKvMod,
                         "qpath": CrossRWKVHeadQPath,
                         "gatectx": CrossRWKVHeadGateCtx}.get(q_mode, SpatialRWKVHeadV8)
@@ -198,6 +205,12 @@ class TaskQueryAttention(nn.Module):
                 "N": self.attn_N._last_coreg,
                 "L": self.attn_L._last_coreg,
                 "M": self.attn_M._last_coreg,
+            }
+        elif self.q_mode == "core":
+            self._last_core_stats = {
+                "N": self.attn_N._last_core,
+                "L": self.attn_L._last_core,
+                "M": self.attn_M._last_core,
             }
 
         # ---------- 残差 + 归一化 ----------
