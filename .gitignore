@@ -10,3 +10,6 @@ scripts/monitor_data/temp_log.csv
 scripts/monitor_data/temp_chart.png
 outputs/gpu_power.csv
 outputs/gpu_power_watch.log
+
+# docx 快照检查临时目录
+.tmp_docx_inspect/
