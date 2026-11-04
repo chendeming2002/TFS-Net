@@ -24,6 +24,7 @@
 | `18-v8.7-ssim设计.md` | v8.7-ssim 系列: 0.1 权重版已验证 (感知双最); 0.2 权重 + 90ep 训练中 |
 | `19-v8.8计划.md` | v8.8: Shift 共享 + 双侧 Channel Mix Shift — 26.05 dB 当前最佳 + Shift 置零消融 |
 | `20-v8.8N-RLKTS设计.md` | v8.8N: RLK-TS 统一 TokenShift — 三项判据不通过, 不采用 |
+| `22-CoReg-QRB设计.md` | v9 CoReg-QRB: 同网格关系条件化 (30ep 完成: 持平 + 鲁棒性更好) |
 | `21-CrossAttention-RWKV论文全景.md` | 文献调查 (三轮核实后按**类型**重组): ①WKV 内部跨流交叉 (CrossWKV/LCR/OTN-RWKV/CVPR-A/EvRWKV/X2Bone + 设计空间表: 各工作从另一路取 {R,K,V,w} 的哪些) / ②RWKV 充当交互算子 (RrmTrack 等 7 篇) / ③RWKV+显式 CA 混合 (20 篇, 含 AAAI/IJCAI 两 A 类) / ④特征级交叉 / 对照组; EvRWKV 经本仓库代码核实归① (K 跨流); 空白四格: delta-rule 式、同模态统计源、任务分解多查询、复原稠密域 |
 
 | `09-A方案轻量聚合设计.md` | v8.5 A 方案: 删除学习式帧权重, 非中心帧均值聚合; PixelShuffle 与插值两个上采样版本及最终对比 |
