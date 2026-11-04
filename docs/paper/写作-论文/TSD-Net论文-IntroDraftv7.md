@@ -158,16 +158,17 @@ where $Q = \mathrm{LP}_{5}(\mathrm{GT}) - \mathrm{LP}_{31}(\mathrm{GT})$ is the 
 
 Table 2. Quantitative comparison of model complexity analysis. (TSD-Net 行为旧配置数字, 待按当前配置重测)
 
-| Type | Model | Param. (M) ↓ | FLOPs (G) ↓ | Memory (GB) ↓ | Latency (ms) ↓ | FPS ↑ |
-|---|---|---|---|---|---|---|
-| Image | Retinexformer | <u>1.61</u> | **15.57** | — | — | — |
-| Image | DarkIR | 12.96 | <u>26.91</u> | 0.31 | 13.5 | 74.1 |
-| Video | SMOID | 5.43 | 67.70 | <u>0.20</u> | **6.8** | **146.8** |
-| Video | SDSDNet | 3.95 | 34.48 | **0.13** | <u>8.5</u> | <u>118.2</u> |
-| Video | Diff-L | 22.08 | 88.92 | — | — | — |
-| Video | UDU-Net | 18.34 | 1098.00 | 0.67 | 485.3 | 2.1 |
-| Video | TCE-Net | 9.06 | 99.14 | 0.43 | 177.8 | 5.6 |
-| Video | TSD-Net (Ours) | **1.175** | 99.51 | 0.467 | 31.0 | 32.2 |
+| Type  | Model          | Param. (M) ↓ | FLOPs (G) ↓  | Memory (GB) ↓ | Latency (ms) ↓ | FPS ↑        |
+| ----- | -------------- | ------------ | ------------ | ------------- | -------------- | ------------ |
+| Image | Retinexformer  | <u>1.61</u>  | **15.57**    | —             | —              | —            |
+| Image | DarkIR         | 12.96        | <u>26.91</u> | 0.31          | 13.5           | 74.1         |
+| Video | SMOID          | 5.43         | 67.70        | <u>0.20</u>   | **6.8**        | **146.8**    |
+| Video | SDSDNet        | 3.95         | 34.48        | **0.13**      | <u>8.5</u>     | <u>118.2</u> |
+| Video | Diff-L         | 22.08        | 88.92        | —             | —              | —            |
+| Video | UDU-Net        | 18.34        | 1098.00      | 0.67          | 485.3          | 2.1          |
+| Video | TCE-Net        | 9.06         | 99.14        | 0.43          | 177.8          | 5.6          |
+| Video | TSD-Net (Ours) | **1.175**    | 99.51        | 0.467         | 31.0           | 32.2         |
+
 
 ---
 
