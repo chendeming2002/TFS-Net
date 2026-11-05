@@ -11,6 +11,8 @@ Branch-N (简化版): 成像噪声去除
 Input:  F_N  [B, C, H, W]   (矩阵 RWKV 注入的噪声上下文; C = channels, v8 用 32)
 Output: Y_N  [B, 3, H, W]   (at_f1=True 时与输入同分辨率, 不做上采样)
 """
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
 

@@ -17,6 +17,8 @@ Input:  F_M     [B, C, H, W]           (矩阵 RWKV 注入的运动上下文; C 
         F2_seq  [B, T, C_enc, H/2, W/2] (encoder 全部帧特征; single_frame=True 时不使用)
 Output: Y_M, flow_vis, conf_map
 """
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
