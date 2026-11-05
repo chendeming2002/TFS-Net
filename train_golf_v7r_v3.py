@@ -88,7 +88,12 @@ def main():
         num_workers=_train_workers,
         pin_memory=bool(_train_workers > 0),
         drop_last=True,
-        persistent_workers=bool(_train_workers > 0),
+        # persistent_workers=False: worker 在每个 epoch 结束时销毁重建。
+        # 原因 (2026-11-05 实测): worker 内的解码帧缓存与 IPC 引用会跨轮持续累积,
+        # persistent 模式下 18 轮后 6 个 worker 从 0.6 GB/个 涨到 5.3 GB/个,
+        # 连同主进程合计 ~64 GB, 触发系统 OOM-killer (dmesg 有完整记录)。
+        # 每轮重建强制回收全部累积引用; 代价是每轮开头多 ~10s 的 worker 启动。
+        persistent_workers=False,
     )
     # 数据加载说明 (v8 训练加速):
     #   num_workers=0 时, 每个 batch 的解码与增广 (约 0.4 s) 会与 GPU 计算完全串行。
@@ -296,6 +301,9 @@ def main():
                 torch.cuda.empty_cache()
             model.eval()
             psnr_list, ssim_list, lpips_list = [], [], []
+            # 验证逐样本显存接近上限 (1080p 前向 ~16.4GB + LPIPS VGG ~3.5GB):
+            # ① 每个样本后释放中间缓存, 防止 LPIPS 的 VGG 峰值与模型前向峰值叠加;
+            # ② LPIPS 张量算完立即回 CPU, 不在 GPU 上累积。
             with torch.no_grad():
                 for batch in val_loader:
                     lq, gt, meta = batch
@@ -307,6 +315,9 @@ def main():
                     lp = lpips_metric(pred, gt)
                     if lp is not None:
                         lpips_list.append(lp)
+                    del pred, lq, gt
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
 
             avg_psnr = sum(psnr_list) / len(psnr_list)
             avg_ssim = sum(ssim_list) / len(ssim_list)
