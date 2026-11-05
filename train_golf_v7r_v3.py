@@ -268,6 +268,14 @@ def main():
                                   for branch in ('N', 'L', 'M')) / 3.0
                     msg += (f" | core(A/|A|/Kq:Kx)={a_mean:.3f}/"
                             f"{a_abs:.3f}/{k_ratio:.3f}")
+                stage = output_dict.get('stage_stats')
+                if stage and all(f"delta_{name}" in stage for name in 'NLM'):
+                    gates = [stage[f"gate_{name}"].item() for name in 'NLM']
+                    deltas = [stage[f"delta_{name}"].item() for name in 'NLM']
+                    writes = [stage[f"inc_{name}"].item() for name in 'NLM']
+                    msg += (f" | sgrf10 G={gates[0]:.3f}/{gates[1]:.3f}/{gates[2]:.3f}"
+                            f" d={deltas[0]:.3f}/{deltas[1]:.3f}/{deltas[2]:.3f}"
+                            f" w={writes[0]:.3f}/{writes[1]:.3f}/{writes[2]:.3f}")
                 logger.info(msg)
 
             # 断电保护: epoch 中途落盘 (默认关闭)
@@ -310,12 +318,13 @@ def main():
                     lq = lq.to(device, non_blocking=True)
                     gt = gt.to(device, non_blocking=True)
                     pred = model(lq)['final']
-                    psnr_list.append(tensor_psnr(pred, gt))
-                    ssim_list.append(tensor_ssim(pred, gt))
-                    lp = lpips_metric(pred, gt)
+                    pred_eval = pred.clamp(0.0, 1.0)
+                    psnr_list.append(tensor_psnr(pred_eval, gt))
+                    ssim_list.append(tensor_ssim(pred_eval, gt))
+                    lp = lpips_metric(pred_eval, gt)
                     if lp is not None:
                         lpips_list.append(lp)
-                    del pred, lq, gt
+                    del pred_eval, pred, lq, gt
                     if device.type == 'cuda':
                         torch.cuda.empty_cache()
 

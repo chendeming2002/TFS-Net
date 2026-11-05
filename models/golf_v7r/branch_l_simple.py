@@ -71,7 +71,8 @@ class LBranch(nn.Module):
         nn.init.zeros_(self.residual_conv.weight)
         nn.init.zeros_(self.residual_conv.bias)
 
-    def forward(self, F_L: torch.Tensor, X_t: torch.Tensor) -> dict:
+    def forward(self, F_L: torch.Tensor, X_t: torch.Tensor,
+                clamp_output: bool = True) -> dict:
         # 输出分辨率取中心帧原图; at_f1=True 时 F_L 的分辨率与它相同 (都是 F1)
         H, W = X_t.shape[-2:]
 
@@ -94,9 +95,18 @@ class LBranch(nn.Module):
         gamma = self.log_gamma.exp()
         Y_L = R_t * L_t.pow(gamma)
         Y_L = Y_L + self.residual_conv(x_up)
-        Y_L = Y_L.clamp(0.0, 1.0)
+        if clamp_output:
+            Y_L = Y_L.clamp(0.0, 1.0)
 
         return {"Y_L": Y_L, "L_t": L_t, "R_t": R_t}
+
+    def predict_delta(self, F_L: torch.Tensor,
+                      state: torch.Tensor) -> dict:
+        """Use the current state as Retinex input and return unclamped Δ_L."""
+        out = self.forward(F_L, state, clamp_output=False)
+        out["candidate"] = out["Y_L"]
+        out["delta"] = out["candidate"] - state
+        return out
 
 
 if __name__ == '__main__':

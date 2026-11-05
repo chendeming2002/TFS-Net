@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
-"""SGRFv9 结构诊断: 门控健康度、限幅统计、阶段反事实测试。
+"""SGRF 结构诊断: 门控健康度与阶段反事实测试。
 
 ## 三类诊断
 
-1. **门控健康度** (只对 SGRFv9 有意义): 门控的均值、标准差、分位数与饱和比例。
+1. **门控健康度** (SGRFv9 / SGRFv10-S1): 门控的均值、标准差、分位数与饱和比例。
    只看均值不够 —— 门若在全图都是 0.5, 均值同样"健康", 但它没有做任何空间选择。
    因此同时报告标准差与分位数, 并统计门在空间上的变异系数。
 
-2. **限幅统计**: 记录软限幅前后的 RMS 与最大绝对值, 以及进入明显压缩区间的元素比例。
-   只报限幅后的数值无法判断限幅是否是瓶颈。
-
-3. **阶段反事实**: 分别关闭 N / L / M 其中一段, 记录 PSNR / SSIM / LPIPS。
+2. **阶段反事实**: 分别关闭 N / L / M 其中一段, 记录 PSNR / SSIM / LPIPS。
    关闭前序阶段会改变后续阶段的输入分布, 因此这一项只作为依赖程度的诊断,
    不能当作"该阶段学到了正确物理退化"的证据。
 
@@ -59,7 +56,8 @@ def main():
     from utils.io import load_state_dict_compat
     from utils.metrics import tensor_psnr, tensor_ssim
 
-    cfg = yaml.safe_load(open(args.config))
+    with open(args.config, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
     mk = dict(cfg.get("model", {}) or {})
     mk.pop("arch", None)
     dev = args.device if torch.cuda.is_available() else "cpu"
@@ -68,9 +66,12 @@ def main():
     load_state_dict_compat(model, ck["model_state_dict"])
 
     if getattr(model, "sgrf", None) is None:
-        raise SystemExit("本脚本只适用于 SGRFv8 / SGRFv9 (fusion_mode 为 sgrf* )")
+        raise SystemExit("本脚本只适用于 SGRFv8/v9/v10 (fusion_mode 为 sgrf* )")
     is_v9 = model.sgrf.__class__.__name__ == "SGRFv9"
-    print(f"RESULT loaded epoch {ck.get('epoch')} fusion={model.sgrf.__class__.__name__}",
+    is_v10 = model.sgrf.__class__.__name__ == "SGRFv10"
+    gate_mode = getattr(model.sgrf, "gate_mode", None)
+    print(f"RESULT loaded epoch {ck.get('epoch')} fusion={model.sgrf.__class__.__name__}"
+          f" gate={gate_mode or 'stage-specific'}",
           flush=True)
 
     try:
@@ -84,43 +85,47 @@ def main():
                    key=lambda x: int(x.replace("pair", "")) if x.replace("pair", "").isdigit() else 0)
     seqs = names[:args.n_seqs]
 
-    # ---------- 门控与限幅统计 (v9 专有) ----------
-    gate_stats = {k: [] for k in ("mean", "std", "p05", "p50", "p95", "sat", "cv")}
-    gate_by_stage = {s: {k: [] for k in gate_stats} for s in "NLM"}
-    clamp_stats = {s: {k: [] for k in ("rms_pre", "rms_post", "absmax_pre",
-                                      "absmax_post", "frac_compress")}
-                   for s in "NLM"}
+    # ---------- 门控统计 ----------
+    gate_keys = ("mean", "std", "p05", "p50", "p95", "sat", "cv")
+    gate_by_stage = {s: {k: [] for k in gate_keys} for s in "NLM"}
     # ---------- 反事实 ----------
     conds = ["full", "no_N", "no_L", "no_M"]
     cf = {c: {"psnr": [], "ssim": [], "lpips": []} for c in conds}
 
-    # 采集一次前向中的门控与限幅中间量
-    captured = {}
+    def record_gate(name, value):
+        g = value.detach()
+        bucket = gate_by_stage[name]
+        bucket["mean"].append(g.mean().item())
+        bucket["std"].append(g.std(unbiased=False).item())
+        q = torch.quantile(
+            g.flatten().float(),
+            torch.tensor([0.05, 0.5, 0.95], device=g.device))
+        bucket["p05"].append(q[0].item())
+        bucket["p50"].append(q[1].item())
+        bucket["p95"].append(q[2].item())
+        bucket["sat"].append(
+            ((g > 0.9) | (g < 0.1)).float().mean().item())
+        bucket["cv"].append(
+            (g.std(unbiased=False) / (g.mean().abs() + 1e-8)).item())
+
     if is_v9:
         sg = model.sgrf
-        orig_forward = sg.forward
-
-        def probing_forward(*a, **kw):
-            res = orig_forward(*a, **kw)
-            return res
-
-        # 钩住门控模块, 记录输出
         for name in "NLM":
             def mk_hook(nm):
                 def hook(mod, inp, out):
-                    g = out.detach()
-                    bucket = gate_by_stage[nm]
-                    bucket["mean"].append(g.mean().item())
-                    bucket["std"].append(g.std().item())
-                    q = torch.quantile(g.flatten().float(),
-                                       torch.tensor([0.05, 0.5, 0.95], device=g.device))
-                    bucket["p05"].append(q[0].item())
-                    bucket["p50"].append(q[1].item())
-                    bucket["p95"].append(q[2].item())
-                    bucket["sat"].append(((g > 0.9) | (g < 0.1)).float().mean().item())
-                    bucket["cv"].append((g.std() / (g.mean() + 1e-8)).item())
+                    record_gate(nm, out)
                 return hook
             sg.gate[name].register_forward_hook(mk_hook(name))
+    elif is_v10 and model.sgrf.gate is not None:
+        # S1 shares one module, but its calls are deterministically N/L/M.
+        call_index = {"value": 0}
+
+        def shared_gate_hook(mod, inp, out):
+            name = model.sgrf.stage_order[call_index["value"] % 3]
+            call_index["value"] += 1
+            record_gate(name, out)
+
+        model.sgrf.gate.register_forward_hook(shared_gate_hook)
 
     with torch.no_grad():
         for seq in seqs:
@@ -141,7 +146,7 @@ def main():
 
             for cond in conds:
                 zs = None if cond == "full" else cond[-1]
-                out = model(clip, zero_stage=zs)["final"]
+                out = model(clip, zero_stage=zs)["final"].clamp(0.0, 1.0)
                 cf[cond]["psnr"].append(tensor_psnr(out, gt))
                 cf[cond]["ssim"].append(tensor_ssim(out, gt))
                 if lpips_fn is not None:
@@ -151,24 +156,34 @@ def main():
     print(f"RESULT {len(seqs)} sequences, crop={args.crop}", flush=True)
 
     # ---------- 输出 ----------
-    out = {"epoch": ck.get("epoch"), "fusion": model.sgrf.__class__.__name__}
+    out = {"epoch": ck.get("epoch"),
+           "fusion": model.sgrf.__class__.__name__,
+           "gate_mode": gate_mode}
 
-    if is_v9:
+    if is_v9 or is_v10:
         print("\n门控健康度 (每个位置一个门值, 统计自单个中心裁剪):", flush=True)
         hdr = f"{'段':<4}{'均值':>8}{'标准差':>9}{'变异系数':>10}{'p05':>8}{'p50':>8}{'p95':>8}{'饱和率':>9}"
         print(hdr, flush=True)
         gs = {}
         for s in "NLM":
             b = gate_by_stage[s]
-            m = {k: float(np.mean(v)) for k, v in b.items()}
+            if is_v10 and gate_mode == "fixed":
+                m = {"mean": 1.0, "std": 0.0, "cv": 0.0,
+                     "p05": 1.0, "p50": 1.0, "p95": 1.0, "sat": 1.0}
+            else:
+                m = {k: float(np.mean(v)) for k, v in b.items()}
             gs[s] = m
             print(f"{s:<4}{m['mean']:>8.3f}{m['std']:>9.3f}{m['cv']:>10.3f}"
                   f"{m['p05']:>8.3f}{m['p50']:>8.3f}{m['p95']:>8.3f}{m['sat']:>9.3f}",
                   flush=True)
         out["gates"] = gs
-        print("\n说明: 变异系数 = 标准差/均值。若接近 0, 门在全图近乎常数, 没有做空间选择。",
-              flush=True)
+        if is_v10 and gate_mode == "fixed":
+            print("\n说明: S0 的 G=1 是固定基线；饱和率 1 不表示学习门退化。", flush=True)
+        else:
+            print("\n说明: 变异系数 = 标准差/|均值|。若接近 0, 门在全图近乎常数, "
+                  "没有做空间选择。", flush=True)
 
+    if is_v9:
         amps = model.sgrf._amp_all().detach().tolist()
         print(f"\n阶段幅度: N={amps[model.sgrf.stage_order.index('N')]:.3f} "
               f"L={amps[model.sgrf.stage_order.index('L')]:.3f} "

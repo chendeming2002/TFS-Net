@@ -48,6 +48,7 @@ from models.golf_v7r.triple_query_tca_v9 import TaskQueryAttention
 from models.golf_v7r.fusion_v7r import V7RFusion
 from models.golf_v7r.sgrf_v8 import SGRFv8
 from models.golf_v7r.sgrf_v9 import SGRFv9
+from models.golf_v7r.sgrf_v10 import SGRFv10
 from models.golf_v7r.branch_n_simple import NBranch
 from models.golf_v7r.branch_l_simple import LBranch
 from models.golf_v7r.branch_m_simple import MBranch
@@ -75,6 +76,7 @@ class GolfNet_v8(nn.Module):
             (N → L → M 加性累加, 每级输入上一级输出; 见 models/golf_v7r/sgrf_v8.py);
             "sgrf_v9" 表示 SGRFv9 门控渐进式恢复 (每段空间自适应门控 + 有界幅度校准;
             见 models/golf_v7r/sgrf_v9.py)
+            "sgrf_v10" 表示从 X_t 出发、固定 N→L→M 的统一增量状态更新。
         summary_type: "full" 为原 TemporalAggregator (学习式帧权重);
             "lite" 为 v8.5 A 方案 (非中心帧均值 + Conv/PixelShuffle 上采样);
             "lite_interp" 与 "lite" 相同, 但上采样用原项目的 Conv3x3 + 双线性插值;
@@ -104,7 +106,8 @@ class GolfNet_v8(nn.Module):
                  summary_type: str = "full",
                  q_shift_share: str = "none", cm_shift: bool = False,
                  enc_cm_shift: bool = False, shift_kind: str = "omni",
-                 q_mixer: str = "current"):
+                 q_mixer: str = "current",
+                 sgrf_v10_gate: str = "shared"):
         super().__init__()
         self.num_frames = num_frames
         self.C1, self.C2, self.C3 = encoder_channels
@@ -158,8 +161,10 @@ class GolfNet_v8(nn.Module):
         )
 
         # ---------- Stage 4: 三分支 (F1 尺度直出, 不再上采样) ----------
+        state_conditioned = fusion_mode == "sgrf_v10"
         self.branch_N = NBranch(channels=self.branch_channels,
-                                      num_blocks=branch_blocks, at_f1=True)
+                                      num_blocks=branch_blocks, at_f1=True,
+                                      state_conditioned=state_conditioned)
         self.branch_L = LBranch(channels=self.branch_channels,
                                       num_blocks=branch_blocks, at_f1=True)
         self.branch_M = MBranch(channels=self.branch_channels,
@@ -167,13 +172,16 @@ class GolfNet_v8(nn.Module):
                                       num_frames=num_frames,
                                       num_blocks=branch_blocks,
                                       single_frame=branch_m_single_frame,
-                                      at_f1=True)
+                                      at_f1=True,
+                                      state_conditioned=state_conditioned)
 
         # ---------- Stage 5: 融合 ----------
-        if fusion_mode in ("sgrf", "sgrf_v9"):
+        if fusion_mode in ("sgrf", "sgrf_v9", "sgrf_v10"):
             self.fusion = None
             if fusion_mode == "sgrf":
                 self.sgrf = SGRFv8(channels=self.branch_channels)
+            elif fusion_mode == "sgrf_v10":
+                self.sgrf = SGRFv10(gate_mode=sgrf_v10_gate)
             else:
                 self.sgrf = SGRFv9(feat_channels=self.branch_channels)
         else:
@@ -187,7 +195,7 @@ class GolfNet_v8(nn.Module):
                 zero_stage: str | None = None) -> Dict[str, torch.Tensor]:
         """x: [B, T, 3, H, W]
 
-        zero_stage: 仅 fusion_mode="sgrf" 时有效, 把指定段 (N/L/M) 的缩放置零,
+        zero_stage: 对 SGRF 系列有效, 把指定段 (N/L/M) 的写入置零,
             用于诊断每段的实际贡献。
         """
         B, T, _, H, W = x.shape

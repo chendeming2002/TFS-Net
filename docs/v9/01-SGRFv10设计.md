@@ -1,8 +1,8 @@
 # SGRFv10：TSDR 固定顺序下的轻量状态更新器
 
-> 日期：2026-11-04
-> 状态：设计冻结，尚未实现和训练
-> 默认上游：v9 CoReg-QRB
+> 日期：2026-11-05
+> 状态：设计与代码已完成，尚未进行 30 epoch 训练
+> 默认上游：Core-QRB `current`
 > 固定顺序：**N→L→M**
 
 ## 1. 设计结论
@@ -31,7 +31,8 @@ x_k=x_{k-1}+a_k g_k\,\operatorname{bound}_k(Y_k).
 这个设计依赖“人工频带目标之和等于 GT”，因此把三路输出当成可加分量。但实际分支输出
 已经出现三种不同语义：
 
-- N 路输出 `X_t - n_hat`，是完整去噪候选图；
+- N 路在 legacy SGRFv9 中实际输出 `n_hat`（调用时未传 `X_t`），而在普通分支调用中又可输出
+  `X_t - n_hat`，同一接口存在两种语义；
 - L 路输出 Retinex 重建结果，是完整增强候选图；
 - M 路输出 RGB 修正，更接近残差。
 
@@ -174,7 +175,8 @@ RGB 修正方向和颜色由三通道 \(\Delta_k\) 决定；Gate 不应再通过
 
 ### 5.3 初始化
 
-- 三个分支的最终残差头零初始化，使 \(\Delta_N=\Delta_L=\Delta_M=0\)；
+- N/M 的最终残差头零初始化；L 的照明头末层和补偿卷积零初始化，使
+  \(\Delta_N=\Delta_L=\Delta_M=0\)；
 - Gate 最后一层权重与偏置零初始化，使初始 \(G_k=0.5\)；
 - 因为初始修正量为零，整个模块严格满足 \(\hat Y=X_t\)。
 
@@ -208,10 +210,10 @@ SGRFv10 初版只监督最终输出：
 \mathcal L_{\mathrm{final}}
 =
 \lVert \hat Y-Y\rVert_1
-+0.1\left(1-\operatorname{SSIM}(\hat Y,Y)\right).
++0.1\left(1-\operatorname{MS\text{-}SSIM}(\hat Y,Y)\right).
 \]
 
-保持 v8.8-B/v9 CoReg 的最终 L1 与 SSIM 口径，避免在结构实验中同时引入 Charbonnier、
+保持现有训练代码的最终 L1 与 MS-SSIM 口径，避免在结构实验中同时引入 Charbonnier、
 感知损失或频率损失。
 
 ### 7.2 明确删除的损失
@@ -279,6 +281,16 @@ loss:
 
 在 S0 上只加入本文共享 Gate。若 S1 优于 S0，才能说明“修正接纳”是有价值的独立任务。
 
+### 9.1 已实现配置
+
+| 实验 | 配置 | 与另一组的唯一结构差异 |
+|---|---|---|
+| S0 | `configs/v9/v9_sgrfv10_s0_fixed_30ep.yaml` | `sgrf_v10_gate: fixed`，固定 \(G=1\) |
+| S1 | `configs/v9/v9_sgrfv10_s1_shared_30ep.yaml` | `sgrf_v10_gate: shared`，增加一个共享 Gate |
+
+S0/S1 除 `output_dir` 与 `sgrf_v10_gate` 外完全相同。二者均使用 Core-current 上游、
+固定 N→L→M、原分支容量和最终 L1+0.1 MS-SSIM；不使用分支监督、正交损失或 Gate 正则。
+
 ### S2：独立 Gate 对照（条件实验）
 
 仅当共享 Gate 的统计显示明显阶段冲突时，改为三个同构独立 Gate。除此之外不增加输入或约束。
@@ -321,3 +333,27 @@ SGRF/融合约 0.1 ms。SGRFv10 的首要目标因此是语义正确、职责清
 
 现有论文草稿中“denoise → deblur → brighten”（N→M→L）的表述与当前实现和本轮确认不一致，
 后续修改论文时必须统一为 N→L→M；这属于文稿修正，不再安排顺序消融。
+
+## 13. 代码落点与运行接口
+
+| 文件 | 职责 |
+|---|---|
+| `models/golf_v7r/sgrf_v10.py` | S0 固定写入与 S1 共享单通道 Gate |
+| `models/golf_v7r/branch_n_simple.py` | `predict_delta(F_N, state)`，显式读取初始观测状态并返回 \(-\hat n\) |
+| `models/golf_v7r/branch_l_simple.py` | 以当前状态产生 Retinex 候选，再换算为 \(\Delta_L\) |
+| `models/golf_v7r/branch_m_simple.py` | 以当前状态和 M 特征产生 \(\Delta_M\) |
+| `models/golf_v7r/golfnet_v8.py` | `fusion_mode: sgrf_v10` 接线 |
+| `train_golf_v7r_v3.py` | 训练状态保持未 clamp；验证指标前 clamp；记录 Gate/Delta/写入量 |
+| `tests/test_sgrf_v10_state_update.py` | S0/S1 接口、恒等起点、参数差和配置一致性检查 |
+
+实现保持严格恒等起点：N/M 残差头初始为零，L 初始 Retinex 候选等于输入状态；因此
+S0 与 S1 在初始化时都满足 `final == X_t`。S1 仅比 S0 增加 449 个 Gate 参数。
+
+当前 Core-current 实验结束并完成结果核对后，直接依次执行：
+
+```bash
+python train_golf_v7r_v3.py --config configs/v9/v9_sgrfv10_s0_fixed_30ep.yaml
+python train_golf_v7r_v3.py --config configs/v9/v9_sgrfv10_s1_shared_30ep.yaml
+```
+
+不要并行启动 S0/S1，也不要在两者之间修改数据、损失、seed、上游 QRB 或训练超参数。

@@ -16,6 +16,7 @@ from .spatial_summary_unet import TemporalAggregator
 from .cross_rwkv_head_v8 import CrossRWKVHeadV8
 from .coreg_query_rwkv import CoRegisteredQueryRWKVHead
 from .core_query_rwkv import CoreQueryRWKVHead, WTConvLite
+from .sgrf_v10 import SGRFv10, SharedCorrectionGate
 from .branch_n_simple import NBranch, BranchNSimple
 from .branch_l_simple import LBranch, BranchLSimple
 from .branch_m_simple import MBranch, BranchMSimple
@@ -40,6 +41,8 @@ __all__ = [
     'CoRegisteredQueryRWKVHead',
     'CoreQueryRWKVHead',
     'WTConvLite',
+    'SGRFv10',
+    'SharedCorrectionGate',
     'BranchNSimple',
     'NBranch',
     'BranchLSimple',

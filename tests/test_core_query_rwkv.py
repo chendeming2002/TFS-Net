@@ -2,14 +2,20 @@
 """Structural and gradient tests for the v9 Core-QRB redesign."""
 import os
 import sys
+import copy
+from pathlib import Path
 
 import torch
+import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models.golf_v7r.core_query_rwkv import CoreQueryRWKVHead, WTConvLite
 from models.golf_v7r.coreg_query_rwkv import CoRegisteredQueryRWKVHead
 from models.golf_v7r.triple_query_tca_v9 import TaskQueryAttention
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _head(mixer="current"):
@@ -118,6 +124,23 @@ def test_tca_core_mode_and_stats():
     loss.backward()
     assert multi.grad is not None and multi.grad.abs().sum() > 0
     assert single.grad is not None and single.grad.abs().sum() > 0
+
+
+def test_four_experiment_configs_change_only_query_mixer():
+    configs = {}
+    for mixer in ("current", "span", "wt", "omni"):
+        path = ROOT / f"configs/v9/v9_core_qrb_{mixer}_30ep.yaml"
+        configs[mixer] = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert configs[mixer]["model"]["q_mode"] == "core"
+        assert configs[mixer]["model"]["q_mixer"] == mixer
+
+    normalized = []
+    for cfg in configs.values():
+        cfg = copy.deepcopy(cfg)
+        cfg["output_dir"] = "<ignored>"
+        cfg["model"]["q_mixer"] = "<ignored>"
+        normalized.append(cfg)
+    assert all(cfg == normalized[0] for cfg in normalized[1:])
 
 
 if __name__ == "__main__":

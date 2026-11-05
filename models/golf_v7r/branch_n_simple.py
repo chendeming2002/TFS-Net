@@ -39,9 +39,11 @@ class NBranch(nn.Module):
     """Branch-N (简化): Imaging Noise Denoising"""
 
     def __init__(self, channels: int = 128, num_blocks: int = 2,
-                 out_channels: int = 3, at_f1: bool = False):
+                 out_channels: int = 3, at_f1: bool = False,
+                 state_conditioned: bool = False):
         super().__init__()
         self.channels = channels
+        self.state_conditioned = bool(state_conditioned)
         # at_f1=True: 输入已经是全分辨率 (F1 尺度), 不再做 2 倍上采样。
         # 这是 v8 U-Net 式重构的一部分 (见 docs/v8/05-UNet重构设计.md)。
         self.at_f1 = bool(at_f1)
@@ -66,22 +68,53 @@ class NBranch(nn.Module):
                 nn.Conv2d(32, out_channels, 3, 1, 1, bias=True),
             )
 
-    def forward(self, F_N: torch.Tensor, X_t: torch.Tensor = None) -> dict:
+        # SGRFv10 only: the observed image state participates in the denoising
+        # prediction itself, rather than being used merely as a subtraction
+        # anchor.  Historical fusion modes do not instantiate this projection.
+        self.state_proj = (nn.Conv2d(3, channels, 1, bias=True)
+                           if self.state_conditioned else None)
+        if self.state_proj is not None:
+            nn.init.kaiming_uniform_(self.state_proj.weight, a=5 ** 0.5)
+            nn.init.zeros_(self.state_proj.bias)
+            # Δ_N=-n_hat starts from zero, so SGRFv10 is initially identity.
+            nn.init.zeros_(self.to_rgb[-1].weight)
+            nn.init.zeros_(self.to_rgb[-1].bias)
+
+    def _predict_noise(self, F_N: torch.Tensor,
+                       state: torch.Tensor | None = None) -> torch.Tensor:
+        if self.state_proj is not None:
+            if state is None:
+                raise ValueError("state-conditioned NBranch requires an image state")
+            F_N = F_N + self.state_proj(state)
+        x = self.denoise_blocks(F_N)
+        x = self.channel_attn(x)
+        if not self.at_f1:
+            x = self.upsample(x)      # [B, 64, H, W]
+        return self.to_rgb(x)
+
+    def forward(self, F_N: torch.Tensor, X_t: torch.Tensor = None,
+                clamp_output: bool = True) -> dict:
         """F_N: 噪声特征 [B,C,H,W]; X_t: 中心帧图像 [B,3,H,W]。
 
         残差去噪形式: 预测噪声分量并从锚点减去。
         X_anchor 取 X_t (中心帧); 若未提供 (旧接口), 退化为直接预测图像。
         """
-        x = self.denoise_blocks(F_N)
-        x = self.channel_attn(x)
-        if not self.at_f1:
-            x = self.upsample(x)      # [B, 64, H, W]
-        n_hat = self.to_rgb(x)
+        n_hat = self._predict_noise(F_N, X_t)
         if X_t is not None:
-            Y_N = (X_t - n_hat).clamp(0.0, 1.0)
+            Y_N = X_t - n_hat
+            if clamp_output:
+                Y_N = Y_N.clamp(0.0, 1.0)
         else:
             Y_N = n_hat
         return {"Y_N": Y_N, "n_hat": n_hat}
+
+    def predict_delta(self, F_N: torch.Tensor,
+                      state: torch.Tensor) -> dict:
+        """Return the unclamped SGRFv10 correction Δ_N=-n_hat."""
+        out = self.forward(F_N, state, clamp_output=False)
+        out["delta"] = -out["n_hat"]
+        out["candidate"] = state + out["delta"]
+        return out
 
 
 if __name__ == '__main__':

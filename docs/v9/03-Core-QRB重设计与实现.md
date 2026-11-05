@@ -1,7 +1,7 @@
 # Core-QRB：删除 G 后的最小交叉 RWKV
 
 > 日期：2026-11-04
-> 状态：代码、配置和单元测试已完成；尚未进行 30 epoch 训练
+> 状态：代码、配置和单元测试已完成；Core-current 30 epoch 训练进行中
 > 历史基线：v9 CoReg-QRB（26.01 dB / 0.8433 / 0.3504）
 > 主实验配置：`configs/v9/v9_core_qrb_current_30ep.yaml`
 
@@ -208,3 +208,6 @@ Kq/A 被删除的 G 抵消后仅增加 684 个整网参数。若主实验成立�
 
 旧 `q_mode: coreg` 和原配置不变，可继续加载旧 checkpoint；新结构使用 `q_mode: core`，避免
 把结构不兼容的 checkpoint 误载入同一模式。
+
+六组初步实验的完整启动顺序和 SGRF-S0/S1 配置见
+[04-六组实验执行说明.md](./04-六组实验执行说明.md)。当前 Core-current 完成前不启动其余组。

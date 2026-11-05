@@ -106,12 +106,13 @@ class MBranch(nn.Module):
     def __init__(self, channels: int = 128, enc_channels: int = 64,
                  num_frames: int = 5, num_blocks: int = 2,
                  out_channels: int = 3, single_frame: bool = False,
-                 at_f1: bool = False):
+                 at_f1: bool = False, state_conditioned: bool = False):
         super().__init__()
         self.channels = channels
         self.num_frames = num_frames
         self.center_idx = num_frames // 2
         self.single_frame = bool(single_frame)
+        self.state_conditioned = bool(state_conditioned)
         # at_f1=True: 输入已是全分辨率 (F1), 不再做 2 倍上采样。
         self.at_f1 = bool(at_f1)
 
@@ -163,6 +164,15 @@ class MBranch(nn.Module):
             nn.LeakyReLU(0.01, inplace=True),
             nn.Conv2d(32, out_channels, 3, 1, 1, bias=True),
         )
+        self.state_proj = (nn.Conv2d(3, channels, 1, bias=True)
+                           if self.state_conditioned else None)
+        if self.state_proj is not None:
+            nn.init.kaiming_uniform_(self.state_proj.weight, a=5 ** 0.5)
+            nn.init.zeros_(self.state_proj.bias)
+            # Δ_M starts from zero; the state projection unlocks after the
+            # residual head has learned a non-zero mapping.
+            nn.init.zeros_(self.to_rgb[-1].weight)
+            nn.init.zeros_(self.to_rgb[-1].bias)
 
     def _align_and_aggregate(self, F_M, F2_seq):
         B, T, C_enc, H, W = F2_seq.shape
@@ -189,7 +199,12 @@ class MBranch(nn.Module):
                     if conf_list else torch.ones(B, 1, H, W, device=F_M.device))
         return aggregated, flow_center, conf_avg
 
-    def forward(self, F_M: torch.Tensor, F2_seq: torch.Tensor) -> dict:
+    def forward(self, F_M: torch.Tensor, F2_seq: torch.Tensor,
+                state: torch.Tensor | None = None) -> dict:
+        if self.state_proj is not None:
+            if state is None:
+                raise ValueError("state-conditioned MBranch requires an image state")
+            F_M = F_M + self.state_proj(state)
         if self.single_frame:
             # 单帧模式: 只经中心帧特征, 不做任何跨帧操作
             aggregated = self.fusion_conv(F_M)
@@ -208,6 +223,14 @@ class MBranch(nn.Module):
         x = self.to_rgb_norm(x)
         Y_M = self.to_rgb(x)
         return {"Y_M": Y_M, "flow_vis": flow_vis, "conf_map": conf_map}
+
+    def predict_delta(self, F_M: torch.Tensor, state: torch.Tensor,
+                      F2_seq: torch.Tensor) -> dict:
+        """Return the unclamped motion correction Δ_M."""
+        out = self.forward(F_M, F2_seq, state=state)
+        out["delta"] = out["Y_M"]
+        out["candidate"] = state + out["delta"]
+        return out
 
 
 if __name__ == '__main__':

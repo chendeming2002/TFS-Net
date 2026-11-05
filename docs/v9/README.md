@@ -1,7 +1,8 @@
 # v9 文档索引
 
-> 更新日期：2026-11-04
-> 当前状态：CoReg-QRB 基线已完成；Core-QRB 已实现、待训练；SGRFv10 已完成设计、尚未实现。
+> 更新日期：2026-11-05
+> 当前状态：CoReg-QRB 基线已完成；Core-current 正在训练；四种 Core-QRB 与 SGRFv10
+> S0/S1 的代码和配置均已就绪，未启动其余实验。
 
 ## 版本定位
 
@@ -14,15 +15,17 @@ v9 不以继续堆叠恢复模块为目标，而是在 v8.8-B 的有效结构上
 当前保留两个参照版本：
 
 - **v8.8-B**：干净集指标、LPIPS 和效率参照；
-- **v9 CoReg-QRB**：噪声鲁棒性和关系机制参照，也是 SGRFv10 的默认上游基线。
+- **v9 CoReg-QRB**：噪声鲁棒性和关系机制参照；
+- **Core-current**：SGRFv10 配置中的默认上游，先由当前 30 epoch 实验验证。
 
 ## 文档
 
 | 文档 | 内容 | 状态 |
 |---|---|---|
-| [01-SGRFv10设计.md](./01-SGRFv10设计.md) | SGRF 的角色、固定 N→L→M 结构、Gate、损失与实验顺序 | 设计完成 |
+| [01-SGRFv10设计.md](./01-SGRFv10设计.md) | SGRF 的角色、固定 N→L→M 结构、Gate、损失与实现 | 已实现，待训练 |
 | [02-CoReg基线与性能剖析.md](./02-CoReg基线与性能剖析.md) | v9 CoReg 30ep 结果、诊断、复杂度与两级 profiling | 结果完成 |
-| [03-Core-QRB重设计与实现.md](./03-Core-QRB重设计与实现.md) | 无 G 的最小 QRB、signed A、SPAN/WTConv 替换、配置与实验顺序 | 已实现，待训练 |
+| [03-Core-QRB重设计与实现.md](./03-Core-QRB重设计与实现.md) | 无 G 的最小 QRB、signed A、SPAN/WTConv 替换、配置与实验顺序 | 已实现；current 训练中 |
+| [04-六组实验执行说明.md](./04-六组实验执行说明.md) | 六组配置、启动顺序、单变量边界和判定口径 | 可执行 |
 
 CoReg-QRB 的结构推导和完整实验原始记录仍见
 [v8/22-CoReg-QRB设计.md](../v8/22-CoReg-QRB设计.md)。
@@ -40,5 +43,5 @@ CoReg-QRB 的结构推导和完整实验原始记录仍见
 
 本文档从 v9 开始把本轮新设计统一称为 **SGRFv10**。当前代码中的
 `models/golf_v7r/sgrf_v9.py::SGRFv9` 以及历史文档中偶尔出现的“SGRFv10”称呼，
-统一视为 **legacy SGRFv9**，避免与本轮设计混淆。只有完成本文结构后，才应在代码中
-新增真正的 `SGRFv10`。
+统一视为 **legacy SGRFv9**，避免与本轮设计混淆。真正的 SGRFv10 已实现于
+`models/golf_v7r/sgrf_v10.py`。
