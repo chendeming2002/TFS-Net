@@ -28,6 +28,17 @@ from PIL import Image
 from utils.io import load_state_dict_compat
 
 
+def _sgrf_scales(sgrf):
+    """SGRF 各段幅值: v8 用 _scale_all, v9/v10 用 _amp_all; v10-S0 固定 G=1."""
+    if hasattr(sgrf, "_amp_all"):
+        return sgrf._amp_all()
+    if hasattr(sgrf, "_scale_all"):
+        return sgrf._scale_all()
+    return torch.ones(3, device=next(sgrf.parameters()).device
+                      ) if next(sgrf.parameters(), None) is not None else [1.0, 1.0, 1.0]
+
+
+
 def read_image(path, crop=None):
     arr = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32) / 255.0
     img = torch.from_numpy(arr).permute(2, 0, 1)
@@ -115,8 +126,7 @@ def main():
             w = out.get("fusion_weights")
             if getattr(model, "sgrf", None) is not None:
                 # 串接融合没有逐像素权重, 记录各段缩放系数 (按 N/L/M 顺序)
-                sc = (model.sgrf._amp_all() if hasattr(model.sgrf, "_amp_all")
-                      else model.sgrf._scale_all())
+                sc = _sgrf_scales(model.sgrf)
                 order = model.sgrf.stage_order
                 acc["wN"].append(float(sc[order.index("N")]))
                 acc["wL"].append(float(sc[order.index("L")]))

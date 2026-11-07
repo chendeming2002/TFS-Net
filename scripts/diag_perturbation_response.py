@@ -50,6 +50,17 @@ BRANCH_KEYS = ("N", "L", "M")
 TARGET_KEYS = {"N": "noise_target", "L": "illum_target", "M": "motion_target"}
 
 
+def _sgrf_scales(sgrf):
+    """SGRF 各段幅值: v8 用 _scale_all, v9/v10 用 _amp_all; v10-S0 固定 G=1."""
+    if hasattr(sgrf, "_amp_all"):
+        return sgrf._amp_all()
+    if hasattr(sgrf, "_scale_all"):
+        return sgrf._scale_all()
+    return torch.ones(3, device=next(sgrf.parameters()).device
+                      ) if next(sgrf.parameters(), None) is not None else [1.0, 1.0, 1.0]
+
+
+
 def read_image(path, crop):
     arr = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32) / 255.0
     img = torch.from_numpy(arr).permute(2, 0, 1)
@@ -194,8 +205,7 @@ def main():
                     # 串接融合没有逐像素权重, 这一列改报各段的缩放系数;
                     # 置零代价用真实前向测量: 跳过某一段后, 后续各段的输入也随之改变,
                     # 这正是串接结构下"去掉一段"的真实代价。
-                    scales = (model.sgrf._amp_all() if hasattr(model.sgrf, "_amp_all")
-                              else model.sgrf._scale_all())
+                    scales = _sgrf_scales(model.sgrf)
                     order = model.sgrf.stage_order
                     for b in BRANCH_KEYS:
                         row[f"w_{b}"].append(float(scales[order.index(b)]))
